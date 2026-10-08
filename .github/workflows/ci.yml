@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      # 纯标准库 + pytest：没有 requirements.txt，也不该有
+      - run: python -m pip install --upgrade pip pytest
+      - run: python -m pytest tests/ -q
+      - name: 自检（合成赛道跑一遍，确认整条链路能起来）
+        run: |
+          python - <<'PY'
+          from gt7coach.engine import CoachConfig, CoachEngine
+          from gt7coach.source import ReplaySource
+          from gt7coach.synth import synth_lap_frames, synth_profile
+
+          frames = synth_lap_frames(laps=2)
+          src = ReplaySource(frames, profile=synth_profile())
+          eng = CoachEngine(src, CoachConfig(sess_poll_boot_s=0.0,
+                                             sess_poll_idle_s=0.0),
+                            clock=src.clock)
+          said = []
+          for _ in range(len(frames) + 20):
+              for u in eng.tick().say:
+                  said.append(u.key)
+          assert any(k.startswith("brake_warn") for k in said), said
+          print("自检通过，说出：", sorted(set(said)))
+          PY

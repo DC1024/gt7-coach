@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gt7-coach"
+version = "0.1.0"
+description = "GT7 赛道工程师（Race Engineer）—— 实时遥测监控与语音副驾"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = []          # 纯标准库：服务端容器是 python:3.12-slim
+authors = [{ name = "DC1024", email = "DC1024@users.noreply.github.com" }]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+gt7coach = "gt7coach.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["gt7coach*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
