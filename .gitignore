@@ -7,3 +7,4 @@ dist/
 build/
 *.egg-info/
 _ui_check/
+_sshkey/
