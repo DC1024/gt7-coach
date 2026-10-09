@@ -571,10 +571,10 @@ class RuleSet:
                              ttl_s=phrases.ttl_for(txt, P_NORMAL, "tyre_temp"),
                              short="胎温",
                              evidence={"tyre_temp_c": [round(x, 1) for x in tt]})
-        return Utterance(key="tyre_cold", text="轮胎太凉，抓地不够",
+        txt = "轮胎太凉，抓地不够，先跑两圈升温"
+        return Utterance(key="tyre_cold", text=txt,
                          priority=P_NORMAL,
-                         ttl_s=phrases.ttl_for("轮胎太凉，抓地不够", P_NORMAL,
-                                               "tyre_temp"),
+                         ttl_s=phrases.ttl_for(txt, P_NORMAL, "tyre_temp"),
                          short="胎温",
                          evidence={"tyre_temp_c": [round(x, 1) for x in tt]})
 
@@ -621,7 +621,12 @@ class RuleSet:
         #    实测值，与参考圈无关，换了车也照样成立。而"比参考圈快/慢多少"
         #    是两辆车之间的比较，跨车没有意义。
         if c.ref_pace_ok and c.ref is not None and c.ref.lap_time_s > 0:
-            ev["vs_ref_s"] = round(sec - c.ref.lap_time_s, 3)
+            vs = sec - c.ref.lap_time_s
+            # 防御：参考圈圈速若被污染/错用，差值会跳到整圈量级
+            # （如参考圈 1:00、当前圈 1:41 → 41 秒），这种"快/慢 40 秒"
+            # 只会摧毁可信度，宁可不报差值也不报离谱数字。
+            if abs(vs) <= max(30.0, c.ref.lap_time_s * 0.25):
+                ev["vs_ref_s"] = round(vs, 3)
             ev["ref_lap_time_s"] = round(c.ref.lap_time_s, 3)
         txt = self.narrator.render("lap_summary", ev)
         return Utterance(key="lap_summary", text=txt, priority=P_LOW,
