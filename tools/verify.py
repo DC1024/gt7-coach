@@ -136,7 +136,12 @@ def main(argv=None) -> int:
     with OPENER.open(args.coach + "/", timeout=30) as r:
         demo = r.read().decode("utf-8", "replace")
     ck("自检页 P0 抢占", "speechSynthesis.cancel()" in demo)
-    ck("自检页传优先级", "d.say[0].priority" in demo)
+    # ⚠️ 别再写 "d.say[0].priority" 这个字面量：R2.2 起自检页先
+    #    `var u = (d.say && d.say.length) ? d.say[0] : null;` 再取字段，
+    #    字面量早就不存在了 —— 这条断言从那时起一直是假红（实际功能正常）。
+    #    改成断言"优先级真的被传下去" + "A 档走立即播"这两件真事。
+    ck("自检页传优先级", "say(u.speech || u.text, u.priority)" in demo)
+    ck("自检页 A 档立即播", "u.priority < P_NORMAL" in demo)
 
     print()
     if failures:
