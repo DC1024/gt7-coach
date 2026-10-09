@@ -340,12 +340,20 @@ class TestBadDrivingEndToEnd:
         assert "shift" in said, list(said)
 
     def test_off_track_is_caught(self):
-        """把第 2 圈的车整圈挪到参考线外 30 m → 应当报出界。"""
+        """把第 2 圈的车整圈挪到参考线外 30 m → 应当报出界。
+
+        🔴 #I：出界现在是「横向偏离 **且** 轮胎打滑」双重确认。真车冲出
+        柏油必然伴随打滑，所以把这一圈轮速也改成"打滑态"（1.12× 自由滚动），
+        否则纯挪坐标只会让横向偏离达标、却因无打滑而不报，反把测试带偏。
+        """
         out = []
         for f in synth_lap_frames(radius_m=R, hz=10.0, laps=3):
             if f.lap == 2 and f.coords_ok:
                 k = (R + 30.0) / R
-                f = Frame(**{**f.__dict__, "x": f.x * k, "z": f.z * k})
+                v_ms = f.speed_kph / 3.6
+                w = v_ms / 0.34 * 1.12   # 真实出界 = 跑出柏油 = 轮胎打滑
+                f = Frame(**{**f.__dict__, "x": f.x * k, "z": f.z * k,
+                             "wheel_rads": (w, w, w, w), "throttle": 0.95})
             out.append(f)
         assert "off_track" in self._run(out)
 

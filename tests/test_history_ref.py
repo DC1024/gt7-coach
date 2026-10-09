@@ -340,7 +340,10 @@ class TestHistoryRefCrossCar:
         def _run(s_at: float, lateral: float, **over):
             """同一状态连跑 8 tick（够过所有 hold 阈值），返回说过的 key。"""
             stt = RuleSet.fresh_state()
-            rsx = RuleSet(RuleConfig())
+            # 🔴 本测试只验"跨车型下几何面（off_track）照常、速度面被禁"，
+            #    与 #I 的打滑闸门正交 —— 关掉闸门，避免离线的合成帧没有
+            #    真实打滑数据而让 off_track 误判成"跨车型把它关了"。
+            rsx = RuleSet(RuleConfig(off_track_require_slip=False))
             out: list[str] = []
             for _ in range(8):
                 c = Ctx(f=mk(**over), ref=ref, s=s_at, lateral_m=lateral,

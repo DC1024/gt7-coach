@@ -11,7 +11,7 @@
 
 | key                     | 档 | 触发 |
 |-------------------------|---|------|
-| `off_track`             | P0 | 距参考线横向 > 18 m 持续 0.4 s |
+| `off_track`             | P0 | 距参考线横向 > 18 m **且** 轮胎打滑（滑移率 > 0.10）同时持续 0.4 s（#I 双重确认，减少走线图误差误报）|
 | `slip_front/rear/all`   | P0 | 滑移率 > 0.15 持续 0.25 s |
 | `brake_late@<刹车区>`   | P0 | 已过入点 > 8 m 还没踩刹车（**只到弯心为止**） |
 | `brake_warn@<刹车区>`   | P1 | 距下一个刹车入点 < 1.5 s |
@@ -92,6 +92,16 @@ class RuleConfig:
     off_track_g_ref: float = 1.2
     off_track_hold_s: float = 0.40
     min_speed_kph: float = 20.0
+    # 🔴 双重确认闸门（#I）：横向偏离参考线**且**轮胎确实在打滑才判"出界"。
+    #    原因：赛车线只是条"建议线"，车手走另一条线（仍轧在柏油上）时
+    #    横向偏离照样很大，纯按距离判会误杀。而草皮/砂石上的**真实出界**
+    #    必然伴随轮胎打滑（抓地力骤降），所以拿打滑当第二重闸门——
+    #    两者同时满足才报，显著减少走线图误差带来的误报。
+    #    False 退回旧行为（只看横向距离），保留给"不要这层过滤"的用户。
+    off_track_require_slip: bool = True
+    # 第二重闸门用的滑移率门限。比 slip_threshold(0.15) 低一点：这里只要
+    # "有可见打滑"就够确认出界，不必到打滑规则那条更严格的播报线。
+    off_track_slip_min: float = 0.10
 
     # 打滑
     slip_threshold: float = 0.15
@@ -310,44 +320,29 @@ class RuleSet:
 
     # —— 1. 出界 ———————————————————————————————————————
 
-    def _off_track(self, c: Ctx) -> Utterance | None:
-        cfg = self.cfg
-        if c.lateral_m is None or c.f.speed_kph < cfg.min_speed_kph:
-            self._hold(c.st, "off", False, c.dt)
-            return None
-        # 弯中放宽：赛车线在弯里切内侧，走别的线偏离十几米很正常
-        slack = min(abs(c.f.glat) / max(cfg.off_track_g_ref, 1e-6), 1.0)
-        thr = cfg.off_track_m * (1.0 + cfg.off_track_corner_slack * slack)
-        if self._hold(c.st, "off", c.lateral_m > thr,
-                      c.dt) < cfg.off_track_hold_s:
-            return None
-        return Utterance(
-            key="off_track", text="出界了，回到赛道", priority=P_CRITICAL,
-            ttl_s=2.5, short="出界",
-            evidence={"lateral_m": round(c.lateral_m, 1),
-                      "threshold_m": round(thr, 1),
-                      "glat": round(c.f.glat, 2)})
+    def _slip_rates(self, c: Ctx) -> tuple[float, float] | None:
+        """当前帧的滑移率 (sf, sr)；条件不足返回 None。
 
-    # —— 2. 打滑 ———————————————————————————————————————
-
-    def _wheel_slip(self, c: Ctx) -> Utterance | None:
+        🔴 顺带在自由滚动帧上**在线标定**轮胎半径——累积器在
+            `c.st["radius"]`，被 `_wheel_slip` 与 `_off_track` 共用。
+            把标定和滑移率计算并到一处，两条规则都不必各写一遍，
+            也不会出现"两处半径不一致"。
+        """
         cfg = self.cfg
         f = c.f
         if len(f.wheel_rads) < 4 or f.speed_ms < 3.0:
-            self._hold(c.st, "slip", False, c.dt)
             return None
-
         rad = c.st["radius"]
         # 自由滚动帧才用来标定半径：横向/纵向 G 都小、油门在中间、没踩刹车
         if (abs(f.glat) < cfg.free_glat_max and abs(f.glon) < cfg.free_glon_max
                 and cfg.free_thr_lo < f.throttle < cfg.free_thr_hi
                 and f.brake < cfg.free_brake_max):
             v = f.speed_ms
-            fl, fr, rl, rr = f.wheel_rads[:4]
+            fl, fr, rl, rr_w = f.wheel_rads[:4]
             rad["fn"] += v * (fl + fr) / 2.0
             rad["fd"] += ((fl * fl + fr * fr) / 2.0)
-            rad["rn"] += v * (rl + rr) / 2.0
-            rad["rd"] += ((rl * rl + rr * rr) / 2.0)
+            rad["rn"] += v * (rl + rr_w) / 2.0
+            rad["rd"] += ((rl * rl + rr_w * rr_w) / 2.0)
             rad["n"] += 1
         if rad["fd"] > 0 and rad["n"] >= cfg.calib_min_samples:
             rad["front"] = rad["fn"] / rad["fd"]
@@ -359,6 +354,61 @@ class RuleSet:
         fl, fr, rl, rr_w = f.wheel_rads[:4]
         sf = (((fl + fr) / 2.0) * rf - v) / v
         sr = (((rl + rr_w) / 2.0) * rr - v) / v
+        return sf, sr
+
+    def _off_track(self, c: Ctx) -> Utterance | None:
+        cfg = self.cfg
+        if c.lateral_m is None or c.f.speed_kph < cfg.min_speed_kph:
+            self._hold(c.st, "off", False, c.dt)
+            return None
+        # 弯中放宽：赛车线在弯里切内侧，走别的线偏离十几米很正常
+        slack = min(abs(c.f.glat) / max(cfg.off_track_g_ref, 1e-6), 1.0)
+        thr = cfg.off_track_m * (1.0 + cfg.off_track_corner_slack * slack)
+        off = c.lateral_m > thr
+
+        # 🔴 双重确认（#I）：横向偏离参考线 **且** 轮胎确实在打滑才判"出界"。
+        #    /profile 给的是最快赛车线不是赛道边界，纯按横向距离判会误杀
+        #    "走了另一条线但仍在柏油上"的车，一次误报就毁掉可信度。
+        #    草皮/砂石上的真实出界必然伴随轮胎打滑（抓地力骤降），所以拿
+        #    打滑当第二重闸门，两者同时满足才报。算不出滑移率（缺轮速/
+        #    还没标定出来）时**宁可放过**——不报比乱报强。
+        slip = True
+        slip_detail: tuple[float, float] | None = None
+        if cfg.off_track_require_slip:
+            res = self._slip_rates(c)
+            if res is None:
+                slip = False
+            else:
+                sf, sr = res
+                slip = (abs(sf) > cfg.off_track_slip_min
+                        or abs(sr) > cfg.off_track_slip_min)
+                slip_detail = (round(sf, 3), round(sr, 3))
+
+        trig = off and slip
+        if self._hold(c.st, "off", trig, c.dt) < cfg.off_track_hold_s:
+            return None
+        ev: dict[str, Any] = {
+            "lateral_m": round(c.lateral_m, 1),
+            "threshold_m": round(thr, 1),
+            "glat": round(c.f.glat, 2),
+        }
+        if slip_detail is not None:
+            ev["slip_front"] = slip_detail[0]
+            ev["slip_rear"] = slip_detail[1]
+        return Utterance(
+            key="off_track", text="出界了，回到赛道", priority=P_CRITICAL,
+            ttl_s=2.5, short="出界", evidence=ev)
+
+    # —— 2. 打滑 ———————————————————————————————————————
+
+    def _wheel_slip(self, c: Ctx) -> Utterance | None:
+        cfg = self.cfg
+        f = c.f
+        res = self._slip_rates(c)
+        if res is None:
+            self._hold(c.st, "slip", False, c.dt)
+            return None
+        sf, sr = res
 
         both = abs(sf) > cfg.slip_threshold and abs(sr) > cfg.slip_threshold
         front = abs(sf) > cfg.slip_threshold

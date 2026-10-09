@@ -87,11 +87,24 @@ def by_prefix(us, pre):
 # —— 1. 出界 ——————————————————————————————————————————
 
 class TestOffTrack:
+    # 🔴 #I：出界判定现在是「横向偏离 **且** 轮胎打滑」双重确认。
+    #    下面会动的测试都先标定半径、再喂"后轮打滑"的轮速，模拟真出界。
+    @staticmethod
+    def _slipkw():
+        w = FREEROLL_OMEGA
+        # 后轮 1.12× → 滑移率 ≈0.12：高于出界闸门 off_track_slip_min(0.10)
+        # 所以"双重确认"过得去；但低于打滑规则的 slip_threshold(0.15)，
+        # 于是 _wheel_slip 自己不会响，测试只观察 off_track 这一条。
+        # throttle=0.95 把轮速挡在"自由滚动标定窗"之外，
+        # 避免标定把打滑值吸收掉、滑移率算成 0。
+        return dict(wheel_rads=(w, w, w * 1.12, w * 1.12), throttle=0.95)
+
     def test_needs_hold(self, rs, st):
+        feed(rs, st, ticks=200)   # 先标定半径
         # 只有 0.3 s，不到 0.4 s 的判定门限
-        assert keys(feed(rs, st, ticks=3, lateral=25.0)) == []
+        assert keys(feed(rs, st, ticks=3, lateral=25.0, **self._slipkw())) == []
         # 再来 0.2 s → 累计 0.5 s，该报
-        us = feed(rs, st, ticks=2, lateral=25.0)
+        us = feed(rs, st, ticks=2, lateral=25.0, **self._slipkw())
         assert "off_track" in keys(us)
         assert us[0].priority == 0 and us[0].short == "出界"
 
@@ -105,28 +118,52 @@ class TestOffTrack:
         """🔴 判据是「距**赛车线**」而不是「距赛道边缘」—— 赛车线在弯里切内侧，
         走别的线偏离十几米完全正常。不按曲率放宽就会在弯中乱报出界，
         而误报一次就把教练的可信度毁了。"""
+        feed(rs, st, ticks=200)   # 先标定半径
+        slip = self._slipkw()
         # 直线 25m：超过 18m 基准 → 报
         assert "off_track" in keys(feed(rs, st, ticks=5, lateral=25.0,
-                                        glat=0.0))
+                                        glat=0.0, **slip))
         # 弯中同样的 25m：阈值放宽到 32.4m → 不报
-        assert feed(rs, st, ticks=5, lateral=25.0, glat=1.2) == []
+        assert feed(rs, st, ticks=5, lateral=25.0, glat=1.2, **slip) == []
         # 弯中真的跑出去 40m：还是要报
         assert "off_track" in keys(feed(rs, st, ticks=5, lateral=40.0,
-                                        glat=1.2))
+                                        glat=1.2, **slip))
 
     def test_slack_saturates(self, rs, st):
         """超出参考 G 之后不再继续放宽 —— 阈值必须有上界，否则弯中等于不判。"""
-        u = feed(rs, st, ticks=5, lateral=33.0, glat=5.0)
+        feed(rs, st, ticks=200)
+        u = feed(rs, st, ticks=5, lateral=33.0, glat=5.0, **self._slipkw())
         assert "off_track" in keys(u)
         assert u[0].evidence["threshold_m"] == pytest.approx(32.4, abs=0.1)
 
     def test_evidence_reports_threshold(self, rs, st):
-        u = feed(rs, st, ticks=5, lateral=25.0, glat=0.0)
-        assert u[0].evidence["threshold_m"] == pytest.approx(18.0, abs=0.1)
+        feed(rs, st, ticks=200)
+        u = feed(rs, st, ticks=5, lateral=25.0, glat=0.0, **self._slipkw())
+        off = [x for x in u if x.key == "off_track"][0]
+        assert off.evidence["threshold_m"] == pytest.approx(18.0, abs=0.1)
+        # #I：双重确认下，打滑值也要进 evidence 方便复盘
+        assert off.evidence["slip_rear"] == pytest.approx(0.12, abs=0.02)
 
     def test_stationary_in_menus_is_silent(self, rs, st):
         """菜单/停车时坐标会飘，速度门槛是防这个的。"""
         assert feed(rs, st, ticks=10, lateral=30.0, speed_kph=3.0) == []
+
+    def test_off_track_requires_slip(self, rs, st):
+        """#I 核心回归：横向偏离大但轮胎**没打滑**→不报（宁可放过）；
+        同时打滑才报；关掉闸门后纯横向偏离就够报（向后兼容旧行为）。"""
+        w = FREEROLL_OMEGA
+        feed(rs, st, ticks=200)   # 标定半径
+        # 场景 A：横向偏离大 + 自由滚动（无打滑）→ 不应报
+        assert feed(rs, st, ticks=8, lateral=25.0,
+                    wheel_rads=(w, w, w, w), throttle=0.95) == []
+        # 场景 B：横向偏离大 + 后轮打滑 → 报
+        us = feed(rs, st, ticks=8, lateral=25.0, **self._slipkw())
+        assert "off_track" in keys(us)
+        # 关闭闸门：纯横向偏离就够报（兼容旧行为 / 不要这层过滤的用户）
+        rs.cfg.off_track_require_slip = False
+        assert "off_track" in keys(
+            feed(rs, st, ticks=8, lateral=25.0,
+                  wheel_rads=(w, w, w, w), throttle=0.95))
 
 
 # —— 2. 打滑 ——————————————————————————————————————————
@@ -460,6 +497,8 @@ def test_fmt_lap_time():
 def test_roll_lap_resets_holds_but_keeps_calibration(rs, st):
     """圈变化要清掉「持续计时」，但**保留**轮胎半径标定 ——
     清掉标定等于每圈前几秒都用默认半径，白白丢掉已经学到的值。"""
+    # 本测试只验证"清持续计时但留标定"，关掉 #I 的打滑闸门回到纯横向判据
+    rs.cfg.off_track_require_slip = False
     feed(rs, st, ticks=5, lateral=25.0)
     st["radius"]["front"] = 0.341
     assert st["hold"].get("off", 0) > 0
