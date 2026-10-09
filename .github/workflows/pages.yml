@@ -1,0 +1,62 @@
+name: 宣传页
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+# 部署到 GitHub Pages 需要的权限。
+# 走官方 Pages 动作（而非手推 gh-pages 分支）的原因：
+#   本地网络只放行了 SSH 443，拿不到 api.github.com，无法用 REST 打开
+#   Pages 站点。把这一步交给 Actions —— 它在 GitHub 侧执行，网络无限制，
+#   `deploy-pages` 会顺带完成站点的初始化与启用。
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 同一时刻只跑一个部署；排队中的新提交直接取消，避免旧版本后落地覆盖新版本。
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 站点就一个文件，不需要构建。这里只是把它摊成一个待发布的目录，
+      # 顺便做两道最小校验：入口存在 + 无外部请求（自包含是硬约束）。
+      - name: 准备站点
+        run: |
+          mkdir -p _site
+          cp site/index.html _site/index.html
+          touch _site/.nojekyll
+          test -s _site/index.html || { echo "入口为空"; exit 1; }
+          if grep -Eq 'src="https?://|href="https?://[^"]*\.(css|js)' site/index.html; then
+            echo "检测到外部资源引用，宣传页必须零外部依赖"; exit 1
+          fi
+          echo "站点大小：$(wc -c < _site/index.html) 字节"
+
+      # enablement: true —— 仓库还没开 Pages 时由这个动作代为开启。
+      # 这正是在本地做不了的那一步（api.github.com 不通）。
+      - uses: actions/configure-pages@v5
+        with:
+          enablement: true
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
