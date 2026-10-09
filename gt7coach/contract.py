@@ -27,11 +27,75 @@ from typing import Any
 # 契约版本。破坏性改动必须 +1。
 COACH_API_VERSION = 1
 
+# 一局比赛总圈数的**可信上限**。超过就判"不知道总圈数"，而不是照着报。
+#
+# 🔴 为什么要有这道闸：`laps_in_race`（packet A 的 totalLaps，int16）在
+#    菜单态、时间赛、练习赛里会被刷成哨兵值（65535）或残留值。u16 归一
+#    只能挡掉 65535 —— 挡不住"刷成了 30000"这种。没有上界的话，
+#    续航播报会念出「油差 29997 圈」，而那一句**每个数字都在 facts 里**，
+#    白名单反而是通的。这类"数字合法、语义荒唐"的错最容易被漏掉。
+#    GT7 里一局超过 500 圈是不存在的，取 500 足够宽松。
+MAX_PLAUSIBLE_LAPS = 500
+
+# 参赛车数的**可信上限**。超过就判"不知道名次"，而不是照着报。
+#
+# 🔴 与上面同一类问题，但多一层：名次是**要念出口**的。`num_cars` 一旦被刷成
+#    垃圾值，播报会变成「还在 P31847，别急」—— 数字本身合法、白名单拦不住，
+#    而这句话一旦念出来，玩家对教练的信任就没了。
+#    GT7 正赛发车位最多 20 个，取 40 是给自定义/特殊赛事留的余量。
+MAX_PLAUSIBLE_CARS = 40
+
 # 优先级：数字越小越紧急。闸门按它排序，紧急的可以抢占冷却。
 P_CRITICAL = 0   # 出界 / 打滑 —— 可以打断一切
 P_HIGH = 1       # 刹车点 / 换挡
 P_NORMAL = 2     # 弯心速度 / 给油时机 / 胎温
 P_LOW = 3        # delta 播报 / 圈后总结
+
+
+def norm_u16(v: Any) -> int:
+    """u16 遥测字段归一：哨兵 65535、负数、非数字一律归 **0**（0 = 未知）。
+
+    🔴 三个地方都要同一个口径，所以提成这一个函数：
+        `Frame.from_v1_live`（解析 `/live`）、`source.FileSource`（解析 jsonl）、
+        `refindex.RefLap`（解析缓存里的车型码）。各写一份的话，
+        "第 65535 名"只在其中一处被挡住 —— 而从哪个口子漏进来都一样糟。
+
+    ⚠️ 0 一律表示"**未知**"，不是"第 0 名 / 0 辆车"。这些字段在菜单态、
+        时间赛、练习赛里不会给值，而 0 恰好是个完全合法的整数 ——
+        判"有没有"必须用 `> 0`，别用 `is not None`。
+    """
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return 0
+    i = int(v)
+    return i if 0 < i < 0xFFFF else 0
+
+
+def car_verdict(a_code: Any, a_name: Any,
+                b_code: Any, b_name: Any) -> str:
+    """这两者（两个场次 / 两份参考圈）是同一辆车吗？
+
+    返回 `"same_car"` | `"cross_car"` | `"unknown"`。
+
+    🔴 优先比 **car_code（数字车型码）**，两边都有值就直接比数字；拿不到才
+       退回比 `car_name`。原因不是"数字更快"，而是**字符串这条路径有个洞**：
+       车型名要过一道 `cars.csv` 查表，表没命中时本场和候选场都拿到空串 →
+       判不出差别 → 于是静默跨车采用，连条日志都没有。
+       数字相等就是同一辆车，没有这道中间环节。
+       （`car_code` 要 Dash 的场次列表带上它才有，见仪表盘 `_first_car_code`；
+        没有时退化成按名字比 —— 比"完全不判"强，但那道洞还在。）
+
+    ⚠️ `"unknown"` 是**三态里的第三态**，不是"当成同车"。判不出就老实说判不出，
+       由调用方按"性能窗口"兜底（见 `refindex.RefLap.pace_ok`）。
+    """
+    ca = norm_u16(a_code)
+    cb = norm_u16(b_code)
+    if ca and cb:
+        return "same_car" if ca == cb else "cross_car"
+    na = str(a_name or "").strip()
+    nb = str(b_name or "").strip()
+    if na and nb:
+        return "same_car" if na == nb else "cross_car"
+    return "unknown"
 
 
 def has_coords(x: float, y: float, z: float) -> bool:
@@ -77,11 +141,37 @@ class Frame:
     fuel_pct: float = 0.0
     fuel_capacity_l: float = 0.0
     powertrain: str = ""             # "fuel" | "electric"
+    # —— 比赛信息（Dash 的 `car.race.*`）——
+    # 🔴 0 一律表示"**未知**"，不是"第 0 名 / 0 辆车"：菜单态、时间赛、
+    #    练习赛里这些字段不会给值，而 0 又恰好是个合法整数 ——
+    #    判"有没有"必须用 `> 0`，别用 `is not None`。
+    position: int = 0                # 当前名次（1-based；比赛进行中随排名变）
+    num_cars: int = 0                # 参赛车数
+    laps_in_race: int = 0            # 本局总圈数（0 = 不限圈/未知）
+    car_code: int = 0                # 车型码（数字，比车型名字符串可靠）
     connected: bool = True
 
     @property
     def speed_ms(self) -> float:
         return self.speed_kph / 3.6
+
+    @property
+    def laps_to_go(self) -> int | None:
+        """到终点还剩几圈（**含当前这一圈**）；总圈数未知时为 None。
+
+        🔴 含当前圈是与"油够跑几圈"对齐的唯一口径：
+           10 圈赛跑在第 3 圈上，还得跑 3~10 共 8 圈，
+           而 `laps_in_race - lap` 只会给 7 —— 少算一圈，
+           恰好是"油够 7.5 圈但差 0.5 圈"这种最要命的判断上出错。
+
+        ⚠️ None 在这里有两层意思（**菜单态** 与 **总圈数未知/离谱**），
+           调用方不需要区分 —— 两种情况下都该"别提终点"。
+        """
+        if self.lap <= 0:
+            return None
+        if not (0 < self.laps_in_race <= MAX_PLAUSIBLE_LAPS):
+            return None
+        return max(0, self.laps_in_race - self.lap + 1)
 
     @property
     def coords_ok(self) -> bool:
@@ -107,9 +197,15 @@ class Frame:
         pos = car.get("position_m") or {}
         g = car.get("g_force") or {}
         shift = car.get("shift_alert") or {}
+        race = car.get("race") or {}
 
         def _num(v, default=0.0):
             return float(v) if isinstance(v, (int, float)) else default
+
+        # `_int` 用契约层的统一口径（见 `norm_u16`）：Dash 会把 65535 这类
+        # u16 哨兵归一（见其 `_U16_FIELDS`），但老版本或代理可能漏了 ——
+        # 这里再兜一道，免得"第 65535 名"漏进播报。
+        _int = norm_u16
 
         lap = tm.get("current_lap", car.get("current_lap", 0))
         if not isinstance(lap, int) or lap < 0 or lap >= 0xFFFF:
@@ -143,6 +239,13 @@ class Frame:
             fuel_pct=_num(car.get("fuel_pct")),
             fuel_capacity_l=_num(car.get("fuel_capacity_l")),
             powertrain=str(car.get("powertrain") or ""),
+            # 🔴 `race.grid_position` 名字带 grid 但**不是**发车位：比赛进行中
+            #    它随排名实时变，真正的发车位是 `grid_start`。取错会得到
+            #    "整场名次不动"的假象。
+            position=_int(race.get("grid_position")),
+            num_cars=_int(race.get("num_cars")),
+            laps_in_race=_int(tm.get("laps_in_race")),
+            car_code=_int(car.get("car_code")),
             connected=bool(d.get("connected")),
         )
 

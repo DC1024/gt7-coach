@@ -29,8 +29,15 @@ T0 = 1791434581.47          # 一个真实场次用过的墙钟起点
 
 
 def write_session(path: Path, laps: int = 2, hz: float = 60.0,
-                  truncated: bool = False, header_car: int = 1302) -> Path:
-    """按记录器的 jsonl 格式落盘（字段名与真实文件一致）。"""
+                  truncated: bool = False, header_car: int = 1302,
+                  position: int = 0, num_cars: int = 0,
+                  laps_in_race: int = 0, car_code: int = 0) -> Path:
+    """按记录器的 jsonl 格式落盘（字段名与真实文件一致）。
+
+    `position` 在 jsonl 里的键是 **`quali_pos`**（0x84）—— 与 Dash `/live`
+    的 `race.grid_position` 同一个源：比赛进行中它随排名实时变。
+    想验 u16 哨兵就传 65535。
+    """
     lines = [json.dumps({"session_id": "test", "started_at": T0,
                          "circuit": None, "car": header_car,
                          "powertrain": "fuel"}, ensure_ascii=False)]
@@ -48,6 +55,8 @@ def write_session(path: Path, laps: int = 2, hz: float = 60.0,
             "gas_level": f.fuel_pct, "gas_capacity": 100.0,
             "max_alert_rpm": f.max_rpm, "powertrain": "fuel",
             "has_coords": True,
+            "quali_pos": position, "num_cars": num_cars,
+            "laps_in_race": laps_in_race, "car_code": car_code,
         }, ensure_ascii=False))
         t_abs += dt
     body = "\n".join(lines) + "\n"
@@ -121,6 +130,31 @@ class TestReadSession:
         _hdr, frames = _read_session(sess)
         assert frames[0].fuel_pct == pytest.approx(100.0)
         assert frames[-1].fuel_pct < 100.0
+
+    def test_race_fields_round_trip_from_jsonl(self, tmp_path):
+        """场次文件里的名次/车数/总圈数必须能被读回来。"""
+        p = write_session(tmp_path / "r.jsonl", laps=1, hz=20.0,
+                          position=6, num_cars=20, laps_in_race=10,
+                          car_code=805)
+        _hdr, frames = _read_session(p)
+        assert frames[0].position == 6
+        assert frames[0].num_cars == 20
+        assert frames[0].laps_in_race == 10
+        assert frames[0].car_code == 805
+
+    def test_u16_sentinel_in_jsonl_is_not_a_rank(self, tmp_path):
+        """菜单态把 quali_pos 写成 65535 → 归 0，别念"第 65535 名"。"""
+        p = write_session(tmp_path / "r2.jsonl", laps=1, hz=20.0,
+                          position=65535, num_cars=65535)
+        _hdr, frames = _read_session(p)
+        assert frames[0].position == 0
+        assert frames[0].num_cars == 0
+
+    def test_missing_race_fields_default_to_zero(self, tmp_path):
+        p = write_session(tmp_path / "r3.jsonl", laps=1, hz=20.0)
+        _hdr, frames = _read_session(p)
+        f = frames[0]
+        assert (f.position, f.num_cars, f.laps_in_race, f.car_code) == (0, 0, 0, 0)
         assert frames[0].powertrain == "fuel"
 
 

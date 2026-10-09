@@ -57,7 +57,9 @@ def synth_lap_frames(radius_m: float = 600.0, base_kph: float = 200.0,
                      lap: int = 1, laps: int = 1,
                      with_wheels: bool = True, fuel_start: float = 100.0,
                      fuel_per_lap: float = 8.0,
-                     powertrain: str = "fuel") -> list[Frame]:
+                     powertrain: str = "fuel",
+                     position: int = 0, num_cars: int = 0,
+                     laps_in_race: int = 0, car_code: int = 0) -> list[Frame]:
     """一圈（或多圈首尾相接）的合成帧。
 
     `hz` 缺省 10 —— 故意对齐实时侧 10Hz 轮询的真实采样率，
@@ -68,6 +70,11 @@ def synth_lap_frames(radius_m: float = 600.0, base_kph: float = 200.0,
 
     油量按**里程**线性消耗（`fuel_per_lap` 每圈），这样"每圈油耗"正好等于
     `fuel_per_lap`，油耗/续航逻辑就有了可验算的真值。
+
+    比赛信息（`position` / `num_cars` / `laps_in_race` / `car_code`）默认全 0
+    = 「未知」，与真机菜单态口径一致；要验名次播报就显式传进去。
+    它们在整段里是常量 —— 名次/名次**变化**的测试请自己改 frames 里的字段
+    （`dataclasses.replace`），别给这个函数加"第几帧变名次"这类开关。
     """
     length, base_kph, dip_kph, dip_start, dip_len = _params(
         radius_m, base_kph, dip_kph, dip_start_m, dip_len_m)
@@ -105,6 +112,10 @@ def synth_lap_frames(radius_m: float = 600.0, base_kph: float = 200.0,
                                    - fuel_per_lap * (lp - lap)), 3),
                 fuel_capacity_l=100.0,
                 powertrain=powertrain,
+                position=position,
+                num_cars=num_cars,
+                laps_in_race=laps_in_race,
+                car_code=car_code,
                 connected=True,
             ))
             s += v * dt

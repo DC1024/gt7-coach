@@ -30,7 +30,14 @@ import math
 from dataclasses import dataclass, field, asdict
 from typing import Any, Iterable
 
+from .contract import car_verdict, norm_u16
+
 G = 9.80665
+
+# 两份参考圈的圈速差超过这个比例 → 判「性能不可比」，速度面禁用。
+# 10% 大约是"快车 vs 慢车在同一个弯差 15~20 km/h"的量级：到这个份上，
+# delta 量的已经不是"你慢了多少"，而是"车慢了多少"。
+PACE_TOL = 0.10
 
 # 单帧位移超过这个数（>3600 km/h）判为坐标跳变（换圈/重生），不计入弧长
 _ARC_GAP_M = 100.0
@@ -136,6 +143,11 @@ class RefLap:
     #    一句"出界了"；拿它预告刹车点 → 指到别的弯。而这一切都发生在刚开局、
     #    车手最需要听清的时候。判据必须落在这里，见 `engine._ref_block_reason`。
     in_progress: bool = False
+    # 🔴 这份参考圈是**哪辆车**跑出来的。跨场次采用历史圈时，它是判断
+    #    「速度面能不能用」的唯一依据（见 `pace_ok`）。
+    #    0 / "" = 未知（老版 Dash、或 `cars.csv` 没命中）。
+    car_code: int = 0
+    car_name: str = ""
     grid_m: list[float] = field(default_factory=list)
     speed_kph: list[float] = field(default_factory=list)
     throttle: list[float] = field(default_factory=list)
@@ -186,6 +198,9 @@ class RefLap:
             source=source or str(_meta.get("source") or "") or "profile",
             session_file=str(_meta.get("file") or ""),
             in_progress=_meta_in_progress(_meta, lap),
+            # 经本地缓存往返一圈回来后，车型身份全靠 `meta` 带回来
+            car_code=norm_u16(_meta.get("car_code")),
+            car_name=str(_meta.get("car_name") or ""),
             grid_m=[float(v) for v in grid],
             speed_kph=[float(v) for v in (d.get("speed_kph") or [])],
             throttle=[float(v) for v in (d.get("throttle") or [])],
@@ -283,6 +298,69 @@ class RefLap:
 
     def v_at_s(self, s: float) -> float | None:
         return self._at(self.speed_kph, s)
+
+    # —— 参考圈的「两面」：几何面 vs 速度面 ————————————————————
+    #
+    # 🔴 一份参考圈其实有**两种**完全不同的用法，混在一起就会失真：
+    #
+    #   · **几何面**：赛车线的形状、刹车点 / 弯心在赛道上的**位置**。
+    #     换车后依然成立 —— T1 的刹车点还在那个地方，顶多差几米。
+    #   · **速度面**：参考圈在那里跑多快、用了多少秒。
+    #     换车后**完全不成立** —— 拿慢车的最快圈去量快车，delta 会是一个
+    #     恒定的 +8 秒，零信息量；弯心速度、刹车入点速度同理。
+    #
+    # 规则层因此按"用哪一面"分成两组（判断在 `rules.py`，判据在这里）：
+    #   · 只用几何面 → 跨车照常工作：`off_track`（横向偏差）、
+    #     `throttle_late`（过弯心后 40~120 m 还没给油，位置判据）；
+    #   · 用速度面 → 跨车必须闭嘴：`brake_warn`、`brake_late`、`apex_slow`、
+    #     `delta`、`projected_lap`，以及 `lap_summary` 的 `vs_ref_s`。
+    #   十四规则里有七条依赖速度面 —— 这就是"跨车参考会严重失真"的量级。
+    #
+    # 为什么不给速度面加"差异补偿"（比如按圈速比缩放参考速度）：
+    #   车的快慢不是均匀分布的 —— 大直道尽头差 30 km/h，发夹弯里只差 3 km/h。
+    #   一个统一的缩放系数会同时在直道上低估、在弯里高估，比不给更糟。
+
+    def car_match(self, other: "RefLap") -> str:
+        """我与 `other` 是同一辆车跑的吗 → "same_car" | "cross_car" | "unknown"。
+
+        判据统一走契约层的 `car_verdict`（先比数字车型码，再比名字），
+        与 `source.faster_sessions` 挑候选时用同一把尺 —— 两处口径分叉
+        会出现"挑的时候说是同车、采用的时候说不是"这种自相矛盾。
+        """
+        return car_verdict(self.car_code, self.car_name,
+                           other.car_code, other.car_name)
+
+    def pace_ratio(self, other: "RefLap") -> float | None:
+        """我相对 `other` 快多少倍（>1 = 我更快）。None = 算不出来。
+
+        用**圈速比**而不是中位速度比：圈速是单一标量，两边直接可比；
+        中位速度还要再假设两条折线的采样密度一致，多引入一处误差。
+        """
+        if self.lap_time_s <= 0 or other.lap_time_s <= 0:
+            return None
+        return other.lap_time_s / self.lap_time_s
+
+    def pace_ok(self, other: "RefLap", tol: float = PACE_TOL) -> bool:
+        """我的**速度面**能拿去量 `other`（本场这辆车）吗？
+
+        `other` 是本场自己跑出来的基准圈，所以这个问题等价于
+        "我（可能是跨场次的历史圈）与当前这辆车的性能可比吗"。
+
+        · **同车** → 可以。这正是 `history_best` 存在的意义：今天跑得烂，
+          教练也该拿你的历史最好当标杆，而不是拿"今天最烂的一圈"夸你。
+          ⚠️ 已知盲点：GT7 的 BoP 会按赛事调动力/车重，同一个 car_code
+             在不同赛事里性能可以差出一截。协议里没有 BoP 数据，我们
+             **无法分辨**"BoP 变了"和"你今天状态不好"。这是可接受的代价 ——
+             反过来（把同车的历史圈也禁掉）会毁掉这个功能本身。
+        · **不同车 / 判不出来** → 看圈速差：超过 `tol` 就别用。
+        · **圈速算不出来** → 不给用（不知道就是不知道）。
+        """
+        if self.car_match(other) == "same_car":
+            return True
+        r = self.pace_ratio(other)
+        if r is None:
+            return False
+        return (1.0 - tol) <= r <= (1.0 + tol)
 
     def next_brake(self, s: float) -> dict | None:
         """在 s 之后（含回绕）最近的一个刹车入点。
@@ -514,7 +592,11 @@ class RefLap:
             #    一圈回来这些都会丢成空/False —— 而它们正是"这份参考圈能不能
             #    现在用"的全部判据（见 `engine._ref_block_reason`）。
             "meta": {"file": self.session_file, "source": self.source,
-                     "in_progress": self.in_progress},
+                     "in_progress": self.in_progress,
+                     # 🔴 车型身份必须跟着走：缓存里那份参考圈是哪辆车跑的，
+                     #    决定了它的速度面能不能拿去量当前这辆车。
+                     "car_code": self.car_code,
+                     "car_name": self.car_name},
             "length_m": self.length_m,
             "length_by_speed_m": self.length_m,
             "length_drift_pct": None,

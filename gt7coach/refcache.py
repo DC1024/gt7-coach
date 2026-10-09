@@ -32,6 +32,27 @@ from .refindex import RefLap
 _META_FP = "__fp__"
 
 
+def car_key(sess: dict) -> str:
+    """缓存 key 里的「车型」部分：**优先用数字车型码**，退回车型名。
+
+    🔴 为什么不能只用车名：车型名来自 `cars.csv` 查表，没命中就是空串。
+       于是"查不到车型的 A 车"和"查不到车型的 B 车"会撞进**同一个 key** ——
+       不同车的最快圈互相覆盖，而缓存加载只看指纹（同赛道当然吻合），
+       于是你会拿到别人车的最快圈当参考，且没有任何报错。
+       车型号是协议里直接给的整数，不经过查表，没有这道中间环节。
+
+    ⚠️ 换了 key 的写法（name:xxx → c805）会让**旧缓存文件失效**（文件名变了）。
+       这不是 bug：旧文件下次跑完会自动重新存一份；而继续用旧 key 会保留
+       上面那个"不同车互相覆盖"的坑。
+    """
+    from .contract import norm_u16
+    code = norm_u16(sess.get("car_code"))
+    if code:
+        return f"c{code}"
+    name = str(sess.get("car_name") or "").strip()
+    return f"n{name}" if name else "unknown"
+
+
 class RefCache:
     """把参考圈按 (车型, 赛道指纹) 存到本地目录。"""
 

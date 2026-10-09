@@ -30,7 +30,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Iterable
 
-from .contract import Frame
+from .contract import Frame, car_verdict, norm_u16
 from .refindex import RefLap
 
 # 无代理 opener：显式空 ProxyHandler，从根上绕开环境变量里的代理
@@ -120,15 +120,22 @@ class HttpSource:
 
     def faster_sessions(self, best_s: float, exclude: str = "",
                         car_name: str = "", same_car: bool = True,
-                        limit: int = 3) -> list[dict]:
+                        limit: int = 3, car_code: int = 0) -> list[dict]:
         """比 `best_s` 更快的**其它场次**，按最快圈升序，最多 `limit` 条。
 
         用于跨场次参考圈（拿你自己的历史最好成绩当标杆，而不是本场最好）。
 
-        🔴 默认只挑**同一辆车**的场次：换了更快的车之后，那个成绩根本够不着，
-           拿去当参考只会让人一路看着 +8 秒。`car_name` 为空（车型表没命中）
-           时不做这层过滤 —— 宁可多比几个，也别因为查不到车型就完全不用历史数据。
+        🔴 默认只挑**同一辆车**的场次：换了更快的车之后，那个历史成绩根本
+           够不着，拿去当参考只会让人一路看着 +8 秒（见 `refindex.RefLap.pace_ok`
+           里"几何面 / 速度面"那笔账）。
+
+        🔴 判据**优先用 `car_code`（数字车型码）**，两边都有值就直接比数字；
+           拿不到才退回比 `car_name`。原因：车型名要过一道 `cars.csv` 查表，
+           表没命中时本场和候选场都拿到空串 → 判不出差别 → 等于静默跨车采用。
+           数字相等就是同一辆车，没有这道中间环节。
+           （`car_code` 也要等 Dash 的场次列表带上它 —— 见仪表盘 `_first_car_code`。）
         """
+        code = norm_u16(car_code)
         out: list[dict] = []
         for s in self.sessions():
             f = s.get("file")
@@ -137,8 +144,9 @@ class HttpSource:
                 continue
             if b <= 0 or b >= best_s * 0.999:
                 continue
-            if same_car and car_name and s.get("car_name") \
-                    and s.get("car_name") != car_name:
+            if same_car and car_verdict(code, car_name,
+                                        s.get("car_code"),
+                                        s.get("car_name")) == "cross_car":
                 continue
             out.append(s)
         out.sort(key=lambda x: x["best_lap_s"])
@@ -213,12 +221,22 @@ class ReplaySource:
 
     def faster_sessions(self, best_s: float, exclude: str = "",
                         car_name: str = "", same_car: bool = True,
-                        limit: int = 3) -> list[dict]:
-        """回放模式下由测试直接指定候选（`history_candidates`）。"""
+                        limit: int = 3, car_code: int = 0) -> list[dict]:
+        """回放模式下由测试直接指定候选（`history_candidates`）。
+
+        同车过滤与 `HttpSource` 走**同一个** `car_verdict`，这样"测试里能
+        被挑中的候选"与"真机上会被挑中的候选"是一回事 —— 否则测试过了、
+        真机上照样跨车采用。
+        """
+        code = norm_u16(car_code)
         out = [c for c in self.history_candidates
                if c.get("file") != exclude
                and isinstance(c.get("best_lap_s"), (int, float))
-               and 0 < c["best_lap_s"] < best_s * 0.999]
+               and 0 < c["best_lap_s"] < best_s * 0.999
+               and (not same_car
+                    or car_verdict(code, car_name,
+                                   c.get("car_code"),
+                                   c.get("car_name")) != "cross_car")]
         out.sort(key=lambda x: x["best_lap_s"])
         return out[:max(1, limit)]
 
@@ -276,6 +294,9 @@ class FileSource:
             "file": self.path.name, "live": True,
             "best_lap_s": self.best_lap_s,
             "car_name": str(self.header.get("car") or ""),
+            # 离线回放也要带车型码：跨场次参考圈的"同车判据"优先用它。
+            # 老场次文件头里没有 → 退回取**实际帧里**出现最多的那个。
+            "car_code": _dominant_car_code(self._all),
         }
 
     # —— 元信息 ————————————————————————————————————————
@@ -355,6 +376,12 @@ class FileSource:
         return None
 
 
+# u16 字段归一统一走契约层的 `norm_u16`（Dash 的 `_U16_FIELDS` 同一口径）：
+# 菜单态会把 lap / num_cars / quali_pos 全写成 65535，`int()` 转出来是个
+# 完全合法的"第 65535 名"，不归一就会漏进播报。
+_u16 = norm_u16
+
+
 def _lap_spans(frames: list[Frame]) -> dict[int, tuple[float, float]]:
     """每圈的首末帧时刻（**用帧自己的 t**，不是圈内计时）。
 
@@ -368,6 +395,20 @@ def _lap_spans(frames: list[Frame]) -> dict[int, tuple[float, float]]:
         t0, t1 = out.get(f.lap, (f.t, f.t))
         out[f.lap] = (min(t0, f.t), max(t1, f.t))
     return out
+
+
+def _dominant_car_code(frames: list[Frame]) -> int:
+    """整场出现次数最多的非 0 车型码（一场通常同一辆车）。
+
+    离线回放假托场次头里没有 `car_code`，但**每一帧**里都有 —— 所以取众数，
+    比"读第一帧"稳：首帧常在菜单态（car_code=0）。
+    """
+    from collections import Counter
+    cnt: Counter[int] = Counter()
+    for f in frames:
+        if f.car_code > 0:
+            cnt[f.car_code] += 1
+    return cnt.most_common(1)[0][0] if cnt else 0
 
 
 def _read_session(path: Path) -> tuple[dict, list[Frame]]:
@@ -434,6 +475,13 @@ def _read_session(path: Path) -> tuple[dict, list[Frame]]:
                 fuel_pct=float(d.get("gas_level") or 0.0),
                 fuel_capacity_l=float(d.get("gas_capacity") or 0.0),
                 powertrain=str(d.get("powertrain") or ""),
+                # 🔴 当前名次取 `quali_pos`（0x84）：比赛进行中它随排名实时变，
+                #    与 Dash `/live` 的 `race.grid_position` 同一个源。
+                #    `position` 是格式 A 的另一字段，与实时名次不是一回事。
+                position=_u16(d.get("quali_pos")),
+                num_cars=_u16(d.get("num_cars")),
+                laps_in_race=_u16(d.get("laps_in_race")),
+                car_code=_u16(d.get("car_code")),
                 connected=True,
             ))
     return header, frames

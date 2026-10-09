@@ -15,7 +15,7 @@ import time
 import pytest
 
 from gt7coach.engine import CoachConfig, CoachEngine
-from gt7coach.refcache import RefCache
+from gt7coach.refcache import RefCache, car_key
 from gt7coach.refindex import RefLap
 from gt7coach.source import ReplaySource
 from gt7coach.synth import synth_lap_frames, synth_profile
@@ -118,7 +118,9 @@ class TestEngineAdoptsCachedRef:
         # 预置一条更快（60s）的同赛道参考圈
         faster = _ref(600.0)
         faster.lap_time_s = 60.0
-        RefCache(cache_dir).save(faster, "TestCar")
+        # 🔴 key 必须走 `car_key()` 而不是裸车名：引擎侧也是用它算 key 的，
+        #    两边各写一份就会"预置的缓存永远命中不了"。
+        RefCache(cache_dir).save(faster, car_key({"car_name": "TestCar"}))
 
         # 本场剖面故意更慢（69.7s），模拟"今天这趟跑得不如历史最好"
         frames = synth_lap_frames(radius_m=R, hz=10.0, laps=2)
@@ -155,7 +157,7 @@ class TestEngineAdoptsCachedRef:
         cache_dir = str(tmp_path / "cache")
         slower = _ref(600.0)
         slower.lap_time_s = 120.0          # 比本场 69.7 慢得多
-        RefCache(cache_dir).save(slower, "TestCar")
+        RefCache(cache_dir).save(slower, car_key({"car_name": "TestCar"}))
 
         frames = synth_lap_frames(radius_m=R, hz=10.0, laps=2)
         prof = synth_profile(radius_m=R)

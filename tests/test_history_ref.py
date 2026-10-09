@@ -21,8 +21,10 @@ import pytest
 from conftest import wait_for
 from gt7coach.engine import CoachConfig, CoachEngine, RefProvider
 from gt7coach.refindex import RefLap
+from gt7coach.rules import Ctx, RuleConfig, RuleSet
 from gt7coach.source import ReplaySource
 from gt7coach.synth import synth_lap_frames, synth_profile
+from test_rules import SPEED_FACE_KEYS, ZONE_S, mk
 
 R = 600.0
 L = 2.0 * math.pi * R
@@ -257,3 +259,122 @@ class TestHistoryRefRobustness:
         st = eng.refs.history_status()
         assert "error" in st and "RuntimeError" in st["error"]
         assert eng._current_ref() is not None, "本场剖面必须还在用"
+
+
+# —— 跨车型：几何面照用，速度面禁用 ————————————————————————
+#
+# 🔴 这是方案 §7 的落地。两条防线：
+#     ① 挑候选时按 car_code 过滤（默认开，同车才用）；
+#     ② 车型判不出来时（cars.csv 没命中 → 两边都是空串），
+#        用**圈速窗口**兜底，而不是像旧实现那样静默跨车采用。
+
+def _engine_unknown_car(hist_lap_s: float):
+    """本场 69.7s；历史候选指定圈速，且**两边车型都查不到**（空名 / 0 码）。"""
+    frames = synth_lap_frames(radius_m=R, hz=10.0, laps=2)
+    src = ReplaySource(frames, profile=None, loop=True)
+    live, hist, _other = _profiles()
+    src.profiles = {"live.jsonl": live}
+    # 历史剖面：形状与本场同赛道，但圈速是指定的
+    src.profiles["hist.jsonl"] = _retime(synth_profile(radius_m=R, step_m=5.0),
+                                         hist_lap_s)
+    src._session = {"file": "live.jsonl", "live": True,
+                    "best_lap_s": 69.7, "car_name": ""}
+    src.history_candidates = [
+        {"file": "hist.jsonl", "best_lap_s": hist_lap_s, "car_name": ""}]
+    eng = CoachEngine(src, CoachConfig(sess_poll_boot_s=0.02,
+                                       sess_poll_idle_s=0.05,
+                                       ref_policy="history_best"),
+                      clock=src.clock)
+    return eng, src
+
+
+def _retime(prof: dict, lap_s: float) -> dict:
+    """把一份剖面的时间轴整体缩放成 `lap_s`（形状不变、只变快慢）。
+
+    用来造"同一条赛道、但明显更快/更慢的另一辆车"的参考圈。
+    """
+    import copy
+    p = copy.deepcopy(prof)
+    cur = float(p.get("lap_time_s") or 0.0) or float(p["t_rel_s"][-1] or 0.0)
+    k = lap_s / max(cur, 1e-6)
+    p["lap_time_s"] = round(lap_s, 3)
+    p["t_rel_s"] = [round(t * k, 3) for t in p["t_rel_s"]]
+    return p
+
+
+class TestHistoryRefCrossCar:
+    """跨车型复用历史圈时的「分层」行为。"""
+
+    def test_same_car_history_keeps_the_speed_face(self):
+        """同车 → 速度面照用（这正是 history_best 的意义）。"""
+        eng, _ = _engine()
+        assert _wait_source(eng, "history"), eng.refs.history_status()
+        st = eng.tick()
+        assert st.stats["ref_car_match"] == "same_car"
+        assert st.stats["ref_pace_ok"] is True
+
+    def test_cross_car_within_window_stays_usable(self):
+        """不同车但性能接近 → 速度面仍可用。"""
+        eng, _ = _engine_unknown_car(67.0)      # 快 3.9%
+        assert _wait_source(eng, "history"), eng.refs.history_status()
+        st = eng.tick()
+        assert st.stats["ref_car_match"] == "unknown"
+        assert st.stats["ref_pace_ok"] is True
+
+    def test_cross_car_beyond_window_kills_only_the_speed_face(self):
+        """🔴 快 36% ⇒ 速度面禁用，但**几何面必须还活着**。
+
+        出了这条，就会退回"要么全都用、要么全都别用" —— 而全别用意味着
+        换了车以后教练连"你出界了"都不说了。
+        """
+        eng, _ = _engine_unknown_car(45.0)      # 69.7 / 45 ≈ 1.55
+        assert _wait_source(eng, "history"), eng.refs.history_status()
+        st = eng.tick()
+        assert st.stats["ref_pace_ok"] is False
+        assert st.stats["ref_car_match"] == "unknown"
+        # 🔴 关键：参考圈**对象**还在（几何面照用），只是速度面被禁。
+        #    上面那条 assert 若改成"没有参考圈"，换了车教练就彻底哑了。
+        assert eng._current_ref() is not None
+        ref = eng._current_ref()
+
+        def _run(s_at: float, lateral: float, **over):
+            """同一状态连跑 8 tick（够过所有 hold 阈值），返回说过的 key。"""
+            stt = RuleSet.fresh_state()
+            rsx = RuleSet(RuleConfig())
+            out: list[str] = []
+            for _ in range(8):
+                c = Ctx(f=mk(**over), ref=ref, s=s_at, lateral_m=lateral,
+                        dt=0.1, st=stt, ref_pace_ok=False)
+                out += [u.key for u in rsx.evaluate(c)]
+            return out
+
+        # 🔴 速度面：七条规则全部静默（正对照见 test_rules.py 里同一条件）
+        got = "".join(_run(ZONE_S + 30.0, 0.0, speed_kph=200.0,
+                           lap_time_s=30.0, brake=0.0))
+        for pre in SPEED_FACE_KEYS:
+            assert pre not in got, (pre, got)
+        # 🔴 几何面：出界照样报 —— 换了车也不能把这条一起关掉
+        assert "off_track" in _run(ZONE_S + 30.0, 60.0, speed_kph=200.0)
+
+    def test_stats_expose_the_two_numbers_behind_the_verdict(self):
+        """排障要能直接看到判据的两个数，不用再去服务端翻。"""
+        eng, _ = _engine_unknown_car(45.0)
+        assert _wait_source(eng, "history")
+        st = eng.tick()
+        assert st.stats["ref_lap_time_s"] == pytest.approx(45.0, abs=0.5)
+        assert st.stats["base_lap_time_s"] == pytest.approx(69.7, abs=0.5)
+
+    def test_same_car_filter_is_code_first(self):
+        """车型名都查不到、码不同 → 不许跨车采用（旧实现在这里是静默放行的）。
+
+        直接打 `faster_sessions`，因为它就是那道闸。
+        """
+        from gt7coach.source import HttpSource
+        src = HttpSource("http://127.0.0.1:1", timeout=0.01)
+        src.sessions = lambda: [
+            {"file": "s1.jsonl", "best_lap_s": 50.0, "car_code": 805},
+            {"file": "s2.jsonl", "best_lap_s": 51.0, "car_code": 902},
+        ]
+        out = src.faster_sessions(70.0, exclude="live.jsonl",
+                                  car_code=902, car_name="")
+        assert [x["file"] for x in out] == ["s2.jsonl"]
