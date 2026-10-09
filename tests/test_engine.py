@@ -131,12 +131,20 @@ class TestSessionChange:
         assert eng._lap_buf == []
 
     def test_ref_provider_key_uses_file_and_best_lap(self):
-        assert RefProvider.key_for({"file": "a.jsonl", "best_lap_s": 90.0}) \
-            == ("a.jsonl", 90.0)
-        assert RefProvider.key_for({}) == (None, None)
-        a = RefProvider.key_for({"file": "a.jsonl", "best_lap_s": 90.0})
-        b = RefProvider.key_for({"file": "a.jsonl", "best_lap_s": 88.0})
+        rp = RefProvider(ReplaySource([]), policy="session_best")
+        assert rp.key_for({"file": "a.jsonl", "best_lap_s": 90.0}) \
+            == ("a.jsonl", 90.0, "session_best")
+        assert rp.key_for({}) == (None, None, "session_best")
+        a = rp.key_for({"file": "a.jsonl", "best_lap_s": 90.0})
+        b = rp.key_for({"file": "a.jsonl", "best_lap_s": 88.0})
         assert a != b, "最快圈刷新了要重取（更好的参考圈）"
+
+    def test_key_includes_policy(self):
+        """改了参考圈策略必须重取 —— 否则切到 history_best 也不会有任何变化。"""
+        a = RefProvider(ReplaySource([]), policy="session_best")
+        b = RefProvider(ReplaySource([]), policy="history_best")
+        sess = {"file": "a.jsonl", "best_lap_s": 90.0}
+        assert a.key_for(sess) != b.key_for(sess)
 
 
 class TestStateSurface:
@@ -378,3 +386,119 @@ class TestSlowDependencyMustNotStallTicks:
         assert "sess_state" in st.stats and "sess_error" in st.stats
         assert st.stats["sess_state"] in ("idle", "loading", "ok", "empty",
                                           "failed")
+
+
+class TestLocalLapStats:
+    """R1.5：分段用时 / 油耗 / 预测圈速 —— **全部本地算，不打任何接口**。
+
+    不调 Dash 的 `/sectors` 与 `/pitstops` 的理由：直播场次上调它们每次都要
+    重解析整场 jsonl（缓存按 mtime/size，而直播文件一直在变），一场 20 万帧
+    要 2s+ 且越来越贵；而这些数从手上的实时帧就能算。
+    """
+
+    @staticmethod
+    def _engine(laps=3, ref_faster=1.0, **cfg):
+        frames = synth_lap_frames(radius_m=R, hz=10.0, laps=laps)
+        prof = synth_profile(radius_m=R)
+        if ref_faster != 1.0:
+            # 把参考圈"改快"一点，制造一个稳定的正 delta
+            prof["t_rel_s"] = [t / ref_faster for t in prof["t_rel_s"]]
+            prof["lap_time_s"] /= ref_faster
+        src = ReplaySource(frames, profile=prof, loop=True)
+        eng = CoachEngine(src,
+                          CoachConfig(sess_poll_boot_s=0.02,
+                                      sess_poll_idle_s=0.05,
+                                      poll_interval_s=0.01, **cfg),
+                          clock=src.clock)
+        return eng, src
+
+    def test_sectors_and_theory_after_laps(self):
+        eng, _ = self._engine(laps=3)
+        assert wait_ref(eng)
+        # 跑完两整圈（10Hz × 约 70s ≈ 700 帧/圈）
+        for _ in range(1500):
+            eng.tick()
+        st = eng.tick()
+        assert st.last_lap is not None, "应当已经有跑完的圈"
+        assert st.last_lap["ok"], st.last_lap
+        secs = st.last_lap["sectors"]
+        assert len(secs) == 3
+        # 容差 5ms：state 里这三个数各自四舍五入到 3 位小数，
+        # "舍入后的和"与"和的舍入"本来就可以差 1~2ms（不是算错）
+        assert sum(secs) == pytest.approx(st.last_lap["lap_time_s"], abs=0.005)
+        assert st.theory_best_s is not None
+        # 理论最快 = 各段最好值之和，必然 ≤ 实际最快圈
+        assert st.theory_best_s <= st.last_lap["lap_time_s"] + 1e-6
+        assert st.potential_gain_s is not None and st.potential_gain_s >= 0.0
+
+    def test_fuel_per_lap_and_range(self):
+        """合成数据每圈正好耗 8.0（按里程线性），所以续航要能算准。"""
+        eng, _ = self._engine(laps=3)
+        assert wait_ref(eng)
+        for _ in range(1500):
+            eng.tick()
+        st = eng.tick()
+        assert st.fuel_per_lap == pytest.approx(8.0, abs=0.2)
+        assert st.last_lap["fuel_used"] == pytest.approx(8.0, abs=0.2)
+        # 剩余量 / 每圈油耗
+        assert st.fuel_laps_left is not None
+        assert st.fuel_laps_left > 0
+
+    def test_projected_lap_appears_when_behind(self):
+        eng, _ = self._engine(laps=3, ref_faster=1.015)
+        assert wait_ref(eng)
+        seen_projected, seen_state = False, False
+        for _ in range(1200):
+            st = eng.tick()
+            if st.projected_lap_s is not None:
+                seen_state = True
+            if any(u.key == "projected_lap" for u in st.say):
+                seen_projected = True
+            if seen_projected:
+                break
+        assert seen_state, "落后期应当给出预测圈速"
+        assert seen_projected, "预测圈速也要真的说出口"
+
+    def test_projected_lap_consistent_with_delta(self):
+        """预计圈速 = 参考圈圈速 + 当前 delta，三个数必须自洽。"""
+        eng, _ = self._engine(laps=3, ref_faster=1.015)
+        assert wait_ref(eng)
+        for _ in range(1200):
+            st = eng.tick()
+            if st.projected_lap_s is not None and st.delta_s is not None:
+                ref = eng._current_ref()
+                assert st.projected_lap_s == pytest.approx(
+                    ref.lap_time_s + st.delta_s, abs=0.01)
+                return
+        pytest.fail("始终没有同时拿到 projected 与 delta")
+
+    def test_no_extra_endpoint_calls_for_lap_stats(self):
+        """分段/油耗是本地算的 —— 跑完几圈不该多出任何接口调用。
+
+        参考圈剖面仍然只取一次（它只能来自服务端）。
+        """
+        eng, src = self._engine(laps=3)
+        assert wait_ref(eng)
+        for _ in range(1500):
+            eng.tick()
+        assert src.profile_calls == 1, src.profile_calls
+        assert eng._sectors.lap_totals, "本地分段应当已经算出来了"
+
+    def test_partial_lap_does_not_pollute_theory(self):
+        """中途接入时第一圈是残圈，不能进理论最快圈的统计。"""
+        frames = synth_lap_frames(radius_m=R, hz=10.0, laps=2)
+        # 从第 1 圈中途开始（掐掉前 25 秒）
+        src = ReplaySource(frames[250:], profile=synth_profile(radius_m=R),
+                           loop=True)
+        eng = CoachEngine(src, CoachConfig(sess_poll_boot_s=0.02,
+                                           sess_poll_idle_s=0.05),
+                          clock=src.clock)
+        assert wait_ref(eng)
+        for _ in range(1600):
+            eng.tick()
+        # 第一圈（残）不该被计入；后续完整的圈才计
+        assert eng._sectors.lap_totals, "后面完整的圈应当被计入"
+        assert eng._prev_lap is not None
+        # 若最后一条是残圈，它必须带着可读的原因而不是静默算错
+        if not eng._prev_lap.ok:
+            assert eng._prev_lap.why

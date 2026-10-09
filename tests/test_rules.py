@@ -90,6 +90,29 @@ class TestOffTrack:
     def test_no_ref_no_lateral_no_offtrack(self, rs, st):
         assert feed(rs, st, ticks=10, lateral=None) == []
 
+    def test_corner_gets_more_slack(self, rs, st):
+        """🔴 判据是「距**赛车线**」而不是「距赛道边缘」—— 赛车线在弯里切内侧，
+        走别的线偏离十几米完全正常。不按曲率放宽就会在弯中乱报出界，
+        而误报一次就把教练的可信度毁了。"""
+        # 直线 25m：超过 18m 基准 → 报
+        assert "off_track" in keys(feed(rs, st, ticks=5, lateral=25.0,
+                                        glat=0.0))
+        # 弯中同样的 25m：阈值放宽到 32.4m → 不报
+        assert feed(rs, st, ticks=5, lateral=25.0, glat=1.2) == []
+        # 弯中真的跑出去 40m：还是要报
+        assert "off_track" in keys(feed(rs, st, ticks=5, lateral=40.0,
+                                        glat=1.2))
+
+    def test_slack_saturates(self, rs, st):
+        """超出参考 G 之后不再继续放宽 —— 阈值必须有上界，否则弯中等于不判。"""
+        u = feed(rs, st, ticks=5, lateral=33.0, glat=5.0)
+        assert "off_track" in keys(u)
+        assert u[0].evidence["threshold_m"] == pytest.approx(32.4, abs=0.1)
+
+    def test_evidence_reports_threshold(self, rs, st):
+        u = feed(rs, st, ticks=5, lateral=25.0, glat=0.0)
+        assert u[0].evidence["threshold_m"] == pytest.approx(18.0, abs=0.1)
+
     def test_stationary_in_menus_is_silent(self, rs, st):
         """菜单/停车时坐标会飘，速度门槛是防这个的。"""
         assert feed(rs, st, ticks=10, lateral=30.0, speed_kph=3.0) == []
@@ -313,3 +336,129 @@ def test_roll_lap_resets_holds_but_keeps_calibration(rs, st):
     rs.roll_lap(st, 2)
     assert st["hold"] == {}
     assert st["radius"]["front"] == 0.341
+
+
+# —— 11/12/13. 本地统计类规则（全部零网络）————————————
+
+class TestProjectedLap:
+    """预测圈速 = 参考圈圈速 + 当前 delta。无线电里最常被问的一句。"""
+
+    def test_fires_after_threshold(self, rs, st, ref):
+        t_ref = ref.t_at_s(ref.length_m * 0.6)
+        us = feed(rs, st, ref=ref, s=ref.length_m * 0.6,
+                  lap_time_s=t_ref + 0.9)
+        p = [u for u in us if u.key == "projected_lap"]
+        assert p, us
+        assert p[0].evidence["projected_s"] == pytest.approx(
+            ref.lap_time_s + 0.9, abs=0.02)
+        assert p[0].text.startswith("预计 ")
+
+    def test_silent_too_early(self, rs, st, ref):
+        """跑得太早 delta 还在抖（起步、暖胎），报出来是误导。"""
+        t_ref = ref.t_at_s(ref.length_m * 0.1)
+        assert [u for u in feed(rs, st, ref=ref, s=ref.length_m * 0.1,
+                                lap_time_s=t_ref + 1.5)
+                if u.key == "projected_lap"] == []
+
+    def test_silent_when_on_pace(self, rs, st, ref):
+        t_ref = ref.t_at_s(ref.length_m * 0.6)
+        assert [u for u in feed(rs, st, ref=ref, s=ref.length_m * 0.6,
+                                lap_time_s=t_ref + 0.05)
+                if u.key == "projected_lap"] == []
+
+    def test_short_form_is_compact(self, rs, st, ref):
+        """弯中禁言要用短句，所以 short 必须是能念的短数字。"""
+        t_ref = ref.t_at_s(ref.length_m * 0.6)
+        p = [u for u in feed(rs, st, ref=ref, s=ref.length_m * 0.6,
+                             lap_time_s=t_ref + 0.9)
+             if u.key == "projected_lap"][0]
+        assert len(p.short) <= 6
+
+    def test_silent_without_ref(self, rs, st):
+        assert [u for u in feed(rs, st, ref=None, s=1000.0, lap_time_s=40.0)
+                if u.key == "projected_lap"] == []
+
+
+class TestSectorLoss:
+    """圈后指出「哪一段最慢」——比"这圈慢 0.4"有用得多。"""
+
+    @staticmethod
+    def _lap(sectors, lap_time=None, ok=True):
+        from gt7coach.lapstats import LapResult
+        return LapResult(lap=5, length_m=3770.0,
+                         lap_time_s=lap_time or sum(sectors),
+                         sectors=list(sectors), ok=ok, why="")
+
+    @staticmethod
+    def _theory(best, samples, gain=None):
+        return {"n_sectors": len(best), "best_each_s": list(best),
+                "samples": list(samples), "theory_best_s": sum(best),
+                "best_actual_s": None, "gain_s": gain, "laps": 3}
+
+    def test_picks_worst_sector(self, rs, st):
+        c = Ctx(f=mk(), lap=self._lap([30.0, 40.5, 25.0]),
+                theory=self._theory([30.0, 40.0, 25.0], [3, 3, 3], gain=0.5))
+        u = rs._sector_loss(c)
+        assert u and u.evidence["sector"] == 2
+        assert u.evidence["loss_s"] == pytest.approx(0.5, abs=0.01)
+        assert "S2" in u.text
+
+    def test_includes_potential_gain(self, rs, st):
+        c = Ctx(f=mk(), lap=self._lap([31.0, 41.0, 25.0]),
+                theory=self._theory([30.0, 40.0, 25.0], [3, 3, 3], gain=0.8))
+        u = rs._sector_loss(c)
+        assert u and "潜在 0.80" in u.text
+
+    def test_skips_sectors_with_few_samples(self, rs, st):
+        """某段样本 <2 时"最好值"就是本圈自己，差值恒 0，报它没意义。"""
+        c = Ctx(f=mk(), lap=self._lap([30.0, 45.0, 25.0]),
+                theory=self._theory([30.0, 44.0, 25.0], [3, 1, 3], gain=0.9))
+        assert rs._sector_loss(c) is None
+
+    def test_silent_when_close(self, rs, st):
+        c = Ctx(f=mk(), lap=self._lap([30.05, 40.02, 25.0]),
+                theory=self._theory([30.0, 40.0, 25.0], [3, 3, 3]))
+        assert rs._sector_loss(c) is None
+
+    def test_silent_when_lap_invalid(self, rs, st):
+        c = Ctx(f=mk(), lap=self._lap([30.0, 45.0, 25.0], ok=False),
+                theory=self._theory([30.0, 40.0, 25.0], [3, 3, 3]))
+        assert rs._sector_loss(c) is None
+
+    def test_silent_without_theory(self, rs, st):
+        assert rs._sector_loss(Ctx(f=mk(), lap=self._lap([30.0, 45.0, 25.0]),
+                                   theory=None)) is None
+
+    def test_silent_on_length_mismatch(self, rs, st):
+        c = Ctx(f=mk(), lap=self._lap([30.0, 45.0]),
+                theory=self._theory([30.0, 40.0, 25.0], [3, 3, 3]))
+        assert rs._sector_loss(c) is None
+
+
+class TestFuelRange:
+    @staticmethod
+    def _fuel(left, per=8.0, level=24.0):
+        return {"per_lap": per, "level": level, "laps_left": left,
+                "samples": 3}
+
+    def test_warns_when_low(self, rs, st):
+        u = rs._fuel_range(Ctx(f=mk(), fuel=self._fuel(2.4)))
+        assert u and "还够 2.4 圈" in u.text
+        assert u.evidence["laps_left"] == 2.4
+
+    def test_silent_when_plenty(self, rs, st):
+        assert rs._fuel_range(Ctx(f=mk(), fuel=self._fuel(9.0))) is None
+
+    def test_ev_says_battery(self, rs, st):
+        """电车说"电量"、油车说"油量" —— 说错一次就没人信了。"""
+        u = rs._fuel_range(Ctx(f=mk(powertrain="electric"),
+                               fuel=self._fuel(1.8)))
+        assert u and "电量" in u.text
+
+    def test_fuel_says_fuel(self, rs, st):
+        u = rs._fuel_range(Ctx(f=mk(powertrain="fuel"), fuel=self._fuel(1.8)))
+        assert u and "油量" in u.text
+
+    def test_silent_without_data(self, rs, st):
+        assert rs._fuel_range(Ctx(f=mk(), fuel=None)) is None
+        assert rs._fuel_range(Ctx(f=mk(), fuel={"laps_left": None})) is None

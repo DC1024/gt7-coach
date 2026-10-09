@@ -14,9 +14,11 @@ from .contract import (COACH_API_VERSION, CoachState, Frame, P_CRITICAL,
                        P_HIGH, P_LOW, P_NORMAL, Utterance, has_coords)
 from .engine import CoachConfig, CoachEngine, RefProvider
 from .gate import Gate, GateConfig
+from .lapstats import (FuelTracker, LapResult, SectorTracker,
+                       lap_result, ref_sector_times, sector_times)
 from .refindex import RefLap
 from .rules import Ctx, RuleConfig, RuleSet, fmt_lap_time
-from .source import HttpSource, ReplaySource, SourceError
+from .source import FileSource, HttpSource, ReplaySource, SourceError
 
 __version__ = "0.1.0"
 __all__ = [
@@ -24,5 +26,8 @@ __all__ = [
     "P_CRITICAL", "P_HIGH", "P_NORMAL", "P_LOW",
     "CoachEngine", "CoachConfig", "RefProvider",
     "Gate", "GateConfig", "RefLap", "RuleSet", "RuleConfig", "Ctx",
-    "fmt_lap_time", "HttpSource", "ReplaySource", "SourceError",
+    "fmt_lap_time", "HttpSource", "ReplaySource", "FileSource",
+    "SourceError",
+    "LapResult", "FuelTracker", "SectorTracker", "lap_result",
+    "sector_times", "ref_sector_times",
 ]

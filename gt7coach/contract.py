@@ -72,6 +72,11 @@ class Frame:
     glon: float = 0.0               # 纵向 G
     tyre_temp: tuple[float, ...] = ()
     wheel_rads: tuple[float, ...] = ()   # 四轮角速度 rad/s（顺序 FL,FR,RL,RR）
+    # 剩余能量：油车是百分比 0~100，纯电车是剩余电量 kWh（两者的语义都是
+    # 「还剩多少」。要算「还能跑几圈」必须配合 powertrain 判断口径）。
+    fuel_pct: float = 0.0
+    fuel_capacity_l: float = 0.0
+    powertrain: str = ""             # "fuel" | "electric"
     connected: bool = True
 
     @property
@@ -135,6 +140,9 @@ class Frame:
             glon=_num(g.get("longitudinal")),
             tyre_temp=tuple(float(v) for v in tt) if isinstance(tt, list) else (),
             wheel_rads=tuple(float(v) for v in wr) if isinstance(wr, list) else (),
+            fuel_pct=_num(car.get("fuel_pct")),
+            fuel_capacity_l=_num(car.get("fuel_capacity_l")),
+            powertrain=str(car.get("powertrain") or ""),
             connected=bool(d.get("connected")),
         )
 
@@ -195,6 +203,13 @@ class CoachState:
     # 距下一个刹车入点：米 / 秒
     next_brake_m: float | None = None
     next_brake_s: float | None = None
+    # —— 本地统计（全部零网络，自己从实时帧算）——
+    projected_lap_s: float | None = None   # 按当前 delta 预测的最终圈速
+    last_lap: dict[str, Any] | None = None  # 刚跑完那圈的 {lap, lap_time_s, sectors}
+    theory_best_s: float | None = None     # 本场各段最好值之和
+    potential_gain_s: float | None = None  # 实际最快 − 理论最快
+    fuel_per_lap: float | None = None      # 每圈消耗（油 % / 电 kWh）
+    fuel_laps_left: float | None = None
     # 这一 tick 决定要说的话（已过闸门）。通常 0 或 1 条。
     say: list[Utterance] = field(default_factory=list)
     # 最近播报（供 UI 显示历史，最多 20 条，新的在前）

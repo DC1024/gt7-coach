@@ -10,3 +10,4 @@ _ui_check/
 _sshkey/
 _*.py
 _*.log
+_data/

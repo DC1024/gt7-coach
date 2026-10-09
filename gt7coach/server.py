@@ -286,8 +286,12 @@ document.getElementById("voice").onclick = function(){
   this.className = speakOn ? "on" : "";
   if (speakOn) say("语音已开启");
 };
-function say(t){
+// 🔴 P0（出界/打滑/刹车晚了）要能**打断**正在念的闲话。
+//    浏览器 TTS 默认是排队制：一句 delta 会把随后的"出界"堵在它后面，
+//    等念完黄花菜都凉了。真赛车无线电是抢麦，不是排队。
+function say(t, prio){
   if(!speakOn || !window.speechSynthesis || !t) return;
+  if(prio === 0 && speechSynthesis.speaking) speechSynthesis.cancel();
   var u = new SpeechSynthesisUtterance(t);
   u.lang = "zh-CN"; u.rate = 1.15;
   speechSynthesis.speak(u);
@@ -312,7 +316,7 @@ function poll(){
     document.getElementById("say").textContent = txt;
     if (d.say && d.say.length) {
       var k = d.say[0].key + "|" + d.say[0].text + "|" + d.lap;
-      if (k !== lastKey) { lastKey = k; say(d.say[0].text); }
+      if (k !== lastKey) { lastKey = k; say(d.say[0].text, d.say[0].priority); }
     }
     document.getElementById("hist").innerHTML = (d.spoken || []).slice(0,10)
       .map(function(h){

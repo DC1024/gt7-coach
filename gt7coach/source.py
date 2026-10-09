@@ -27,9 +27,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import Any, Iterable
 
 from .contract import Frame
+from .refindex import RefLap
 
 # 无代理 opener：显式空 ProxyHandler，从根上绕开环境变量里的代理
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -116,9 +118,31 @@ class HttpSource:
                 return s
         return None
 
-    def session_stats(self, file: str) -> dict | None:
-        d = self._get(f"/api/v1/sessions/{urllib.parse.quote(file)}")
-        return d if isinstance(d, dict) and not d.get("error") else None
+    def faster_sessions(self, best_s: float, exclude: str = "",
+                        car_name: str = "", same_car: bool = True,
+                        limit: int = 3) -> list[dict]:
+        """比 `best_s` 更快的**其它场次**，按最快圈升序，最多 `limit` 条。
+
+        用于跨场次参考圈（拿你自己的历史最好成绩当标杆，而不是本场最好）。
+
+        🔴 默认只挑**同一辆车**的场次：换了更快的车之后，那个成绩根本够不着，
+           拿去当参考只会让人一路看着 +8 秒。`car_name` 为空（车型表没命中）
+           时不做这层过滤 —— 宁可多比几个，也别因为查不到车型就完全不用历史数据。
+        """
+        out: list[dict] = []
+        for s in self.sessions():
+            f = s.get("file")
+            b = s.get("best_lap_s")
+            if not f or f == exclude or not isinstance(b, (int, float)):
+                continue
+            if b <= 0 or b >= best_s * 0.999:
+                continue
+            if same_car and car_name and s.get("car_name") \
+                    and s.get("car_name") != car_name:
+                continue
+            out.append(s)
+        out.sort(key=lambda x: x["best_lap_s"])
+        return out[:max(1, limit)]
 
     def lap_profile(self, file: str, lap: int | None = None,
                     step_m: float = 5.0) -> dict | None:
@@ -166,6 +190,9 @@ class ReplaySource:
             "file": "replay.jsonl", "live": True, "best_lap_s": 90.0}
         self.loop = loop
         self.profile_calls = 0
+        # 跨场次参考圈的候选（测试用）；真要回放历史时也可以填
+        self.history_candidates: list[dict] = []
+        self.profiles: dict[str, dict] = {}   # file -> profile（多候选时用）
 
     def poll(self) -> Frame | None:
         if not self._frames:
@@ -184,12 +211,25 @@ class ReplaySource:
     def live_session(self) -> dict | None:
         return self._session
 
-    def session_stats(self, file: str) -> dict | None:
-        return {"meta": {"file": file}, "best_lap": {"lap": 1, "time": 90.0}}
+    def faster_sessions(self, best_s: float, exclude: str = "",
+                        car_name: str = "", same_car: bool = True,
+                        limit: int = 3) -> list[dict]:
+        """回放模式下由测试直接指定候选（`history_candidates`）。"""
+        out = [c for c in self.history_candidates
+               if c.get("file") != exclude
+               and isinstance(c.get("best_lap_s"), (int, float))
+               and 0 < c["best_lap_s"] < best_s * 0.999]
+        out.sort(key=lambda x: x["best_lap_s"])
+        return out[:max(1, limit)]
 
     def lap_profile(self, file: str, lap: int | None = None,
                     step_m: float = 5.0) -> dict | None:
         self.profile_calls += 1
+        # 多候选场景（跨场次参考圈）按文件名取，缺省回落单一 profile
+        if file in self.profiles:
+            return self.profiles[file]
+        if self.profiles and self._profile is None:
+            return None
         return self._profile
 
     def clock(self) -> float:
@@ -204,3 +244,196 @@ class ReplaySource:
             return 0.0
         i = min(max(self._i - 1, 0), len(self._frames) - 1)
         return self._frames[i].t
+
+
+class FileSource:
+    """读 jsonl 场次文件当数据源 —— **完全离线**，连 GT7 Dash 都不需要。
+
+    用途是**调参**：跑一遍历史场次，看教练在什么位置会说什么话。
+    阈值（`brake_late_m` / `apex_slow_kph` / 冷却时间…）以前改一次就得
+    上方向盘试一次，而"感觉不对"这种反馈既慢又没法对比。有了它，
+    改一个数跑一遍就能看到会说的话怎么变 —— 而且是可 diff 的。
+
+    只依赖文件，所以也能当"没有服务端时的回放器"。
+    """
+
+    def __init__(self, path: str, *, lap: int | None = None,
+                 ref_lap: int | None = None, step_m: float = 5.0,
+                 max_frames: int = 0):
+        self.path = Path(path)
+        self.step_m = step_m
+        self.header, self._all = _read_session(self.path)
+        # `lap` 只回放这一天圈；`ref_lap` 指定参考圈（缺省 = 本文件最快圈）
+        self._frames = ([f for f in self._all if f.lap == lap] if lap
+                        else list(self._all))
+        if max_frames:
+            self._frames = self._frames[:max_frames]
+        self._i = 0
+        self._ref_lap = ref_lap
+        self._ref: RefLap | None = None
+        self.profile_calls = 0
+        self._session = {
+            "file": self.path.name, "live": True,
+            "best_lap_s": self.best_lap_s,
+            "car_name": str(self.header.get("car") or ""),
+        }
+
+    # —— 元信息 ————————————————————————————————————————
+
+    @property
+    def best_lap_s(self) -> float | None:
+        best = None
+        for lap, (t0, t1) in _lap_spans(self._all).items():
+            dur = t1 - t0
+            if dur >= 20.0 and (best is None or dur < best):
+                best = dur
+        return round(best, 3) if best else None
+
+    @property
+    def lap_spans(self) -> dict[int, tuple[float, float]]:
+        return _lap_spans(self._all)
+
+    def frames_of_lap(self, lap: int) -> list[Frame]:
+        return [f for f in self._all if f.lap == lap]
+
+    # —— Source 协议 ————————————————————————————————————
+
+    def poll(self) -> Frame | None:
+        if self._i >= len(self._frames):
+            return None
+        f = self._frames[self._i]
+        self._i += 1
+        return f
+
+    def clock(self) -> float:
+        """虚拟时钟 = 帧自带的墙钟。用墙上时钟当闸门时钟会让 20s 冷却
+        在一次几秒跑完的回放里永远生效，得出"教练一句话都不说"的假结论。"""
+        if not self._frames:
+            return 0.0
+        return self._frames[min(max(self._i - 1, 0), len(self._frames) - 1)].t
+
+    def sessions(self) -> list[dict]:
+        return [self._session]
+
+    def live_session(self) -> dict | None:
+        return self._session
+
+    def faster_sessions(self, *_a, **_k) -> list[dict]:
+        """离线只有一场，没有"跨场次更快"可言。"""
+        return []
+
+    def _best_lap_no(self) -> int | None:
+        best, best_dur = None, None
+        for lap, (t0, t1) in _lap_spans(self._all).items():
+            dur = t1 - t0
+            if dur >= 20.0 and (best_dur is None or dur < best_dur):
+                best, best_dur = lap, dur
+        return best
+
+    def lap_profile(self, file: str, lap: int | None = None,
+                    step_m: float = 5.0) -> dict | None:
+        """本地从帧建参考圈剖面 —— 不连服务端。
+
+        顺带把「拿不到 Dash `/profile` 时自攒参考圈」那条降级路径也跑通了：
+        离线回放走的正是同一条代码路径。
+        """
+        self.profile_calls += 1
+        want = lap if lap else (self._ref_lap or self._best_lap_no())
+        if not want:
+            return None
+        fs = self.frames_of_lap(int(want))
+        if len(fs) < 30:
+            return None
+        try:
+            self._ref = RefLap.from_frames(fs, lap=int(want), step_m=step_m)
+        except ValueError:
+            return None
+        return self._ref.to_profile()
+
+    @property
+    def last_error(self) -> str | None:
+        return None
+
+
+def _lap_spans(frames: list[Frame]) -> dict[int, tuple[float, float]]:
+    """每圈的首末帧时刻（**用帧自己的 t**，不是圈内计时）。
+
+    注意与 `lap_time_s` 的区别：那个是圈内相对时间，用来喂规则；
+    这里是绝对跨度，用来判"这圈是不是跑满了一整圈"（≥20s，同 Dash 口径）。
+    """
+    out: dict[int, tuple[float, float]] = {}
+    for f in frames:
+        if f.lap <= 0:
+            continue
+        t0, t1 = out.get(f.lap, (f.t, f.t))
+        out[f.lap] = (min(t0, f.t), max(t1, f.t))
+    return out
+
+
+def _read_session(path: Path) -> tuple[dict, list[Frame]]:
+    """流式读一个场次 jsonl。返回 (header, frames)。
+
+    🔴 两条必须遵守的规矩（都是踩过的）：
+      1. **最后一行可能没有换行符** —— 正在录制时那是写了一半的行，
+         `json.loads` 会抛异常把整场读成 0 帧（Dash 侧实测 4183 → 0）。
+         没换行符就直接丢。
+      2. `t` 是**绝对墙钟**，所以圈内用时必须自己用「本圈首帧」做差 ——
+         不能拿 `t` 当圈内计时直接喂规则。
+    """
+    frames: list[Frame] = []
+    header: dict = {}
+    lap_start: dict[int, float] = {}
+    with open(path, "r", encoding="utf-8") as fh:
+        for i, line in enumerate(fh):
+            if not line.endswith("\n"):
+                break                       # 半截行，丢掉
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if i == 0:
+                header = d
+                continue
+            lap = d.get("lap") or 0
+            try:
+                lap = int(lap)
+            except (TypeError, ValueError):
+                lap = 0
+            if lap < 0 or lap >= 0xFFFF:
+                lap = 0
+            t = float(d.get("t") or 0.0)
+            if lap > 0 and lap not in lap_start:
+                lap_start[lap] = t
+            g = d.get("g_force") or [0.0, 0.0, 0.0]
+            tt = d.get("tyre_temp") or []
+            wr = d.get("wheel_rads") or []
+            mx = d.get("max_alert_rpm") or 0.0
+            frames.append(Frame(
+                t=t,
+                lap_time_s=max(0.0, t - lap_start.get(lap, t)),
+                last_lap_ms=(float(d["last_lap_ms"])
+                             if isinstance(d.get("last_lap_ms"), (int, float))
+                             else None),
+                speed_kph=float(d.get("speed_kph") or 0.0),
+                rpm=float(d.get("rpm") or 0.0),
+                max_rpm=float(mx) if isinstance(mx, (int, float)) else 0.0,
+                gear=int(d.get("gear") or 0),
+                throttle=float(d.get("throttle") or 0.0),
+                brake=float(d.get("brake") or 0.0),
+                lap=lap,
+                x=float(d.get("car_x") or 0.0),
+                y=float(d.get("car_y") or 0.0),
+                z=float(d.get("car_z") or 0.0),
+                glon=float(g[0]) if len(g) > 0 else 0.0,
+                glat=float(g[1]) if len(g) > 1 else 0.0,
+                tyre_temp=tuple(float(v) for v in tt) if isinstance(tt, list) else (),
+                wheel_rads=tuple(float(v) for v in wr) if isinstance(wr, list) else (),
+                fuel_pct=float(d.get("gas_level") or 0.0),
+                fuel_capacity_l=float(d.get("gas_capacity") or 0.0),
+                powertrain=str(d.get("powertrain") or ""),
+                connected=True,
+            ))
+    return header, frames

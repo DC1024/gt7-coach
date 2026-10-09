@@ -55,7 +55,9 @@ def synth_lap_frames(radius_m: float = 600.0, base_kph: float = 200.0,
                      dip_kph: float = 90.0, dip_start_m: float = 400.0,
                      dip_len_m: float = 160.0, hz: float = 10.0,
                      lap: int = 1, laps: int = 1,
-                     with_wheels: bool = True) -> list[Frame]:
+                     with_wheels: bool = True, fuel_start: float = 100.0,
+                     fuel_per_lap: float = 8.0,
+                     powertrain: str = "fuel") -> list[Frame]:
     """一圈（或多圈首尾相接）的合成帧。
 
     `hz` 缺省 10 —— 故意对齐实时侧 10Hz 轮询的真实采样率，
@@ -63,6 +65,9 @@ def synth_lap_frames(radius_m: float = 600.0, base_kph: float = 200.0,
 
     轮胎角速度按 `ω = v/R_tyre` 造，所以滑移率恒为 0（自由滚动）——
     想要打滑场景自己把某一轮的 ω 乘上去。
+
+    油量按**里程**线性消耗（`fuel_per_lap` 每圈），这样"每圈油耗"正好等于
+    `fuel_per_lap`，油耗/续航逻辑就有了可验算的真值。
     """
     length, base_kph, dip_kph, dip_start, dip_len = _params(
         radius_m, base_kph, dip_kph, dip_start_m, dip_len_m)
@@ -96,6 +101,10 @@ def synth_lap_frames(radius_m: float = 600.0, base_kph: float = 200.0,
                 glat=round(glat, 3), glon=round(glon, 3),
                 tyre_temp=(88.0, 89.0, 86.0, 87.0),
                 wheel_rads=(omega, omega, omega, omega) if with_wheels else (),
+                fuel_pct=round(max(0.0, fuel_start - fuel_per_lap * (s / length)
+                                   - fuel_per_lap * (lp - lap)), 3),
+                fuel_capacity_l=100.0,
+                powertrain=powertrain,
                 connected=True,
             ))
             s += v * dt

@@ -173,3 +173,19 @@ class TestHealthDiagnostics:
         assert wait_for(lambda: _get(server + "/api/v1/coach/health")[1]
                         .get("sess_state") == "ok", timeout=3.0), \
             _get(server + "/api/v1/coach/health")[1]
+
+
+class TestVoicePreemption:
+    """P0 要能**打断**正在念的闲话。
+
+    浏览器 TTS 默认是排队制：一句 delta 会把随后的"出界"堵在它后面，
+    等念完黄花菜都凉了。真赛车无线电是抢麦，不是排队。
+    """
+
+    def test_demo_page_cancels_on_p0(self, server):
+        with _OPENER.open(server + "/", timeout=5) as r:
+            html = r.read().decode("utf-8")
+        assert "speechSynthesis.cancel()" in html
+        assert "prio === 0" in html, "只有 P0 才抢占，否则会互相打断"
+        # 播报时必须把优先级传进去（不传就等于永远不抢占）
+        assert "d.say[0].priority" in html

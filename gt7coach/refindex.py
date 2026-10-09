@@ -32,10 +32,64 @@ from typing import Any, Iterable
 
 G = 9.80665
 
-# 弯心半径：κ = G_lat·g / v²，|κ| 小于这个值就当直线（不给半径）
-_KAPPA_EPS = 5e-4
 # 单帧位移超过这个数（>3600 km/h）判为坐标跳变（换圈/重生），不计入弧长
 _ARC_GAP_M = 100.0
+
+
+def arc_lengths(xs: list[float], zs: list[float]) -> tuple[list[float], bool]:
+    """相邻点弦长累积的几何弧长（米）。返回 (弧长, 是否真的用了几何)。
+
+    🔴 只依赖坐标，与速度无关 —— 这是它相对「速度积分」的唯一也是全部优势：
+       速度积分一圈漂移 60~300 m，拿它做跨圈/跨场对齐会错十几米。
+       坐标缺失时返回 ([0.0]*n, False)，调用方**必须**把降级暴露出去。
+
+    提成模块级函数是因为 lapstats（每圈分段用时）也要用同一份实现 ——
+    两处各写一遍，口径分叉了也不会有人发现。
+    """
+    n = len(xs)
+    if n == 0 or len(zs) != n:
+        return [], False
+    if not all(isinstance(v, (int, float)) for v in xs + zs):
+        return [0.0] * n, False
+    if (max(abs(v) for v in xs) + max(abs(v) for v in zs)) <= 1e-6:
+        return [0.0] * n, False
+    out = [0.0]
+    acc = 0.0
+    px, pz = xs[0], zs[0]
+    for i in range(1, n):
+        cx, cz = xs[i], zs[i]
+        d = math.hypot(cx - px, cz - pz)
+        if d < _ARC_GAP_M:
+            acc += d
+        px, pz = cx, cz
+        out.append(acc)
+    return out, True
+
+
+def interp_at(dists: list[float], values: list[float], d: float) -> float:
+    """在**单调不减**的 dists 上按 d 线性插值取 values。两端夹住不外推。"""
+    if not dists:
+        return 0.0
+    if d <= dists[0]:
+        return values[0]
+    if d >= dists[-1]:
+        return values[-1]
+    lo, hi = 0, len(dists) - 1
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if dists[mid] <= d:
+            lo = mid
+        else:
+            hi = mid
+    d0, d1 = dists[lo], dists[hi]
+    if d1 <= d0:
+        return values[hi]
+    k = (d - d0) / (d1 - d0)
+    return values[lo] + (values[hi] - values[lo]) * k
+
+
+# 弯心半径：κ = G_lat·g / v²，|κ| 小于这个值就当直线（不给半径）
+_KAPPA_EPS = 5e-4
 
 
 @dataclass
@@ -43,7 +97,8 @@ class RefLap:
     """一圈的按位置索引剖面。所有数组 `grid_m` 一一对齐。"""
 
     lap: int = 0
-    source: str = "profile"          # "profile"（Dash 60Hz）| "self"（自攒）
+    # "profile" 本场最快圈（Dash 60Hz）| "self" 自攒 | "history" 跨场次历史最快
+    source: str = "profile"
     grid_m: list[float] = field(default_factory=list)
     speed_kph: list[float] = field(default_factory=list)
     throttle: list[float] = field(default_factory=list)
@@ -61,7 +116,8 @@ class RefLap:
     # —— 构造 ——————————————————————————————————————————
 
     @staticmethod
-    def from_profile(d: dict[str, Any], require_geometry: bool = True) -> "RefLap":
+    def from_profile(d: dict[str, Any], require_geometry: bool = True,
+                     source: str = "profile") -> "RefLap":
         """解析 GT7 Dash `/profile` 的响应。
 
         `require_geometry=True`（缺省）时，**没有坐标的剖面直接拒绝** ——
@@ -81,7 +137,7 @@ class RefLap:
         mk = d.get("markers") or {}
         ref = RefLap(
             lap=int(d.get("lap") or 0),
-            source="profile",
+            source=source,
             grid_m=[float(v) for v in grid],
             speed_kph=[float(v) for v in (d.get("speed_kph") or [])],
             throttle=[float(v) for v in (d.get("throttle") or [])],
@@ -113,14 +169,8 @@ class RefLap:
         if len(fs) < 30:
             raise ValueError(f"可用帧太少（{len(fs)}），无法自攒参考圈")
 
-        s: list[float] = [0.0]
-        acc = 0.0
-        for a, b in zip(fs, fs[1:]):
-            d = math.hypot(b.x - a.x, b.z - a.z)
-            if d < _ARC_GAP_M:
-                acc += d
-            s.append(acc)
-        total = s[-1]
+        s, _geo_ok = arc_lengths([f.x for f in fs], [f.z for f in fs])
+        total = s[-1] if s else 0.0
         if total < 200.0:
             raise ValueError(f"圈长不足 200 m（{total:.1f}）")
 
@@ -134,18 +184,7 @@ class RefLap:
             d += step
 
         def interp(vals: list[float], q: float) -> float:
-            if q <= s[0]:
-                return vals[0]
-            if q >= s[-1]:
-                return vals[-1]
-            i = 0
-            while i + 1 < len(s) and s[i + 1] < q:
-                i += 1
-            d0, d1 = s[i], s[i + 1]
-            if d1 <= d0:
-                return vals[i + 1]
-            k = (q - d0) / (d1 - d0)
-            return vals[i] + (vals[i + 1] - vals[i]) * k
+            return interp_at(s, vals, q)
 
         def col(attr: str) -> list[float]:
             raw = [float(getattr(f, attr) or 0.0) for f in fs]
@@ -188,23 +227,7 @@ class RefLap:
         """在距离 s 处线性插值取列值。"""
         if not col or not self.grid_m:
             return None
-        g = self.grid_m
-        if s <= g[0]:
-            return col[0]
-        if s >= g[-1]:
-            return col[-1]
-        lo, hi = 0, len(g) - 1
-        while hi - lo > 1:
-            mid = (lo + hi) // 2
-            if g[mid] <= s:
-                lo = mid
-            else:
-                hi = mid
-        d0, d1 = g[lo], g[hi]
-        if d1 <= d0:
-            return col[hi]
-        k = (s - d0) / (d1 - d0)
-        return col[lo] + (col[hi] - col[lo]) * k
+        return interp_at(self.grid_m, col, s)
 
     def t_at_s(self, s: float) -> float | None:
         """参考圈跑到距离 s 用了多少秒（圈首为 0）。"""
@@ -359,3 +382,66 @@ class RefLap:
                         "after_apex_m": round(g[m] - g[k], 1),
                     })
                     break
+
+    def shape_distance(self, other: "RefLap") -> float | None:
+        """两条折线的**形状差异**（米）—— 中位最近点距离。
+
+        用来判断"这条参考圈是不是同一条赛道的"：同一赛道的两条走线
+        （哪怕快慢差几秒）中位距离只有几米；换一条赛道就是几十上百米。
+        反例（反向布局、不同线路变体）长度可能一样，但形状差得远 —— 所以
+        必须比**形状**而不是比圈长。
+
+        取中位数而不是均值/最大值：走线在个别弯里差十几米很正常（那是水平差异，
+        不是赛道不同），而均值会被这些点拉高，最大值更是完全没有判别力。
+
+        返回 None = 两边有一方没有折线（无法判断，调用方应当保守处理）。
+        """
+        if not self.xs or not other.xs:
+            return None
+        ds: list[float] = []
+        for x, z in zip(self.xs, self.zs):
+            best = float("inf")
+            for ox, oz in zip(other.xs, other.zs):
+                d2 = (x - ox) ** 2 + (z - oz) ** 2
+                if d2 < best:
+                    best = d2
+            ds.append(math.sqrt(best))
+        if not ds:
+            return None
+        ds.sort()
+        n = len(ds)
+        return ds[n // 2] if n % 2 else (ds[n // 2 - 1] + ds[n // 2]) / 2.0
+
+    def to_profile(self) -> dict[str, Any]:
+        """导出成 GT7 Dash `/profile` 的形状。
+
+        两个用途：
+          · 离线回放（`FileSource`）—— 不连服务端也能有参考圈
+          · 让 `from_profile` / `to_profile` 形成**可测的往返**：
+            序列化出来的东西能不能被自己解析回去，是能写断言的
+        """
+        n = len(self.grid_m)
+        step = round(self.grid_m[1] - self.grid_m[0], 2) if n > 1 else 0.0
+        return {
+            "lap": self.lap,
+            "frames": 0,
+            "length_m": self.length_m,
+            "length_by_speed_m": self.length_m,
+            "length_drift_pct": None,
+            "geometry_used": True,
+            "lap_time_s": self.lap_time_s,
+            "step_m": step,
+            "grid_m": list(self.grid_m),
+            "speed_kph": list(self.speed_kph),
+            "throttle": list(self.throttle),
+            "brake": list(self.brake),
+            "t_rel_s": list(self.t_rel_s),
+            # 几何弧长口径下这两个通道本地没算（规则也不用），给空列表
+            "glat": [], "glon": [],
+            "pt": {"x": list(self.xs), "z": list(self.zs)},
+            "markers": {"brake_in": list(self.brake_in),
+                        "apex": list(self.apex),
+                        "throttle_on": list(self.throttle_on),
+                        "peak": [], "valley": []},
+            "warnings": list(self.warnings),
+        }
