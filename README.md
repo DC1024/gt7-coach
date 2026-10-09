@@ -428,6 +428,16 @@ python -m gt7coach serve --cloud /opt/gt7-coach/data/cloud.json
 也可以在**仪表盘「赛道工程师」卡片 →「播报设置」→ 云措辞模型**里直接填
 （写回同一个文件，立即生效）。
 
+> **Docker 部署时它在哪**：容器里固定用 `/opt/gt7-coach/data/cloud.json`，
+> 由 compose 的 `./data:/opt/gt7-coach/data` 挂出来持久化（这文件是运行态，
+> 卡片里改的模型名写回它，容器重建不该冲掉）。
+> `tools/deploy.py` 会在**文件不存在时**播种一份默认值（`enabled: true`、
+> `model` 留空 = 用厂商预设的免费模型、只写 `api_key_env` 变量名），**已存在就原样保留**。
+>
+> 🔴 **key 不代管**：仓库里不放、部署脚本也不传。要用云措辞就自己在服务器上
+> `export GT7_COACH_LLM_KEY=sk-xxx`（或写进 `/opt/gt7-coach/.env`，已 gitignore）
+> 并取消 compose 里那行的注释。不填 = 纯本地模板，零外呼。
+
 #### 填哪个？百炼的免费额度模型（2026-10 控制台）
 
 教练的云润色用的就是 `.1` 那类**大语言模型**：

@@ -11,3 +11,7 @@ _sshkey/
 _*.py
 _*.log
 _data/
+# 运行态（含云措辞 cloud.json —— 卡片里改的模型名写回这里）
+data/
+# compose 的 key 放这儿，绝不进仓库
+.env

@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import sys
+import tempfile
 import time
 
 try:
@@ -31,6 +33,19 @@ except ImportError:                       # pragma: no cover
 
 DASH_FILES = ["gt7-dashboard.py", "gt7analysis.py", "gt7-recorder.py"]
 COACH_TOP = ["Dockerfile", "docker-compose.yml", ".dockerignore"]
+
+# 首次播种的云措辞配置。🔴 **不含 key**，只写"从哪个环境变量读 key"，所以
+# 放服务器上是安全的；key 由使用者自己在服务器上 export（本工具不代管）。
+# model 留空 = 用厂商预设，现在是免费额度内的 qwen3.8-flash —— 没 key 时
+# 也不会外呼，填了 key 就直接能用且不产生费用。
+CLOUD_SEED = {
+    "enabled": True,
+    "provider": "dashscope",
+    "model": "",
+    "api_key_env": "GT7_COACH_LLM_KEY",
+}
+CLOUD_DIR = "/opt/gt7-coach/data"
+CLOUD_LIVE = CLOUD_DIR + "/cloud.json"
 
 
 def md5_file(path: str) -> str:
@@ -95,9 +110,35 @@ def deploy_dash(d: Deployer, dash_dir: str, skip: bool) -> None:
           "--no-deps gt7-recorder gt7-dashboard 2>&1 | tail -6")
 
 
+def seed_cloud(d: Deployer) -> None:
+    """准备好持久化的云措辞配置目录，并**仅在缺失时**播种 cloud.json。
+
+    🔴 为什么是"仅缺失时"：cloud.json 是**运行态** —— 仪表盘卡片里改的模型名
+       会写回它。每次部署都重写，用户刚选的模型就被冲掉了。
+    🔴 为什么目录必须存在：卡片的保存走"临时文件 + 原子替换"，目录不存在
+       会直接写失败，表现是"填了没反应"。
+    """
+    d.run(f"mkdir -p {CLOUD_DIR}", quiet=True)
+    fd, tmp = tempfile.mkstemp(suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(CLOUD_SEED, fh, ensure_ascii=False, indent=2)
+        # 留一份默认值在服务器上做参照；真正的活文件只在缺失时从它拷贝
+        d.sftp.put(tmp, CLOUD_DIR + "/cloud.default.json")
+    finally:
+        os.unlink(tmp)
+    out = d.run(f"cd {CLOUD_DIR} && "
+                f"if [ -f cloud.json ]; then echo 保留既有; "
+                f"else cp cloud.default.json cloud.json; echo 已播种; fi",
+                quiet=True)
+    print(f"    云措辞配置 {CLOUD_LIVE} 就绪（{out.strip() or 'ok'}）；"
+          f"key 由使用者自己 export，本工具不代管")
+
+
 def deploy_coach(d: Deployer, coach_dir: str) -> None:
     print("\n[2/3] GT7 Coach：上传 → 重建镜像 → 重启")
     d.run("mkdir -p /opt/gt7-coach/gt7coach", quiet=True)
+    seed_cloud(d)
     for name in COACH_TOP:
         d.put_verified(os.path.join(coach_dir, name), f"/opt/gt7-coach/{name}")
     pkg = os.path.join(coach_dir, "gt7coach")
