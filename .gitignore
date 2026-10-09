@@ -8,3 +8,5 @@ build/
 *.egg-info/
 _ui_check/
 _sshkey/
+_*.py
+_*.log

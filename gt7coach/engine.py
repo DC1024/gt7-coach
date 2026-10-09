@@ -46,26 +46,84 @@ class CoachConfig:
 
 
 class RefProvider:
-    """后台取参考圈剖面。线程只写、tick 只读。"""
+    """后台取「当前场次」与参考圈剖面。线程只写、tick 只读。
+
+    🔴 为什么连「找场次」也要后台做：
+       `/api/v1/sessions` 的冷态要把每个场次文件流式扫一遍才能给出列表里的
+       「最快圈」（实测服务器上 5 场里有个 111 MB 的 → **11 秒**），而容器
+       每次重启都会回到冷态。早先这一句是同步写在 tick 里的，后果是
+       每个 tick 卡 3~11 秒、10Hz 直接掉到 0.3Hz —— 仪表盘慢一下，
+       教练就整个哑掉。**慢的依赖绝不能在 tick 线程上等。**
+    """
 
     def __init__(self, source: Any, step_m: float = 5.0,
-                 retry_s: float = 20.0):
+                 retry_s: float = 20.0,
+                 boot_gap_s: float = 2.0, idle_gap_s: float = 15.0):
         self.src = source
         self.step_m = step_m
         self.retry_s = retry_s
+        # 还没拿到参考圈时勤问（尽快能用）；有了之后偶尔问一次（换场要能发现）
+        self.boot_gap_s = boot_gap_s
+        self.idle_gap_s = idle_gap_s
         self._lock = threading.Lock()
         self._ref: RefLap | None = None
         self._key: tuple | None = None
         self._state = "idle"           # idle | loading | ready | failed | unsupported
         self._err: str | None = None
         self._last_try = 0.0
-        self._profile_ok: bool | None = None
+        # —— 场次发现（独立于参考圈）——
+        self._sess: dict | None = None
+        self._sess_state = "idle"      # idle | loading | ok | empty | failed
+        self._sess_err: str | None = None
+        self._last_sess_poll = -1e9
 
     @staticmethod
     def key_for(sess: dict) -> tuple:
         """参考圈的身份：换了场次、或最快圈被刷新，就要重取。"""
         return (sess.get("file"), sess.get("best_lap_s"))
 
+    # —— 场次发现 ————————————————————————————————————
+
+    def tick_session(self, now: float) -> dict | None:
+        """由 tick 调用的**非阻塞**入口：到点了就叫醒后台去问，立刻返回已知值。
+
+        绝不在调用线程上发 HTTP。上一次还没回来就不重复起线程
+        （否则慢服务端会让线程越堆越多）。
+        """
+        with self._lock:
+            gap = self.idle_gap_s if self._ref is not None else self.boot_gap_s
+            due = (self._sess_state != "loading"
+                   and now - self._last_sess_poll >= gap)
+            if due:
+                self._last_sess_poll = now
+                self._sess_state = "loading"
+            sess = self._sess
+        if due:
+            threading.Thread(target=self._discover, daemon=True,
+                             name="gt7coach-sess").start()
+        return sess
+
+    def _discover(self) -> None:
+        try:
+            sess = self.src.live_session()
+            with self._lock:
+                self._sess = sess
+                self._sess_state = "ok" if sess else "empty"
+                self._sess_err = None
+        except Exception as e:               # noqa: BLE001
+            with self._lock:
+                self._sess_state = "failed"
+                self._sess_err = f"{type(e).__name__}: {e}"
+
+    def session(self) -> dict | None:
+        with self._lock:
+            return self._sess
+
+    def session_status(self) -> tuple[str, str | None]:
+        with self._lock:
+            return self._sess_state, self._sess_err
+
+    # —— 参考圈 ————————————————————————————————————
     def request(self, sess: dict) -> None:
         """有需要就在后台起一次取数；重复调用是安全的（幂等）。"""
         if not sess or not sess.get("file"):
@@ -133,7 +191,9 @@ class CoachEngine:
         # 时钟可注入：回放用比赛时钟，真机用墙上时钟（两者本就相等）
         self._clock = clock or time.monotonic
         self.refs = RefProvider(source, step_m=self.cfg.profile_step_m,
-                                retry_s=self.cfg.profile_retry_s)
+                                retry_s=self.cfg.profile_retry_s,
+                                boot_gap_s=self.cfg.sess_poll_boot_s,
+                                idle_gap_s=self.cfg.sess_poll_idle_s)
 
         self._st_rules = RuleSet.fresh_state()
         self._st_gate = Gate.fresh_state()
@@ -145,7 +205,6 @@ class CoachEngine:
         self._spoken: list[dict[str, Any]] = []
         self._ticks = 0
         self._ref_sess_key: tuple | None = None
-        self._last_sess_poll = -1e9
 
     # —— 对外 ——————————————————————————————————————————
 
@@ -200,8 +259,8 @@ class CoachEngine:
         if len(self._lap_buf) > self.cfg.lap_buffer_max:
             del self._lap_buf[:len(self._lap_buf) - self.cfg.lap_buffer_max]
 
-        # —— 参考圈：找当前场次，需要就后台取 ——
-        self._maybe_request_ref()
+        # —— 参考圈：场次发现与剖面取数全在后台线程，这里只读缓存 ——
+        self._maybe_request_ref(now)
 
         ref = self._current_ref()
         s: float | None = None
@@ -245,6 +304,7 @@ class CoachEngine:
                 next_s = round(d / max(f.speed_ms, 1.0), 2)
 
         _ref, ref_state, ref_err = self.refs.get()
+        sess_state, sess_err = self.refs.session_status()
         return CoachState(
             connected=f.connected,
             ref_ready=ref is not None,
@@ -264,6 +324,11 @@ class CoachEngine:
                 "ref_source": ref.source if ref else None,
                 "ref_state": ref_state,
                 "ref_error": ref_err,
+                # 场次发现单独暴露：它可能比参考圈更早失败，
+                # 而且失败原因往往是"仪表盘冷态在算最快圈"这种慢，
+                # 不区分开就分不清是网络断了还是对方在忙。
+                "sess_state": sess_state,
+                "sess_error": sess_err,
                 "lateral_m": round(lateral_m, 1) if lateral_m is not None else None,
                 "lap_frames": len(self._lap_buf),
                 "dropped_by_gate": self._st_gate.get("dropped", 0),
@@ -278,18 +343,9 @@ class CoachEngine:
             },
         )
 
-    def _maybe_request_ref(self) -> None:
-        # 🔴 按节流问场次列表，不是每 tick 都问（理由见 CoachConfig）。
-        #    还没参考圈时勤问（尽快能用），有了之后偶尔问一次（换个场要能发现）。
-        have_ref = self._current_ref() is not None
-        gap = (self.cfg.sess_poll_idle_s if have_ref
-               else self.cfg.sess_poll_boot_s)
-        now = time.monotonic()
-        if now - self._last_sess_poll < gap:
-            return
-        self._last_sess_poll = now
-
-        sess = self.src.live_session()
+    def _maybe_request_ref(self, now: float) -> None:
+        """参考圈：拿后台已发现的场次去要剖面。**这里不发任何 HTTP。**"""
+        sess = self.refs.tick_session(now)
         if not sess or not sess.get("file"):
             return
         key = RefProvider.key_for(sess)

@@ -110,6 +110,14 @@ class CoachService:
                 "ref_ready": st.ref_ready,
                 "ref_source": st.stats.get("ref_source"),
                 "source_error": st.stats.get("source_error"),
+                # 场次发现的状态要放进 health：排障时第一个要回答的问题是
+                # 「是网络断了、还是仪表盘在忙、还是真的没在录」。
+                # 藏在 state 里的话，用 curl 看 health 的人只会看到
+                # connected=false 然后开始瞎猜。
+                "sess_state": st.stats.get("sess_state"),
+                "sess_error": st.stats.get("sess_error"),
+                "ref_state": st.stats.get("ref_state"),
+                "ref_error": st.stats.get("ref_error"),
             }
 
     def config(self) -> dict[str, Any]:

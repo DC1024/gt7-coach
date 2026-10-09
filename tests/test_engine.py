@@ -10,6 +10,8 @@
 from __future__ import annotations
 
 import math
+import threading
+import time
 
 import pytest
 
@@ -27,14 +29,13 @@ def make_engine(*, with_profile=True, laps=3, interval=0.01, **cfg_over):
     frames = synth_lap_frames(radius_m=R, hz=10.0, laps=laps)
     prof = synth_profile(radius_m=R) if with_profile else None
     src = ReplaySource(frames, profile=prof, loop=True)
-    cfg = CoachConfig(poll_interval_s=interval, sess_poll_boot_s=0.0,
-                      sess_poll_idle_s=0.0, **cfg_over)
+    cfg = CoachConfig(poll_interval_s=interval, sess_poll_boot_s=0.02,
+                      sess_poll_idle_s=0.05, **cfg_over)
     return CoachEngine(src, cfg), src
 
 
 def drive(eng, n, sleep=0.0):
     """跑 n 次 tick，返回最后一次的 state。"""
-    import time
     st = None
     for _ in range(n):
         st = eng.tick()
@@ -43,16 +44,21 @@ def drive(eng, n, sleep=0.0):
     return st
 
 
-def wait_ref(eng, source="profile", timeout=3.0):
+def wait_ref(eng, source="profile", timeout=4.0):
     """等到参考圈就位。
 
-    🔴 必须先 tick 一次 —— 参考圈的取数线程是在 tick 里按需启动的，
-       没 tick 过就等，等的是一个永远不会开始的线程。
+    🔴 必须**边等边 tick**。参考圈是两跳异步的：tick 先唤醒「找场次」的线程，
+    下次 tick 拿到场次后才去要剖面。只 tick 一次然后干等，等的是一个
+    还没被安排的下一步。而且所有 HTTP 都在后台线程上，tick 本身不阻塞。
     """
-    eng.tick()
-    return wait_for(lambda: (eng._current_ref() is not None
-                             and eng._current_ref().source == source),
-                    timeout=timeout)
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        eng.tick()
+        ref = eng._current_ref()
+        if ref is not None and ref.source == source:
+            return True
+        time.sleep(0.01)
+    return False
 
 
 class TestRefAcquisition:
@@ -116,7 +122,11 @@ class TestSessionChange:
         assert eng._self_ref is not None
         src._session = {"file": "another.jsonl", "live": True,
                         "best_lap_s": 88.0}
-        eng.tick()
+        # 场次发现是后台的：要给它机会跑一轮（tick 只负责唤醒线程）
+        end = time.monotonic() + 3.0
+        while time.monotonic() < end and eng._self_ref is not None:
+            eng.tick()
+            time.sleep(0.02)
         assert eng._self_ref is None, "换场次后自攒参考圈必须作废"
         assert eng._lap_buf == []
 
@@ -230,8 +240,8 @@ class TestBadDrivingEndToEnd:
 
     def _run(self, frames):
         src = ReplaySource(frames, profile=synth_profile(radius_m=R))
-        eng = CoachEngine(src, CoachConfig(sess_poll_boot_s=0.0,
-                                           sess_poll_idle_s=0.0),
+        eng = CoachEngine(src, CoachConfig(sess_poll_boot_s=0.02,
+                                           sess_poll_idle_s=0.05),
                           clock=src.clock)
         assert wait_ref(eng), "参考圈没就位"
         said = {}
@@ -300,11 +310,71 @@ class TestBadDrivingEndToEnd:
                              400.0, 700.0, brake=0.0, throttle=0.05,
                              speed_kph=195.0, rpm=8600.0, max_rpm=8200.0)
         src = ReplaySource(frames, profile=synth_profile(radius_m=R))
-        eng = CoachEngine(src, CoachConfig(sess_poll_boot_s=0.0,
-                                           sess_poll_idle_s=0.0),
+        eng = CoachEngine(src, CoachConfig(sess_poll_boot_s=0.02,
+                                           sess_poll_idle_s=0.05),
                           clock=src.clock)
         assert wait_ref(eng)
         normal = 0
         for _ in range(len(frames)):
             normal += len([u for u in eng.tick().say if u.priority >= 2])
         assert normal <= eng.gate.cfg.max_per_lap, normal
+
+
+class TestSlowDependencyMustNotStallTicks:
+    """🔴 慢的依赖绝不能在 tick 线程上等。
+
+    这是服务器上真实踩到的：`/api/v1/sessions` 的冷态要把每个场次文件
+    流式扫一遍才能给出列表里的「最快圈」（服务器上 5 场里有个 111 MB 的
+    → **11 秒**），而容器每次重启都回到冷态。早先「找哪一场在直播」是同步
+    写在 tick 里的，于是每个 tick 卡 3~11 秒、10Hz 掉到 0.3Hz ——
+    仪表盘慢一下，教练整个哑掉。现象是 `/health` 里 ticks 个位数、
+    source_error=timed out，而两边其实都在正常运行。
+    """
+
+    class SlowSession(ReplaySource):
+        """`live_session()` 慢 1 秒（模拟冷态场次列表）。"""
+
+        def live_session(self):
+            time.sleep(1.0)
+            return self._session
+
+    def _engine(self):
+        frames = synth_lap_frames(radius_m=R, hz=10.0, laps=2)
+        src = self.SlowSession(frames, profile=synth_profile(radius_m=R),
+                               loop=True)
+        return CoachEngine(src, CoachConfig(sess_poll_boot_s=0.02,
+                                            sess_poll_idle_s=0.05),
+                           clock=src.clock), src
+
+    def test_ticks_stay_fast_despite_slow_session_lookup(self):
+        eng, _ = self._engine()
+        eng.tick()                     # 唤醒一次场次发现（1 秒的慢查询）
+        t0 = time.monotonic()
+        for _ in range(30):
+            eng.tick()
+        el = time.monotonic() - t0
+        assert el < 0.4, f"30 个 tick 花了 {el:.2f}s —— 慢查询把 tick 拖住了"
+
+    def test_no_thread_pileup_while_slow_lookup_pending(self):
+        """慢查询还没回来时不能继续堆线程，否则服务端一慢就线程爆炸。"""
+        eng, _ = self._engine()
+        eng.tick()
+        time.sleep(0.1)                # 上一次还在 loading
+        for _ in range(20):
+            eng.tick()
+        state, _err = eng.refs.session_status()
+        assert state == "loading", state
+        assert threading.active_count() < 12, threading.active_count()
+
+    def test_reference_still_arrives_despite_slow_lookup(self):
+        """慢不等于失败：场次最终被发现，参考圈照样建起来。"""
+        eng, _ = self._engine()
+        assert wait_ref(eng, timeout=6.0), eng.refs.session_status()
+
+    def test_stats_expose_session_state(self):
+        """场次发现的状态要单独暴露，否则分不清"网络断了"和"对方在忙"。"""
+        eng, _ = self._engine()
+        st = eng.tick()
+        assert "sess_state" in st.stats and "sess_error" in st.stats
+        assert st.stats["sess_state"] in ("idle", "loading", "ok", "empty",
+                                          "failed")

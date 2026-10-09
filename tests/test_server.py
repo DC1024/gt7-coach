@@ -150,3 +150,26 @@ class TestServiceRobustness:
             assert svc.health()["ticks"] > 0, "服务应当还在跑"
         finally:
             svc.stop()
+
+
+class TestHealthDiagnostics:
+    """`/health` 必须能一眼回答「是谁的问题」。
+
+    排障时第一个要回答的问题是：网络断了？仪表盘在忙？还是真的没在录？
+    这三种情况在 health 里长得**一模一样**（都是 connected=false），
+    所以场次发现与参考圈取数的状态必须各自单独暴露。
+    """
+
+    def test_health_exposes_both_states(self, server):
+        code, d, _ = _get(server + "/api/v1/coach/health")
+        assert code == 200
+        for k in ("sess_state", "ref_state", "ref_source",
+                  "sess_error", "ref_error"):
+            assert k in d, k
+
+    def test_sess_state_reaches_ok(self, server):
+        """ReplaySource 的场次发现很快 → 应落到 ok（不是一直 loading）。"""
+        from conftest import wait_for
+        assert wait_for(lambda: _get(server + "/api/v1/coach/health")[1]
+                        .get("sess_state") == "ok", timeout=3.0), \
+            _get(server + "/api/v1/coach/health")[1]

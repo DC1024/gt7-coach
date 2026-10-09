@@ -43,9 +43,14 @@ class HttpSource:
     """拉 GT7 Dash 的 HTTP v1 接口。"""
 
     def __init__(self, base_url: str, timeout: float = 3.0,
-                 live_stale_s: float = 20.0):
+                 slow_timeout: float = 40.0, live_stale_s: float = 20.0):
         self.base = base_url.rstrip("/")
         self.timeout = float(timeout)
+        # 🔴 慢接口要单独给宽限：`/api/v1/sessions` 冷态要**流式扫每个场次文件**
+        #    才能算出场次列表里的「最快圈」（实测服务器上 5 场里有个 111 MB 的，
+        #    冷态 11 秒、容器重启后又是冷态）。它走的都是后台线程，
+        #    等 40 秒没有代价；用 3 秒的通用超时反而永远发现不了场次。
+        self.slow_timeout = float(slow_timeout)
         # 场次列表里那个 live 标记有多可信：Dash 侧判的是「status.json 近 20s
         # 有写入」。这里再叠一层自己的新鲜度判断，避免对着一个刚断掉的场次
         # 反复取参考圈。
@@ -54,7 +59,8 @@ class HttpSource:
 
     # —— 底层 ——————————————————————————————————————————
 
-    def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
+    def _get(self, path: str, params: dict[str, Any] | None = None,
+             slow: bool = False) -> Any:
         url = self.base + path
         if params:
             url += "?" + urllib.parse.urlencode(params)
@@ -62,7 +68,8 @@ class HttpSource:
             "Accept": "application/json", "User-Agent": "gt7-coach/0.1",
         })
         try:
-            with _OPENER.open(req, timeout=self.timeout) as r:
+            with _OPENER.open(req, timeout=self.slow_timeout if slow
+                              else self.timeout) as r:
                 self._last_err = None
                 return json.loads(r.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
@@ -79,6 +86,7 @@ class HttpSource:
     # —— 实时帧 ————————————————————————————————————————
 
     def poll(self) -> Frame | None:
+        # 实时帧必须快：10Hz 的 tick 在等它。超时就当这一帧没来。
         d = self._get("/api/v1/live")
         if not isinstance(d, dict):
             return None
@@ -87,7 +95,7 @@ class HttpSource:
     # —— 场次 ——————————————————————————————————————————
 
     def sessions(self) -> list[dict]:
-        d = self._get("/api/v1/sessions")
+        d = self._get("/api/v1/sessions", slow=True)
         if not isinstance(d, dict):
             return []
         out = [s for s in (d.get("sessions") or []) if isinstance(s, dict)]
@@ -114,12 +122,18 @@ class HttpSource:
 
     def lap_profile(self, file: str, lap: int | None = None,
                     step_m: float = 5.0) -> dict | None:
-        """取参考圈剖面。`lap=None` = 让服务端给最快圈。"""
+        """取参考圈剖面。`lap=None` = 让服务端给最快圈。
+
+        同样走 slow 超时：冷路径要把整场 jsonl 解析成列式存储
+        （一场 20 万帧约 2s；服务器上有 111 MB 的场次），
+        而它只在后台线程里被调用，等待没有代价。
+        """
         params: dict[str, Any] = {"step": step_m}
         if lap:
             params["lap"] = int(lap)
         d = self._get(
-            f"/api/v1/sessions/{urllib.parse.quote(file)}/profile", params)
+            f"/api/v1/sessions/{urllib.parse.quote(file)}/profile", params,
+            slow=True)
         if not isinstance(d, dict) or d.get("error"):
             return None
         return d
