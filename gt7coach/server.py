@@ -50,6 +50,7 @@ from urllib.parse import parse_qs, urlparse
 
 from .contract import CoachState
 from .engine import CoachConfig, CoachEngine
+from .rules import SLIP_PRESETS
 from .version import version
 
 DEFAULT_PORT = 8788  # 紧挨着仪表盘的 8787，别抢
@@ -147,6 +148,8 @@ class CoachService:
             "coach": asdict(self.engine.cfg),
             "rules": asdict(self.engine.rules.cfg),
             "gate": asdict(self.engine.gate.cfg),
+            # #J：打滑三档预设的各档基线，给 UI 渲染下拉 + 滑块初始值
+            "slip_presets": dict(SLIP_PRESETS),
         }
 
     def cloud_status(self) -> dict[str, Any]:
@@ -268,6 +271,13 @@ class CoachService:
         （防止前端一个笔误就把阈值改成字符串，之后比较运算静默全 False。）
         """
         applied: dict[str, list[str]] = {}
+        # 🔴 #J：打滑预设 `slip_preset` 是字符串字段，不能走下面的数值白名单，
+        #    单独摘出来处理——选预设时把 `slip_threshold` 设回该档基线，
+        #    除非调用方同一条请求里还显式给了 `slip_threshold`（那是微调，优先）。
+        rules_patch = body.get("rules")
+        slip_preset = None
+        if isinstance(rules_patch, dict) and "slip_preset" in rules_patch:
+            slip_preset = rules_patch.pop("slip_preset")
         for section, obj in (("coach", self.engine.cfg),
                              ("rules", self.engine.rules.cfg),
                              ("gate", self.engine.gate.cfg)):
@@ -285,6 +295,17 @@ class CoachService:
                 names.append(k)
             if names:
                 applied[section] = names
+
+        # 🔴 #J：选了打滑预设 → 记下标签，并把阈值设回该档基线
+        #    （除非本次同时显式微调了阈值，那句微调优先）。
+        if slip_preset is not None:
+            if slip_preset not in SLIP_PRESETS:
+                raise ValueError(
+                    f"rules.slip_preset 必须是 {sorted(SLIP_PRESETS)} 之一")
+            self.engine.rules.cfg.slip_preset = slip_preset
+            if "slip_threshold" not in applied.get("rules", ()):
+                self.engine.rules.cfg.slip_threshold = SLIP_PRESETS[slip_preset]
+            applied.setdefault("rules", []).append("slip_preset")
 
         # 🔴 改到 `tts_*` 必须**重建** TtsEngine 才生效 —— 它在构造时把
         #    `tts_config()` 的快照收进 `self.cfg`，之后不回看 CoachConfig。

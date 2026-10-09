@@ -104,6 +104,14 @@ class RuleConfig:
     off_track_slip_min: float = 0.10
 
     # 打滑
+    # 🔴 #J：打滑阈值三档预设（严格/标准/宽容）+ 用户微调。
+    #    `slip_preset` 只是个标签（给 UI 做下拉 + 记忆用），**真正参与判据的
+    #    永远是 `slip_threshold`**。选预设时 server 会把 `slip_threshold` 设回
+    #    该档基线，之后用户在滑块上微调改的就是 `slip_threshold` 本身。
+    #      strict   街道：任何打滑都是坏事 → 低门限
+    #      standard 赛道日：默认
+    #      lenient  漂移/拉力/泥地：本来就在故意滑 → 高门限，别老报
+    slip_preset: str = "standard"
     slip_threshold: float = 0.15
     slip_hold_s: float = 0.25
     tyre_radius_default: float = 0.34
@@ -171,6 +179,16 @@ class RuleConfig:
     #   事实合并成**一句** `lap_advice`（每圈一条，云润色只调用一次）。
     # False：退回旧行为 —— 四条各自单说（保留给逐条调试 / A-B 对比用）。
     lap_advice: bool = True
+
+
+# 🔴 #J：打滑三档预设 → 各档基线阈值（见 RuleConfig.slip_preset 说明）。
+#    选预设时 server 把 `slip_threshold` 设回对应基线，之后滑块微调只动
+#    `slip_threshold` 本身。UI 用这份表渲染下拉 + 各档默认值。
+SLIP_PRESETS: dict[str, float] = {
+    "strict": 0.08,    # 街道：任何打滑都该报
+    "standard": 0.15,  # 赛道日：默认
+    "lenient": 0.30,   # 漂移/拉力/泥地：故意滑，高门限别老报
+}
 
 
 @dataclass
