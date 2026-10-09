@@ -946,3 +946,118 @@ class TestSpeechDigits:
         assert got.to_dict()["speech"] == "左前胎过热 一一五"
         # 字符数等价 → ttl 预算无需因这一层重算
         assert len(got.speech) == len(got.text)
+
+
+# ===========================================================================
+# 名次 / 情绪向（R3.1）—— 端到端装配
+# ===========================================================================
+#
+# 🔴 守的是**装配**，不是规则本身（规则单测在 `tests/test_rules.py::TestMood`）：
+#    `Frame` 上有 `position` 字段 ≠ 它会被念出来。中间还隔着两道 ——
+#    ① `RuleSet.evaluate` 里有没有注册；② 闸门有没有把它竞争掉。
+#    少任何一道的表现都是"静默"，而不是报错。
+
+class TestMoodEndToEnd:
+    @staticmethod
+    def _frames(position_fn, *, laps=6):
+        """合成帧 + 名次：`position_fn(i)` 给出第 i 帧的名次。"""
+        import dataclasses
+
+        base = synth_lap_frames(radius_m=R, hz=10.0, laps=laps)
+        return [
+            dataclasses.replace(f, position=position_fn(i), num_cars=20,
+                                laps_in_race=laps)
+            for i, f in enumerate(base)
+        ]
+
+    @staticmethod
+    def _drive(frames, *, step_s=0.1):
+        """跑完全部帧，收集说出口的播报（key 去掉位置后缀归并）。
+
+        🔴 用**可控时钟**推进，而不是真等：闸门有 6 s 跨类冷却，而测试循环
+           比真车快几百倍。不推时钟的话，「名次变化」会一直被上一条播报的
+           冷却挡住 —— 那测出来的不是规则坏了，是**测法错了**。
+        """
+        # session=None → 后台不取参考圈，测试完全确定性、不依赖异步线程。
+        src = ReplaySource(frames, profile=None, session=None, loop=False)
+        tick_t = {"v": 1000.0}
+
+        def clock():
+            tick_t["v"] += step_s
+            return tick_t["v"]
+
+        eng = CoachEngine(src, CoachConfig(poll_interval_s=step_s,
+                                           sess_poll_boot_s=999,
+                                           sess_poll_idle_s=999),
+                          clock=clock)
+        said: dict[str, list[str]] = {}
+        for _ in range(len(frames) + 10):
+            for u in eng.tick().say:
+                said.setdefault(u.key.split("@")[0], []).append(u.text)
+        return said
+
+    def test_position_change_is_broadcast(self):
+        """20 车赛里从 P13 追到 P11 → 会念出来（规则已注册 + 闸门放行）。
+
+        🔴 名次变化与鼓励同为 P_LOW，会**互相竞争** —— 这是闸门"不打扰优先"
+           的正确行为，不是 bug。所以这条用例把名次变化放在离圈首足够远的
+           位置（30% 处），让两条话各自的 6 s 跨类冷却都过得去。
+        """
+        base = synth_lap_frames(radius_m=R, hz=10.0, laps=6)
+        switch = int(len(base) * 0.3)
+        frames = self._frames(lambda i: 13 if i < switch else 11)
+        said = self._drive(frames)
+        assert "position" in said, list(said)
+        assert any("追回 2 位" in t for t in said["position"]), \
+            said["position"]
+
+    def test_position_is_silent_when_unknown(self):
+        """合成帧默认不带名次（0）→ 闭嘴，不能念"P0"。"""
+        said = self._drive(self._frames(lambda i: 0))
+        assert "position" not in said, said
+
+    def test_leader_reminder_fires(self):
+        """一路领跑 → 至少念一次"已经是 P1"。"""
+        said = self._drive(self._frames(lambda i: 1))
+        assert "leader" in said, list(said)
+        assert any(t.startswith("已经是 P1") for t in said["leader"]), \
+            said["leader"]
+
+    def test_encouragement_fires_in_back_half(self):
+        """一直卡在 P13/20 → 会鼓励。"""
+        said = self._drive(self._frames(lambda i: 13))
+        assert "encourage" in said, list(said)
+        assert all(t.startswith("还在 P13，") for t in said["encourage"]), \
+            said["encourage"]
+
+    def test_no_encouragement_in_front_half(self):
+        """上半区（P8/20）不鼓励 —— 在那里说"别急"听着像讽刺。"""
+        said = self._drive(self._frames(lambda i: 8))
+        assert "encourage" not in said, said
+
+    def test_stats_expose_position(self):
+        """名次两个数进 stats —— 排障第一现场。
+
+        🔴 教练念了句"还在 P13"，第一反应是"它读到的是不是 13"。
+           不暴露出来，就得去翻服务端日志；而"教练在瞎编"和
+           "教练读到的数就是错的"是两种完全不同的故障。
+        """
+        frames = self._frames(lambda i: 13)
+        src = ReplaySource(frames, profile=None, session=None, loop=False)
+        eng = CoachEngine(src, CoachConfig(poll_interval_s=0.1,
+                                           sess_poll_boot_s=999,
+                                           sess_poll_idle_s=999))
+        st = eng.tick()
+        assert st.stats["position"] == 13
+        assert st.stats["num_cars"] == 20
+
+    def test_back_half_and_leadership_do_not_both_fire(self):
+        """🔴 情绪向两条**互斥**：领跑时不会同时被鼓励"别急"。
+
+        这不是巧合而是设计：名次数据只有一份，P1 与"后半区"不可能同时成立。
+        留着这条是为了防止将来有人把鼓励的判据改成"落后于某人"之类 ——
+        那样 P1 也可能"落后于理论最快圈"，就会同时挨上两句。
+        """
+        said = self._drive(self._frames(lambda i: 1))
+        assert "leader" in said
+        assert "encourage" not in said

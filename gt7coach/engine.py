@@ -25,9 +25,10 @@ from typing import Any, Callable
 
 from .contract import CoachState, Frame, Utterance
 from . import phrases
+from . import refcache
 from .refcache import RefCache
 from .gate import Gate, GateConfig
-from .contract import P_NORMAL, CoachState, Frame, Utterance
+from .contract import P_NORMAL, CoachState, Frame, Utterance, norm_u16
 from .lapstats import (CornerTracker, FuelTracker, LapResult,
                        SectorTracker, corner_loss_split, corner_losses,
                        lap_result)
@@ -64,8 +65,16 @@ class CoachConfig:
     #   开一场慢的，教练就该拿你的历史最好当标杆 —— 否则它只会拿"你今天
     #   最烂的那一圈"来夸你。失败时自动退回 session_best，不会没参考可用。
     ref_policy: str = "history_best"
+    # 跨场次找历史圈时**只认同一辆车**吗。默认开：换了更快的车之后，
+    # 拿旧车的历史最好当标杆只会一路看着 +8 秒。关掉是**显式**允许跨车 ——
+    # 那时由 `ref_pace_tol` 的性能窗口兜底。
+    history_same_car: bool = True
     history_max_tries: int = 3          # 最多试几个候选（每个要一次 /profile）
     history_shape_tol_m: float = 60.0   # 形状中位距离超过它就判为不同赛道
+    # 🔴 「速度面」的可比容差：跨车型采用历史圈时，两圈圈速差超过这个比例
+    #    → 禁用所有依赖速度的规则（几何类规则照常）。默认 10%，
+    #    依据与取值见 `refindex.PACE_TOL`。
+    ref_pace_tol: float = 0.10
     # 自攒参考圈最早从第几圈开始建。默认 2 = **跳过第 1 圈（出场 / 暖胎圈）**：
     # 第 1 圈通常慢且不具代表性，拿它当参考会让第 2~3 圈的刹车点 / 弯心速度全建在
     # 慢圈上 → 用户感知的"前几圈瞎播报"。时间赛里第 1 圈就是飞行圈时改成 1 即可。
@@ -138,6 +147,7 @@ class RefProvider:
                  policy: str = "history_best", history_max_tries: int = 3,
                  history_shape_tol_m: float = 60.0,
                  history_same_car: bool = True,
+                 pace_tol: float = 0.10,
                  cache: "RefCache | None" = None):
         self.src = source
         self.step_m = step_m
@@ -146,6 +156,7 @@ class RefProvider:
         self.history_max_tries = max(0, int(history_max_tries))
         self.history_shape_tol_m = float(history_shape_tol_m)
         self.history_same_car = bool(history_same_car)
+        self.pace_tol = float(pace_tol)
         # 参考圈本地缓存：把跑过的最好一圈按「赛道指纹 + 车型」存盘，下次同赛道
         # 直接复用，省掉 history_best 去服务端翻历史的冷启动延迟。None = 禁用。
         self._cache = cache
@@ -163,6 +174,16 @@ class RefProvider:
                                       "adopted": None}
         # 本轮是否采用了本地缓存参考圈（先于服务端历史搜索命中）
         self._cached = False
+        # —— 参考圈的「两面」（见 `refindex.RefLap.pace_ok`）——
+        # `ref_pace_ok` = 速度面（圈速 / 参考速度）能不能拿去量本场这辆车；
+        # 几何面（赛车线形状、刹车点与弯心的位置）永远可用。
+        # 只有"跨车型 / 判不出车型"且圈速差超容差时才是 False；
+        # 同车（含自攒 / 本场最快圈）恒为 True。
+        self._pace_ok = True
+        # 车型判定：same_car | cross_car | unknown（排障用，与 pace_ok 一起看）
+        self._car_match = "same_car"
+        # 本场基准圈（自己最快那圈）的圈速 —— 性能比对的另一半，落进 state 供排障
+        self._base_lap_time_s: float = 0.0
         # `_fetch_ref` 上一次为什么没给出参考圈（只在取数线程里读写）。
         # 用来把错误说清楚：取到了剖面但内容还不能用（半圈）**不是**网络问题，
         # 两者混成一句" /profile 不可用"会让人往错的方向查。
@@ -239,7 +260,15 @@ class RefProvider:
         threading.Thread(target=self._load, args=(sess, key),
                          daemon=True, name="gt7coach-ref").start()
 
-    def _fetch_ref(self, file: str, source: str) -> RefLap | None:
+    def _fetch_ref(self, file: str, source: str, car_code: int = 0,
+                   car_name: str = "") -> RefLap | None:
+        """取一份剖面。想让 `car_code` / `car_name` 有值就由调用方给 ——
+        `/profile` 响应里没有车型，而**场次列表**里有（`status.json` + `cars.csv`）。
+
+        ⚠️ 给了才覆盖：`from_profile` 会从缓存 meta 里读一份回来（缓存里那份
+           参考圈是哪辆车跑的，是它唯一的身份来源），调用方没给就**保留缓存值**，
+           不要拿 0 去盖掉它 —— 那等于把"已知"降级成"未知"。
+        """
         d = self.src.lap_profile(file, None, self.step_m)
         if not d:
             return None
@@ -259,6 +288,10 @@ class RefProvider:
             self._note = (f"本场唯一的一圈（第 {ref.lap} 圈）还在跑，"
                           f"跑完一整圈才有参考圈")
             return None
+        if car_code:
+            ref.car_code = norm_u16(car_code)
+        if car_name:
+            ref.car_name = str(car_name)
         self._note = None
         return ref
 
@@ -282,7 +315,10 @@ class RefProvider:
         否则换条赛道误用旧参考圈 = 静默定位错误。
         """
         try:
-            base = self._fetch_ref(sess["file"], "profile")
+            car_code = norm_u16(sess.get("car_code"))
+            car_name = str(sess.get("car_name") or "")
+            base = self._fetch_ref(sess["file"], "profile",
+                                   car_code=car_code, car_name=car_name)
             why = self._note          # 紧跟其后取走，别被后面几次取数覆盖
             if base is None:
                 with self._lock:
@@ -291,7 +327,9 @@ class RefProvider:
                     self._err = (why or f"/profile 不可用"
                                  f"（{getattr(self.src, 'last_error', None)}）")
                 return
-            car = sess.get("car_name", "") or ""
+            # 🔴 缓存 key 里的「车型」优先用数字码：车型名要过 `cars.csv` 查表，
+            #    表没命中时两次都拿到空串 → 不同车也存进同一个 key。
+            car = refcache.car_key(sess)
             fp = base.track_fingerprint()
             # ② 先查本地缓存：同赛道、更快 → 立刻发布（毫秒级，无需等服务端）
             cached = None
@@ -303,18 +341,13 @@ class RefProvider:
                         and cached.lap_time_s < base.lap_time_s):
                     sd = cached.shape_distance(base)
                     if sd is not None and sd <= self.history_shape_tol_m:
+                        self._publish(cached, base)
                         with self._lock:
-                            self._ref = cached
-                            self._state = "ready"
-                            self._err = None
                             self._cached = True
                         used_cache = True
             # ① 没命中缓存才发布本场剖面：教练立刻有参考圈可用
             if not used_cache:
-                with self._lock:
-                    self._ref = base
-                    self._state = "ready"
-                    self._err = None
+                self._publish(base, base)
             # ④ 存盘（在"读缓存"之后，避免把磁盘上的更快缓存覆盖掉）
             if self._cache is not None:
                 self._cache.save(base, car)
@@ -326,14 +359,45 @@ class RefProvider:
             if better is not None and self._cache is not None:
                 self._cache.save(better, car)
             # ⑥ 落定最终参考圈（历史/缓存更快就升级，否则保持已发布的）
-            with self._lock:
-                self._ref = adopted
-                self._state = "ready"
-                self._err = None
+            self._publish(adopted, base)
         except Exception as e:               # noqa: BLE001 —— 解析/网络都可能炸
             with self._lock:
                 self._state = "failed"
                 self._err = f"{type(e).__name__}: {e}"
+
+    def _publish(self, ref: RefLap, base: RefLap) -> None:
+        """发布一份参考圈 —— 连同它的「两面」状态一起。
+
+        🔴 收敛到一个出口，是为了让"参考圈变了"与"速度面可不可用"**不可能
+           不同步**。原先三处各写一遍 `_ref = …`，再加两行状态就得改三处，
+           漏一处就是"换了参考圈、还按上一份的性能判定说话"。
+        """
+        ok, verdict = self._pace_verdict(ref, base)
+        with self._lock:
+            self._ref = ref
+            self._state = "ready"
+            self._err = None
+            self._pace_ok = ok
+            self._car_match = verdict
+            self._base_lap_time_s = float(base.lap_time_s or 0.0)
+
+    def _pace_verdict(self, ref: RefLap | None,
+                      base: RefLap | None) -> tuple[bool, str]:
+        """这份参考圈与本场基准圈**性能可比**吗 → (速度面可用吗, 车型判定)。
+
+        判据见 `refindex.RefLap.pace_ok` / `contract.car_verdict`。这里只做两件事：
+          ① 把"本场自己那圈"（`base`）短路成同车 —— 它按构造就是本轮的车；
+          ② 把结果与车型判定**一起**返回，好让调用方写进 state 供排障。
+
+        🔴 为什么"能不能用"和"为什么"必须成对返回：只返回一个 bool 的话，
+           现场看到"速度规则全哑了"只能去猜是车型不同、是车型查不到、
+           还是圈速算不出来 —— 三种情况的处理方式完全不同。
+        """
+        if ref is None:
+            return True, "unknown"
+        if base is None or ref is base:
+            return True, "same_car"
+        return ref.pace_ok(base, self.pace_tol), ref.car_match(base)
 
     def _find_history_ref(self, sess: dict, base: RefLap) -> RefLap | None:
         """本场之外更快的历史圈 —— 用**几何形状**确认是同一条赛道才采用。
@@ -354,6 +418,7 @@ class RefProvider:
             cands = self.src.faster_sessions(
                 float(best), exclude=sess.get("file", ""),
                 car_name=sess.get("car_name", ""),
+                car_code=norm_u16(sess.get("car_code")),
                 same_car=self.history_same_car,
                 limit=self.history_max_tries)
         except Exception as e:               # noqa: BLE001
@@ -365,7 +430,12 @@ class RefProvider:
         adopted: dict | None = None
         found: RefLap | None = None
         for c in cands:
-            r = self._fetch_ref(c["file"], "history")
+            # 🔴 候选场次的车型只能从**场次列表**拿（`/profile` 里没有）。
+            #    它是后面「速度面能不能用」的唯一依据 —— 不带上，跨车采用
+            #    就没有任何痕迹（既没日志也没状态位）。
+            r = self._fetch_ref(c["file"], "history",
+                                car_code=norm_u16(c.get("car_code")),
+                                car_name=str(c.get("car_name") or ""))
             if r is None:
                 rejected.append({"file": c["file"], "why": "profile 取不到"})
                 continue
@@ -377,9 +447,16 @@ class RefProvider:
                                  "shape_m": None if dist is None else round(dist, 1),
                                  "why": "形状不像同一条赛道"})
                 continue
+            ok, verdict = self._pace_verdict(r, base)
             found = r
             adopted = {"file": c["file"], "best_lap_s": c["best_lap_s"],
-                       "shape_m": round(dist, 1)}
+                       "shape_m": round(dist, 1),
+                       # 🔴 车型判定必须与采用结果一起落进状态：跨车采用历史圈
+                       #    是合法的（几何面照样有用），但"速度规则为什么集体
+                       #    闭嘴"必须能一眼查到，否则排障时只能靠猜。
+                       "car_match": verdict, "pace_ok": ok,
+                       "ref_lap_time_s": round(r.lap_time_s, 3),
+                       "base_lap_time_s": round(base.lap_time_s, 3)}
             break
         with self._lock:
             self._hist = {"candidates": [c["file"] for c in cands],
@@ -389,6 +466,23 @@ class RefProvider:
     def history_status(self) -> dict[str, Any]:
         with self._lock:
             return {**self._hist, "cached_adopted": self._cached}
+
+    def pace_status(self) -> dict[str, Any]:
+        """参考圈的「两面」现在各是什么状态。
+
+        · `ref_pace_ok`  —— 速度面（圈速 / 参考速度）能不能用；
+        · `ref_car_match`—— 车型判定（same_car / cross_car / unknown）；
+        · `ref_lap_time_s` / `base_lap_time_s` —— 判据本身的两个数，
+          让"为什么判成不可比"不用再去服务端翻。
+
+        ⚠️ 这里描述的是**服务端/缓存那份**参考圈。若手上这份是自攒的
+           （`source == "self"`），调用方（`_tick_frame`）会自行按"同车"处理。
+        """
+        with self._lock:
+            return {"ref_pace_ok": bool(self._pace_ok),
+                    "ref_car_match": self._car_match,
+                    "base_lap_time_s": (round(self._base_lap_time_s, 3)
+                                        if self._base_lap_time_s else None)}
 
     def get(self) -> tuple[RefLap | None, str, str | None]:
         with self._lock:
@@ -410,6 +504,10 @@ class RefProvider:
             self._key = None
             self._state = "idle"
             self._err = None
+            # 参考圈没了 → 车型判定回到"未知"。速度面此时也用不上
+            # （`ref` 为 None → 规则层全体静默），这两位只是别留下上一轮的残值。
+            self._pace_ok = True
+            self._car_match = "unknown"
 
 
 class CoachEngine:
@@ -437,6 +535,8 @@ class CoachEngine:
                                 policy=self.cfg.ref_policy,
                                 history_max_tries=self.cfg.history_max_tries,
                                 history_shape_tol_m=self.cfg.history_shape_tol_m,
+                                history_same_car=self.cfg.history_same_car,
+                                pace_tol=self.cfg.ref_pace_tol,
                                 cache=RefCache(self.cfg.ref_cache_dir))
 
         self._st_rules = RuleSet.fresh_state()
@@ -474,6 +574,9 @@ class CoachEngine:
         self._ref_blocked: str | None = None
         # 本 tick **真正可信、可以拿去决策**的参考圈（None = 别用）
         self._ref_live: RefLap | None = None
+        # 这份参考圈的**速度面**与本场这辆车可比吗（几何面永远可比）。
+        # False 时七条速度类规则静默，几何类规则照常 —— 见 `rules.py`。
+        self._ref_pace_ok: bool = True
         # 下一 tick 要不要**强制**重取参考圈（见 `_maybe_request_ref`）：
         # 第 1 圈跑完时置位 —— 开局那几次取到的都是"半圈"、已被 `_fetch_ref`
         # 拒掉，此时不等退避，立刻催一次，否则第 2 圈前 20 秒又是哑巴。
@@ -678,7 +781,14 @@ class CoachEngine:
         # —— 参考圈：场次发现与剖面取数全在后台线程，这里只读缓存 ——
         self._maybe_request_ref(now)
 
-        ref = self._current_ref()
+        pref, ref_state, ref_err = self.refs.get()
+        pace = self.refs.pace_status()
+        # 🔴 速度面的可比性只对**服务端/缓存那份**参考圈有意义。
+        #    自攒参考圈（`source == "self"`）按构造就是本轮这辆车跑出来的，
+        #    恒为同车 —— 它连"跨场次"都不是，自然没有跨车失真可言。
+        ref = pref or self._self_ref
+        self._ref_pace_ok = (bool(pace.get("ref_pace_ok", True))
+                             if pref is not None else True)
         cur_file = (self.refs.session() or {}).get("file", "") or ""
         self._ref_blocked = self._ref_block_reason(ref, f, cur_file)
         # 🔴 不可信的参考圈**一律不交给规则层**。规则里每一条依赖它的检查都写着
@@ -707,10 +817,15 @@ class CoachEngine:
                   lateral_m=lateral_m, dt=dt, st=self._st_rules,
                   lap=self._prev_lap, theory=self._sectors.to_dict(),
                   fuel=self._fuel_snapshot(), corners=self._corner_snapshot(),
-                  warmup=warmup)
+                  warmup=warmup, ref_pace_ok=self._ref_pace_ok)
         cands = self.rules.evaluate(ctx)
         say = self.gate.filter(cands, now=now, lap=f.lap,
                                g_mag=f.g_mag, st=self._st_gate)
+        # 🔴 规则**产出候选**只是"想说什么"，能不能出闸门由闸门说了算。
+        #    所以状态位（名次记忆 / 上次鼓励圈 / 已在领跑）必须在**确认播出**
+        #    之后才推进 —— 否则被闸门跳过的候选会永久消失。
+        #    详见 `RuleSet.on_spoken` 的说明。
+        self.rules.on_spoken(say, self._st_rules)
         # 语音专用串：把 `text` 里的阿拉伯数字逐位中文化（54→五四），
         # 屏幕显示仍用原样 `text`。幂等且字符数等价，不影响 ttl 预算。
         # 放在闸门之后：此时 `u.text` 已是最终要念的那句（含弯中禁言的短句替换）。
@@ -748,7 +863,6 @@ class CoachEngine:
                 next_m = round(d, 1)
                 next_s = round(d / max(f.speed_ms, 1.0), 2)
 
-        _ref, ref_state, ref_err = self.refs.get()
         sess_state, sess_err = self.refs.session_status()
         # 预测圈速：保持当前 delta 跑完，最终就是这个时间。
         projected = None
@@ -813,6 +927,19 @@ class CoachEngine:
                 "ref_blocked": self._ref_blocked,
                 # 手上这份（可能正是被拒的那半圈）本身就是"还在跑的那一圈"
                 "ref_in_progress": bool(ref.in_progress) if ref else False,
+                # —— 参考圈的两面（见 `refindex.RefLap.pace_ok`）——
+                # `False` = 这份参考圈来自**性能差一截的另一辆车**：
+                #   几何面（赛车线 / 刹车点位置）照用，
+                #   速度面（delta / 参考速度 / 弯心速度）禁用。
+                # 排障时与 `ref_car_match` 一起看：unknown 多半是
+                #   `cars.csv` 没命中车型名，而不是真的跨车。
+                "ref_pace_ok": bool(self._ref_pace_ok),
+                "ref_car_match": pace.get("ref_car_match"),
+                # 判据用到的两个数（都是秒），省得再去服务端翻。
+                # `base_lap_time_s` = 本场自己最快那圈；两者之比就是判据本身。
+                "ref_lap_time_s": (round(ref.lap_time_s, 3)
+                                   if ref and ref.lap_time_s else None),
+                "base_lap_time_s": pace.get("base_lap_time_s"),
                 # 本场已**跑完**的圈数（0 = 还在本场第 1 圈，暖胎期）
                 "run_laps": self._run_laps,
                 # 场次发现单独暴露：它可能比参考圈更早失败，
@@ -821,6 +948,11 @@ class CoachEngine:
                 "sess_state": sess_state,
                 "sess_error": sess_err,
                 "lateral_m": round(lateral_m, 1) if lateral_m is not None else None,
+                # —— 名次（R3.1）—— 排障第一现场：教练报了"还在 P13"，
+                #    要能一眼查到它读到的是多少，而不是去怀疑规则写错了。
+                #    0 = 未知（菜单态 / 时间赛 / 老版 Dash 不给值）。
+                "position": int(f.position),
+                "num_cars": int(f.num_cars),
                 "lap_frames": len(self._lap_buf),
                 "dropped_by_gate": self._st_gate.get("dropped", 0),
                 # 被面板开关关掉的分组条数（与"闸门竞争掉"分开，见 gate.py）
