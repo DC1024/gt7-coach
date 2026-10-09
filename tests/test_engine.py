@@ -575,3 +575,67 @@ class TestBestLapRefreshDoesNotWipeLapBuffer:
         assert len(eng._sectors.lap_totals) >= 1, \
             f"分段统计没累起来（lap_samples={len(eng._sectors.lap_totals)}）"
         assert eng._sector_len_m is not None
+
+
+class TestCornerHabitEndToEnd:
+    """R1.6：跨圈累积「哪个弯反复亏」，第 3 圈起主动播报。
+
+    这是整条链路里唯一需要跨圈累积的规则，也是教练和仪表盘最本质的区别：
+    仪表盘显示**现在**，教练告诉你**你的习惯**。
+    """
+
+    def test_fires_after_three_laps_of_same_corner(self):
+        # 直播车整体比参考圈慢 ~5% → 每个弯都亏，累积 3 圈后应当主动指出
+        frames = synth_lap_frames(radius_m=R, hz=10.0, laps=4,
+                                  base_kph=190.0, dip_kph=85.0)
+        src = ReplaySource(frames, profile=synth_profile(radius_m=R), loop=True)
+        eng = CoachEngine(src, CoachConfig(sess_poll_boot_s=0.02,
+                                           sess_poll_idle_s=0.05),
+                          clock=src.clock)
+        assert wait_ref(eng)
+        fired, habit = [], None
+        for _ in range(2900):
+            st = eng.tick()
+            for u in st.say:
+                if u.key.startswith("corner_habit"):
+                    fired.append((st.lap, u.text))
+            if eng._corners.habit():
+                habit = eng._corners.habit()
+        assert habit is not None, "4 圈之后应当已经形成习惯"
+        assert habit["label"] == "T1"
+        assert habit["median_loss_s"] > 0.3
+        assert fired, f"习惯形成了却没播报；losses={eng._corners.losses}"
+        # 只有一个弯 → 文案里必须点名那个弯
+        assert "T1" in fired[0][1], fired
+
+    def test_does_not_fire_every_lap(self):
+        """同一个弯隔 3 圈才提醒第二次 —— 每圈念同一句就成了唠叨。"""
+        frames = synth_lap_frames(radius_m=R, hz=10.0, laps=4,
+                                  base_kph=190.0, dip_kph=85.0)
+        src = ReplaySource(frames, profile=synth_profile(radius_m=R), loop=True)
+        eng = CoachEngine(src, CoachConfig(sess_poll_boot_s=0.02,
+                                           sess_poll_idle_s=0.05),
+                          clock=src.clock)
+        assert wait_ref(eng)
+        laps_spoken = []
+        for _ in range(2900):
+            st = eng.tick()
+            for u in st.say:
+                if u.key.startswith("corner_habit"):
+                    laps_spoken.append(st.lap)
+        assert laps_spoken, "应当至少播报一次"
+        if len(laps_spoken) > 1:
+            assert laps_spoken[1] - laps_spoken[0] >= 3, laps_spoken
+
+    def test_stats_expose_corner_state(self):
+        frames = synth_lap_frames(radius_m=R, hz=10.0, laps=2)
+        src = ReplaySource(frames, profile=synth_profile(radius_m=R), loop=True)
+        eng = CoachEngine(src, CoachConfig(sess_poll_boot_s=0.02,
+                                           sess_poll_idle_s=0.05),
+                          clock=src.clock)
+        assert wait_ref(eng)
+        for _ in range(700):
+            eng.tick()
+        st = eng.tick()
+        assert "corners" in st.stats and "corner_habit" in st.stats
+        assert st.stats["corners"]["corners"] >= 1

@@ -11,9 +11,10 @@ import math
 import pytest
 
 from gt7coach.contract import Frame
-from gt7coach.lapstats import (FuelTracker, SectorTracker, lap_result,
+from gt7coach.lapstats import (CornerTracker, FuelTracker, SectorTracker,
+                               corner_losses, corner_windows, lap_result,
                                ref_sector_times, sector_times)
-from gt7coach.refindex import RefLap
+from gt7coach.refindex import RefLap, arc_lengths
 from gt7coach.synth import synth_lap_frames, synth_profile
 
 R = 600.0
@@ -327,3 +328,127 @@ class TestFuelMarkAlwaysAdvances:
         assert res.ok
         assert ft.values, "有效圈要进统计"
         assert res.fuel_used == pytest.approx(8.0, abs=0.05)
+
+
+class TestCornerWindowsAndLosses:
+    """每弯累积（R1.6）—— 唯一的真缺口。
+
+    🔴 为什么按**弯**而不复用 sector_loss（按段）：一段里可能有 2~3 个弯，
+       「S2 慢 0.4」没法回答「T3 到底该怎么改」；按弯（弯心 ±150m）算出来的
+       损失才能直接对应到「哪个弯」。
+    """
+
+    def test_one_window_per_apex(self):
+        ref = RefLap.from_profile(synth_profile(radius_m=R))    # 1 个弯心
+        w = corner_windows(ref)
+        assert len(w) == 1
+        assert w[0]["label"] == "T1"
+        assert w[0]["s1"] == pytest.approx(480.0 - 150.0, abs=5.0)
+        assert w[0]["s2"] == pytest.approx(480.0 + 150.0, abs=5.0)
+
+    def test_overlapping_windows_merged(self):
+        """连续 S 弯的窗口要合并，否则同一段路算两遍、损失重复计入。"""
+        ref = RefLap.from_profile(synth_profile(radius_m=R))
+        # 手工塞两个只差 50m 的弯心 → 窗口必然重叠
+        ref.apex = [{"s_m": 480.0, "speed_kph": 90.0, "glat": 0.1,
+                     "radius_m": 600.0, "turn": "左"},
+                    {"s_m": 530.0, "speed_kph": 95.0, "glat": 0.1,
+                     "radius_m": 600.0, "turn": "右"}]
+        w = corner_windows(ref)
+        assert len(w) == 1, w
+
+    def test_labels_are_in_track_order(self):
+        ref = RefLap.from_profile(synth_profile(radius_m=R))
+        ref.apex = [{"s_m": 2500.0, "speed_kph": 120.0, "glat": 0.05,
+                     "radius_m": 900.0, "turn": "右"},
+                    {"s_m": 900.0, "speed_kph": 150.0, "glat": 0.08,
+                     "radius_m": 700.0, "turn": "左"}]
+        w = corner_windows(ref)      # 输入乱序，输出必须按 s 升序重新编号
+        assert [x["label"] for x in w] == ["T1", "T2"]
+        assert w[0]["s1"] < w[1]["s1"]
+
+    def test_uniform_pace_gives_zero_loss(self):
+        """和参考圈一模一样地跑 → 每个弯的损失都该是 0。"""
+        fs = [f for f in synth_lap_frames(radius_m=R, hz=10.0, laps=1)]
+        ref = RefLap.from_profile(synth_profile(radius_m=R, step_m=5.0))
+        w = corner_windows(ref)
+        s, _ = arc_lengths([f.x for f in fs], [f.z for f in fs])
+        t = [f.lap_time_s for f in fs]
+        per = corner_losses(s, t, w, ref)
+        assert per and all(abs(v) < 0.3 for v in per.values()), per
+
+    def test_slower_lap_gives_positive_loss(self):
+        fs = [f for f in synth_lap_frames(radius_m=R, hz=10.0, laps=1,
+                                          base_kph=190.0, dip_kph=85.0)]
+        ref = RefLap.from_profile(synth_profile(radius_m=R, step_m=5.0))
+        w = corner_windows(ref)
+        s, _ = arc_lengths([f.x for f in fs], [f.z for f in fs])
+        t = [f.lap_time_s for f in fs]
+        per = corner_losses(s, t, w, ref)
+        # 实测 0.40：慢圈只在减速弯里慢，窗口里还包括前后的直道（那里不慢）
+        assert per["T1"] > 0.3, per
+
+    def test_window_beyond_lap_is_skipped(self):
+        """本圈没跑到窗口出弯处时插值会被夹住，那段"损失"是假的 —— 宁可不算。
+
+        🔴 初版这里 premises 写错了：截到 400 帧 ≈ 2200m，而合成圆唯一的弯心
+           在 480m（窗口 330~630），根本没超出 —— 所以那次调用是合法的。
+           要测"窗口超出"就得自己放一个远处的弯心。
+        """
+        fs = synth_lap_frames(radius_m=R, hz=10.0, laps=1)[:400]   # 只跑到 ~2200m
+        ref = RefLap.from_profile(synth_profile(radius_m=R, step_m=5.0))
+        ref.apex = [{"s_m": 2500.0, "speed_kph": 120.0, "glat": 0.05,
+                     "radius_m": 900.0, "turn": "右"}]
+        w = corner_windows(ref)
+        s, _ = arc_lengths([f.x for f in fs], [f.z for f in fs])
+        t = [f.lap_time_s for f in fs]
+        assert s[-1] < w[0]["s2"], "前提：本圈确实没跑到窗口出弯处"
+        per = corner_losses(s, t, w, ref)
+        assert "T1" not in per, per
+
+
+class TestCornerTracker:
+    def test_habit_picks_worst_by_median(self):
+        st = CornerTracker(min_laps=3, min_loss_s=0.30)
+        for v in (1.3, 1.4, 1.5):          # T1 中位 1.4
+            st.losses.setdefault("T1", []).append(v)
+        for v in (0.1, 0.05, 0.1):         # T2 中位 0.1（低于 0.3 阈值）
+            st.losses.setdefault("T2", []).append(v)
+        h = st.habit()
+        assert h and h["label"] == "T1"
+        assert h["median_loss_s"] == pytest.approx(1.4)
+
+    def test_needs_min_laps(self):
+        st = CornerTracker(min_laps=3, min_loss_s=0.30)
+        st.losses.setdefault("T1", []).extend([1.0, 5.0])   # 只有 2 圈
+        assert st.habit() is None
+
+    def test_median_filters_one_off(self):
+        """单圈大亏可能是被慢车挡了；连续几圈都在同一个弯亏才是习惯。
+
+        🔴 初版用均值：[0, 0, 3.0] 的均值是 1.0，会把"三圈里只亏一圈"
+           误报成习惯。改中位数后是 0，正确地不触发。
+        """
+        st = CornerTracker(min_laps=3, min_loss_s=0.30)
+        st.losses.setdefault("T1", []).extend([0.0, 0.0, 3.0])
+        assert st.habit() is None, "三圈里只亏一圈不该报"
+
+    def test_median_does_not_go_negative(self):
+        st = CornerTracker(min_laps=3, min_loss_s=0.30)
+        st.losses.setdefault("T1", []).extend([-0.2, -0.1, -0.3])
+        assert st.habit() is None
+
+    def test_to_dict_json_safe(self):
+        import json
+        st = CornerTracker(min_laps=3, min_loss_s=0.30)
+        st.losses.setdefault("T1", []).extend([0.1, 0.2, 0.4])
+        json.dumps(st.to_dict(), ensure_ascii=False)
+
+    def test_window_pinned_across_refs(self):
+        """窗口一旦生成就钉死：参考圈换了弯心会微移，跟着换跨圈就不可比。"""
+        st = CornerTracker(min_laps=3, min_loss_s=0.30)
+        ref1 = RefLap.from_profile(synth_profile(radius_m=R))
+        ref2 = RefLap.from_profile(synth_profile(radius_m=650.0))
+        assert st.setup(ref1) is True
+        assert st.setup(ref2) is False, "第二次 setup 不该重建窗口"
+        assert st.windows == st.windows

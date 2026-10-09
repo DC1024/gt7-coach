@@ -116,6 +116,12 @@ class RuleConfig:
     sector_loss_min_s: float = 0.15
     # 续航提醒：剩多少圈的时候说
     fuel_warn_laps: float = 3.0
+    # —— 每弯累积失误（R1.6）——
+    corner_min_laps: int = 3        # 同一个弯至少这么多圈才下结论
+    corner_min_loss_s: float = 0.30  # 平均亏这么多才值一条播报
+    # 同一个弯两次提醒之间隔几圈。每圈都念同一句就成了唠叨；
+    # 隔 3 圈 = 提醒之后给你 3 圈去改，改不好再提。
+    corner_repeat_laps: int = 3
 
 
 def fmt_lap_time(seconds: float | None) -> str:
@@ -141,6 +147,7 @@ class Ctx:
     lap: "LapResult | None" = None    # 刚跑完那一圈的本地统计
     theory: dict[str, Any] | None = None   # 本场各段最好值 → 理论最快圈
     fuel: dict[str, Any] | None = None     # 每圈油耗 / 还能跑几圈
+    corners: dict[str, Any] | None = None  # 每弯累积（含 habit：反复亏的那个弯）
 
 
 class RuleSet:
@@ -182,7 +189,7 @@ class RuleSet:
                    self._brake_late, self._apex_slow, self._throttle_late,
                    self._shift, self._tyre_temp, self._delta,
                    self._lap_summary, self._projected_lap,
-                   self._sector_loss, self._fuel_range):
+                   self._sector_loss, self._fuel_range, self._next_focus):
             u = fn(c)
             if u is not None:
                 out.append(u)
@@ -535,3 +542,43 @@ class RuleSet:
                       "per_lap": c.fuel.get("per_lap"),
                       "level": c.fuel.get("level"),
                       "powertrain": c.f.powertrain or None})
+
+    # —— 14. 主动建议（R2.4）：哪个弯反复亏 ————————————————————
+    #
+    # 这是整条链路里**唯一需要跨圈累积**的规则，也是教练和"仪表盘"最本质的
+    # 区别：仪表盘显示的是**现在**，教练能告诉你的是**你的习惯**。
+    #
+    # 🔴 为什么单独算每弯而不复用 sector_loss（按段）：
+    #    一段里可能有 2~3 个弯，"S2 慢 0.4"没法回答"T3 到底该怎么改"；
+    #    而按弯（弯心 ±150m）算出来的损失才能直接对应到"哪个弯"。
+    #
+    # 🔴 为什么文本是"指出"而不是"开药方"：
+    #    "刹车早一点"这种处方需要知道失误的模式（晚刹？入弯太快？），
+    #    本地只能给出"这个弯你反复亏多少"这个事实。开药方交给 R2 的云润色 ——
+    #    那是它擅长且唯一该做的事。
+
+    def _next_focus(self, c: Ctx) -> Utterance | None:
+        if not c.corners:
+            return None
+        h = c.corners.get("habit")
+        if not h:
+            return None
+        # 🔴 兜第二道闸：CornerTracker 已经按 min_laps 挡过一次，但这里不能信
+        #    传入值 —— 将来 narrate/云侧也可能组装这个 dict。样本不足的"习惯"
+        #    比没有习惯更糟（它会让玩家以为自己真的有一个改不掉的毛病）。
+        if h.get("laps", 0) < self.cfg.corner_min_laps:
+            return None
+        if c.lap is None:
+            return None
+        # 🔴 同一个弯要隔几圈才提醒第二次：每圈都念同一句就成了唠叨，
+        #    而唠叨会让人开始忽略教练 —— 比不说还糟。
+        seen = c.st.setdefault("habit_last_lap", {})
+        last = seen.get(h["label"], -999)
+        if c.lap.lap - last < self.cfg.corner_repeat_laps:
+            return None
+        seen[h["label"]] = c.lap.lap
+        return Utterance(
+            key=f"corner_habit@{h['label']}",
+            text=f"下一圈重点：{h['label']}，最近亏 {h['median_loss_s']:.2f}",
+            priority=P_NORMAL, ttl_s=6.0, short=f"重点 {h['label']}",
+            evidence=h)

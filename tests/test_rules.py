@@ -462,3 +462,60 @@ class TestFuelRange:
     def test_silent_without_data(self, rs, st):
         assert rs._fuel_range(Ctx(f=mk(), fuel=None)) is None
         assert rs._fuel_range(Ctx(f=mk(), fuel={"laps_left": None})) is None
+
+
+class TestNextFocus:
+    """R1.6 + R2.4：哪个弯**反复**亏 —— 教练和仪表盘最本质的区别。
+
+    仪表盘显示的是**现在**，教练能告诉你的是**你的习惯**。
+    单圈说「S2 慢 0.4」可能是被慢车挡了；连续三圈都在同一个弯亏才是习惯 ——
+    这正是这条规则（按弯累积）和 sector_loss（单圈最慢段）的本质区别。
+    """
+
+    @staticmethod
+    def _habit(label="T3", med=0.42, laps=3):
+        return {"label": label, "median_loss_s": med, "metric": med,
+                "laps": laps, "recent": [med, med, med]}
+
+    @staticmethod
+    def _lap_result(lap_no=5):
+        from gt7coach.lapstats import LapResult
+        return LapResult(lap=lap_no, length_m=3770.0, lap_time_s=69.7,
+                         sectors=[24.0, 23.0, 22.7], ok=True)
+
+    def test_fires_with_habit(self, rs, st):
+        c = Ctx(f=mk(), lap=self._lap_result(5),
+                corners={"habit": self._habit("T3", 0.42)})
+        u = rs._next_focus(c)
+        assert u and "下一圈重点：T3" in u.text
+        assert u.evidence["median_loss_s"] == pytest.approx(0.42)
+
+    def test_repeats_only_every_n_laps(self, rs, st):
+        """同一个弯每圈都念同一句就成了唠叨 —— 而唠叨会让人开始忽略教练。"""
+        c = Ctx(f=mk(), lap=self._lap_result(5),
+                corners={"habit": self._habit("T3", 0.42)})
+        assert rs._next_focus(c) is not None          # 第 5 圈提醒
+        # 紧接着的第 6、7 圈不再提醒（间隔 3 圈）
+        c6 = Ctx(f=mk(), lap=self._lap_result(6),
+                 corners={"habit": self._habit("T3", 0.42)}, st=c.st)
+        assert rs._next_focus(c6) is None
+        # 到第 8 圈才再提
+        c8 = Ctx(f=mk(), lap=self._lap_result(8),
+                 corners={"habit": self._habit("T3", 0.42)}, st=c.st)
+        assert rs._next_focus(c8) is not None
+
+    def test_silent_without_habit(self, rs, st):
+        assert rs._next_focus(Ctx(f=mk(), corners={"habit": None})) is None
+        assert rs._next_focus(Ctx(f=mk(), corners=None)) is None
+
+    def test_silent_when_habit_below_threshold(self, rs, st):
+        """样本不足时 habit 本身就是 None（CornerTracker 挡住了），这里兜第二道。"""
+        h = self._habit("T3", 0.42)
+        h["laps"] = 1                                  # 只有 1 圈样本
+        assert rs._next_focus(Ctx(f=mk(), lap=self._lap_result(5),
+                                  corners={"habit": h})) is None
+
+    def test_silent_without_lap(self, rs, st):
+        """没有刚跑完的圈就没有"下一圈"可言。"""
+        c = Ctx(f=mk(), lap=None, corners={"habit": self._habit("T3", 0.42)})
+        assert rs._next_focus(c) is None

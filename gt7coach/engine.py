@@ -25,7 +25,8 @@ from typing import Any, Callable
 
 from .contract import CoachState, Frame, Utterance
 from .gate import Gate, GateConfig
-from .lapstats import FuelTracker, LapResult, SectorTracker, lap_result
+from .lapstats import (CornerTracker, FuelTracker, LapResult,
+                       SectorTracker, corner_losses, lap_result)
 from .refindex import RefLap
 from .rules import Ctx, RuleConfig, RuleSet
 from .source import HttpSource, ReplaySource
@@ -308,6 +309,10 @@ class CoachEngine:
         # —— 本地圈统计（分段 / 油耗）——
         self._sectors = SectorTracker(self.rules.cfg.sectors_n)
         self._fuel = FuelTracker()
+        self._corners = CornerTracker(min_laps=self.rules.cfg.corner_min_laps,
+                                      min_loss_s=self.rules.cfg.corner_min_loss_s)
+        self._corners = CornerTracker(min_laps=self.rules.cfg.corner_min_laps,
+                                      min_loss_s=self.rules.cfg.corner_min_loss_s)
         self._prev_lap: LapResult | None = None
         # 🔴 分段基准圈长必须**跨圈稳定**：段边界按绝对距离等分，基准一变，
         #    同一段路在不同圈被切成不同范围，跨圈比段落就没有意义了。
@@ -392,7 +397,7 @@ class CoachEngine:
         ctx = Ctx(f=f, prev=prev, ref=ref if s is not None else None, s=s,
                   lateral_m=lateral_m, dt=dt, st=self._st_rules,
                   lap=self._prev_lap, theory=self._sectors.to_dict(),
-                  fuel=self._fuel_snapshot())
+                  fuel=self._fuel_snapshot(), corners=self._corner_snapshot())
         cands = self.rules.evaluate(ctx)
         say = self.gate.filter(cands, now=now, lap=f.lap,
                                g_mag=f.g_mag, st=self._st_gate)
@@ -477,6 +482,10 @@ class CoachEngine:
                                  if self._sector_len_m else None),
                 "lap_samples": len(self._sectors.lap_totals),
                 "fuel_samples": len(self._fuel.values),
+                "corners": self._corners.to_dict(),
+                "corner_habit": self._corners.habit(),
+                "corners": self._corners.to_dict(),
+                "corner_habit": self._corners.habit(),
                 "source_error": getattr(self.src, "last_error", None),
                 "wheel_radius_m": {
                     "front": round(self._st_rules["radius"]["front"], 4)
@@ -532,6 +541,12 @@ class CoachEngine:
                 self._lap_buf = []
                 self._sector_len_m = None      # 换赛道 → 分段基准也要重来
                 self._sectors = SectorTracker(self.rules.cfg.sectors_n)
+                self._corners = CornerTracker(          # 弯窗口也跟着换赛道重来
+                    min_laps=self.rules.cfg.corner_min_laps,
+                    min_loss_s=self.rules.cfg.corner_min_loss_s)
+                self._corners = CornerTracker(          # 弯窗口也跟着换赛道重来
+                    min_laps=self.rules.cfg.corner_min_laps,
+                    min_loss_s=self.rules.cfg.corner_min_loss_s)
             self.refs.request(sess)
 
     def _local_lap_stats(self, lap: int) -> None:
@@ -554,6 +569,40 @@ class CoachEngine:
         if self._sector_len_m is None:
             self._sector_len_m = res.length_m
         self._sectors.add(res.sectors, res.lap_time_s)
+        # —— 每弯累积（R1.6）：用同一份弧长/时间算每个弯相对参考亏多少 ——
+        ref = self._current_ref()
+        if ref is not None and res.s_arr:
+            if not self._corners.windows:
+                self._corners.setup(ref)     # 窗口一生成一次，跨圈钉死
+            if self._corners.windows:
+                self._corners.add(corner_losses(res.s_arr, res.t_arr,
+                                                self._corners.windows, ref))
+        # —— 每弯累积（R1.6）：用同一份弧长/时间算每个弯相对参考亏多少 ——
+        ref = self._current_ref()
+        if ref is not None and res.s_arr:
+            if not self._corners.windows:
+                self._corners.setup(ref)     # 窗口一生成一次，跨圈钉死
+            if self._corners.windows:
+                self._corners.add(corner_losses(res.s_arr, res.t_arr,
+                                                self._corners.windows, ref))
+
+    def _corner_snapshot(self) -> dict[str, Any] | None:
+        habit = self._corners.habit()
+        if habit is None and not self._corners.losses:
+            return None
+        return {"habit": habit,
+                "corners": len(self._corners.windows),
+                "tracked": sorted(self._corners.losses),
+                "min_laps": self._corners.min_laps}
+
+    def _corner_snapshot(self) -> dict[str, Any] | None:
+        habit = self._corners.habit()
+        if habit is None and not self._corners.losses:
+            return None
+        return {"habit": habit,
+                "corners": len(self._corners.windows),
+                "tracked": sorted(self._corners.losses),
+                "min_laps": self._corners.min_laps}
 
     def _fuel_snapshot(self) -> dict[str, Any] | None:
         per = self._fuel.per_lap

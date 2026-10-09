@@ -139,6 +139,11 @@ class LapResult:
     raw_frames: int = 0
     ok: bool = False
     why: str = ""
+    # 🔴 内部数组：`corner_losses` 要用**同一份**弧长/时间算每弯损失。
+    #    重算一遍弧长虽然便宜，但两处实现迟早分叉（本仓库已经吃过这种亏）。
+    #    repr/compare 关掉、to_dict 不输出 —— 它们是内部中间产物。
+    s_arr: list[float] = field(default_factory=list, repr=False, compare=False)
+    t_arr: list[float] = field(default_factory=list, repr=False, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -188,6 +193,7 @@ def lap_result(frames: Iterable[Any], *, lap: int, n_sectors: int,
     length = s[-1]
     res.length_m = length
     res.lap_time_s = t[-1] - t[0]
+    res.s_arr, res.t_arr = s, t
 
     if expected_len_m:
         if abs(length - expected_len_m) / expected_len_m > LEN_TOL:
@@ -286,3 +292,133 @@ class SectorTracker:
             "gain_s": g,
             "laps": len(self.lap_totals),
         }
+
+
+# ===========================================================================
+# 每弯累积失误（R1.6）—— 唯一的真缺口
+# ===========================================================================
+#
+# 教练能主动说 13 件事，但「哪个弯**反复**亏」它从来不说 —— 因为那是跨圈的
+# 统计，不是单圈事件。而它恰恰是最值钱的一条：单圈说"S2 慢 0.4"可能是偶发，
+# 连续三圈都在同一个弯慢，就是**习惯**，值得专门提醒。
+#
+# 🔴 为什么这是本地能做、而且只有本地能做的：
+#    每圈的帧都在手上（弧长 + 圈内时间），参考圈的 t_rel 也在手上 ——
+#    两边一插值作差就是"这个弯相对参考亏了多少"。零网络、零模型。
+
+# 弯窗口：弯心前后的覆盖范围（米）。太窄会漏掉入弯前的减速差，太宽会把
+# 相邻两个弯并成一个 —— 300m 在赛道尺度上是 8~12 秒的车程，够包容
+# 「入弯前的减速差 + 出弯后的加速差」，又不至于把相邻弯吃进来。
+CORNER_BEFORE_M = 150.0
+CORNER_AFTER_M = 150.0
+
+
+def corner_windows(ref: RefLap, *, before_m: float = CORNER_BEFORE_M,
+                   after_m: float = CORNER_AFTER_M) -> list[dict]:
+    """从参考圈的弯心标记生成「弯窗口」`[{s1, s2, label}, ...]`（按 s 升序）。
+
+    label 用 T1/T2/… 按赛道顺序编号 —— 玩家脑子里记的是"第几个弯"，
+    不是弧长米数。
+
+    🔴 重叠的窗口要合并：两个弯心离得近（连续 S 弯）时，各自 ±150m 会重叠，
+       不合并就会把同一段路算两遍，损失被重复计入。
+    🔴 跨起跑线的窗口**不做回绕**，直接夹到 [0, L] —— 第一个弯在起跑线前
+       的那部分会被截掉。这是已知的近似（记在 warnings 里），比做回绕的
+       复杂度划算：截掉的是弯心前 150m 里的一小段，不是整个弯。
+    """
+    apexes = sorted((a for a in (ref.apex or [])
+                     if a.get("s_m") is not None), key=lambda a: a["s_m"])
+    if not apexes or ref.length_m <= 0:
+        return []
+    raw: list[list[float]] = []
+    for a in apexes:
+        s1 = max(0.0, float(a["s_m"]) - before_m)
+        s2 = min(ref.length_m, float(a["s_m"]) + after_m)
+        if s2 - s1 < 20.0:            # 太窄的窗口（贴着起跑线被夹没的）不要
+            continue
+        if raw and s1 <= raw[-1][1]:
+            raw[-1][1] = max(raw[-1][1], s2)
+        else:
+            raw.append([s1, s2])
+    return [{"s1": round(w[0], 1), "s2": round(w[1], 1),
+             "label": f"T{i + 1}"} for i, w in enumerate(raw)]
+
+
+def corner_losses(s: list[float], t: list[float], windows: list[dict],
+                  ref: RefLap) -> dict[str, float]:
+    """本圈在每个弯窗口里相对参考圈亏了多少秒。
+
+    返回 `{label: 损失秒}`，只包含**窗口完整落在本圈内**的弯 ——
+    窗口超出本圈弧长时插值会被夹住，那段"损失"是假的，宁可不算。
+    """
+    out: dict[str, float] = {}
+    if not windows or not s or s[-1] <= 0:
+        return out
+    for w in windows:
+        if w["s2"] > s[-1]:
+            continue                   # 本圈没跑到这个弯的出弯处
+        lt2 = interp_at(s, t, w["s2"])
+        lt1 = interp_at(s, t, w["s1"])
+        rt2 = ref.t_at_s(w["s2"])
+        rt1 = ref.t_at_s(w["s1"])
+        if rt1 is None or rt2 is None:
+            continue
+        out[w["label"]] = (lt2 - lt1) - (rt2 - rt1)
+    return out
+
+
+@dataclass
+class CornerTracker:
+    """跨圈累积每个弯的损失，找出「反复亏」的那个弯。
+
+    🔴 窗口一旦生成就**钉死**：参考圈换了（跑出更快的圈）弯心可能微移，
+       如果跟着换，跨圈的损失就不可比了 —— 与 `_sector_len_m` 同一个道理。
+    """
+
+    min_laps: int = 3                 # 至少这么多圈才开始下结论
+    min_loss_s: float = 0.30          # 平均亏这么多才值一条播报
+    window: int = 5                   # 取最近 N 圈的均值（老圈的失误会淡出）
+    windows: list[dict] = field(default_factory=list)
+    losses: dict[str, list[float]] = field(default_factory=dict)
+
+    def setup(self, ref: RefLap) -> bool:
+        """用参考圈的弯心建窗口；已建过就返回 False（不重建）。"""
+        if self.windows:
+            return False
+        w = corner_windows(ref)
+        self.windows = w
+        return bool(w)
+
+    def add(self, per: dict[str, float]) -> None:
+        for k, v in per.items():
+            xs = self.losses.setdefault(k, [])
+            xs.append(v)
+            del xs[:-self.window]
+
+    def habit(self) -> dict[str, Any] | None:
+        """「反复亏」的弯：样本 ≥min_laps、**中位损失** ≥min_loss_s 里最严重的。
+
+        🔴 用**中位数**而不是均值 —— 和 `FuelTracker` 用中位数是同一个理由：
+           均值对单圈离群值不鲁棒。实测：最近三圈损失 [0, 0, 3.0] 的均值是 1.0，
+           会触发"这个弯你反复亏"的播报；但那三圈里有两圈是 0 —— 那是被慢车
+           挡了一圈的偶发，不是习惯。中位数是 0，正确地不触发。
+        """
+        best: dict[str, Any] | None = None
+        for label, xs in self.losses.items():
+            if len(xs) < self.min_laps:
+                continue
+            srt = sorted(xs)
+            n = len(srt)
+            med = srt[n // 2] if n % 2 else (srt[n // 2 - 1] + srt[n // 2]) / 2.0
+            if med < self.min_loss_s:
+                continue
+            if best is None or med > best["median_loss_s"]:
+                best = {"label": label, "median_loss_s": round(med, 3),
+                        "metric": round(med, 3), "laps": n,
+                        "recent": [round(x, 2) for x in xs]}
+        return best
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"corners": len(self.windows),
+                "tracked": sorted(self.losses),
+                "min_laps": self.min_laps}
