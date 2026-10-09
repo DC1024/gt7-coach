@@ -751,6 +751,60 @@ class TestStatus:
         assert st["disabled_reason"]
 
 
+# —— 8.5 配置热更新：重建引擎要继承**计费计数** ————————————————————
+#
+# 🔴 `TtsEngine.cfg` 是 `tts_config()` 的**快照**，改配置只能整体重建
+#    （见 `CoachEngine.rebuild_tts`）。若重建顺手把预算清零，用户每改一次设置
+#    就白拿一份日/场/圈配额 —— 而 `chars_per_day` 是我们**唯一**的成本硬顶。
+
+class TestCarryOver:
+    def test_counters_are_inherited_and_new_cfg_takes_effect(self, tmp_path):
+        with fake_tts(), engine(tmp_path) as old:
+            old.note_lap(7)
+            old.synthesize_now("一句中文")
+            before = old.status()
+            assert before["chars_today"] > 0
+
+            new = TtsEngine(_cfg(tmp_path, max_chars=20))
+            new.carry_over(old)
+            after = new.status()
+            assert after["chars_today"] == before["chars_today"]
+            assert after["chars"] == before["chars"]
+            assert after["calls"] == before["calls"]
+            assert after["chars_lap"] == before["chars_lap"]
+            assert new.cfg.max_chars == 20     # 新配置生效 = 重建的目的
+            assert new._st["lap"] == 7         # 圈号也继承，每圈预算不被误重置
+            new.close()
+
+    def test_daily_cap_survives_a_rebuild(self, tmp_path):
+        """配额不能因改配置而重置：日上限触顶后，重建出来的引擎照样拒绝。
+
+        在设置页滑一下 `tts_max_chars` 就能重置配额的话，成本闸形同虚设。
+        """
+        lim = {"chars_per_day": 4, "chars_per_session": 100,
+               "chars_per_lap": 100}
+        with fake_tts(force_chars=4), engine(tmp_path, limits=lim) as old:
+            old.synthesize_now("四个字")
+            assert old.status()["chars_today"] == 4          # 正好触顶
+            new = TtsEngine(_cfg(tmp_path, limits=lim))
+            new.carry_over(old)
+            # ⚠️ 必须在 with 里调：`enabled` 每次求值都会查 provider 表，
+            #    而 `fake_tts` 退出时会注销本地 provider —— 出去再调就变成
+            #    "未启用"（在更早的分支返回），根本走不到预算闸。
+            assert new.request("再来一句") is None            # 日配额已满
+            assert new.status()["budget_drops"] == 1
+            new.close()
+
+    def test_carry_over_does_not_share_the_queue(self, tmp_path):
+        """只继承计数，**不继承**在制品 —— 重建本就是换一条新链路。"""
+        with fake_tts(), engine(tmp_path) as old:
+            new = TtsEngine(_cfg(tmp_path))
+            new.carry_over(old)
+            assert new._inflight == set()
+            assert new._q.qsize() == 0
+            new.close()
+
+
 # —— 9. 引擎接入：A 档永不上云 ————————————————————————————————
 #
 # 🔴 R3 的头号红线。用 spy 包住 `tts.request`，看得见"谁被送去云上"。

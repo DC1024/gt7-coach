@@ -308,6 +308,49 @@ def test_bare_minute_token_does_not_satisfy_the_guard():
     assert n.status()["drop_missing"] == 1
 
 
+# —— 第四道闸：数字归谁（张冠李戴）—————————————————————————
+
+_ATTR_FACTS = {"lap_time_s": 83.45, "vs_ref_s": 0.42, "sector": 2,
+               "loss_s": 0.31, "focus_label": "T1", "focus_laps": 3,
+               "focus_loss_s": 0.40, "laps_left": 2.3, "unit": "油"}
+
+
+def test_cloud_misattribution_is_discarded():
+    """真机实测：facts 是 `sector=2 / loss_s=0.31 / vs_ref_s=0.42`，
+    云句却是「这圈1:23.450，第二段慢了0.42秒」—— 0.42（与参考圈的差）
+    被安到了"第二段"头上。
+
+    🔴 圈速必须**与 facts 一致**，否则先被白名单当"编数字"拦下，
+       就验证不到"只有归属校验能拦它"这件事。前三道闸在这里全部放行。
+    """
+    with fake_llm("ok", reply_text="这圈1:23.450，第二段慢了0.42秒") as (url, _):
+        n = Narrator(cfg=_cfg(url))
+        out = n.render("lap_advice", _ATTR_FACTS)
+    assert out == phrases.render("lap_advice", _ATTR_FACTS)   # 回落模板
+    st = n.status()
+    assert st["num_violations"] == 0, "两个数都在 facts 里 —— 白名单本就放行"
+    assert st["drop_missing"] == 0 and st["drop_advice"] == 0
+    assert st["drop_misattr"] == 1
+    assert st["cloud_rejects"] == 1 and st["fallback_ratio"] == 1.0
+    assert st["last_guard"]["misattr"] == ["慢了0.42"]
+
+
+def test_cloud_correct_attribution_is_used():
+    """同一条 facts，把数安对了（0.4 是 T1 的损失）→ 用云句，不回落。
+
+    这是**真机第 1/3/5 圈实际产出的句子形态**（`T1段` 要按弯解），
+    必须放行 —— 否则又变成"每一句都被丢"。
+    """
+    with fake_llm("ok", reply_text="一圈1:23.450，T1段慢了0.4秒") as (url, _):
+        n = Narrator(cfg=_cfg(url))
+        out = n.render("lap_advice", _ATTR_FACTS)
+    assert out == "一圈1:23.450，T1段慢了0.4秒"
+    st = n.status()
+    assert st["drop_misattr"] == 0
+    assert st["cloud_rejects"] == 0 and st["fallback_ratio"] == 0.0
+    assert st["degraded"] is False
+
+
 def test_cache_key_includes_prompt_version(monkeypatch):
     """升级提示词版本必须让旧缓存**自动失效**（否则新提示永远不生效）。"""
     from gt7coach import prompts

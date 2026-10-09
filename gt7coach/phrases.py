@@ -345,6 +345,169 @@ def invented_advice(text: str, facts: Any) -> list[str]:
     return hits
 
 
+# ===========================================================================
+# 第四道闸 —— 「数字↔实体」归属校验
+# ===========================================================================
+#
+# 🔴 前三道闸都管不到的一种错：**张冠李戴**。
+#    真机实测（PROMPT_VERSION=4）：facts 是 `sector=2 / loss_s=0.31 / vs_ref_s=0.42`，
+#    云句却是「这圈1:23.550，第二段慢了0.42秒」——
+#    0.42（与参考圈的差）被安到了"第二段"头上，而分段损失其实是 0.31。
+#    两个数字**都来自 facts**，所以任何"数字白名单"都拦不住；
+#    它也没丢主体（圈速在）、没编建议（无指令）—— 前三道闸全部放行。
+#
+#    判据不是"这个数在不在 facts 里"，而是"这个数**是不是这个实体的**"。
+#    做法：在同一子句内，把被「慢/亏/差/快」标记的数字，绑给**它前面最近的那个
+#    实体名**（`S2` / `第二段` / `2段` / `T12` / `12号弯`），再要求该数字必须等于
+#    该实体在 facts 里的值。**实体没点名就不判**（那种情况白名单已经够了）。
+#
+# ⚠️ 已知取舍（宁可漏判不可误杀 —— 误杀的代价是整句回落模板，见 missing_mandatory
+#    那次 100% 误杀的教训）：
+#   · 只认"**同一子句**内、实体名在数字**之前**"的绑定。跨子句的
+#     「S2 慢 0.31，还差 0.80」里 `还差 0.80` 不判（实体名在上一子句）。
+#   · 🔴 `T1段` 这种"字母编号 + 段"按**弯**解、不按分段解。
+#     否则真机的合法句「T1段慢了0.4秒」会被读成"第 1 段"，与 facts 的
+#     `sector=2` 冲突 → 把一句好话误判成张冠李戴。§重叠消解就是为它写的。
+#   · 中文数字只认到「十」（`第二段` / `二段`）。`第十一段` 不认。
+
+_CN_DIGITS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+              "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+
+_NUM_PAT = r"\d+(?:\.\d+)?"
+
+# 实体名。每项 = (类别, 正则)。正则**只带一个捕获组**（就是那个编号）。
+# 多个模式会各自命中，然后由 `_entity_refs` 做**重叠消解** —— 所以这里的
+# 先后顺序不重要，位置与长度才是判据（`T1段` 里 `T1` 比 `1段` 更靠左）。
+_ENTITY_PATTERNS: list[tuple[str, str]] = [
+    ("focus", r"[Tt]\s*(\d{1,2})"),                        # T12
+    ("focus", r"(?<![A-Za-z0-9])(\d{1,2})\s*号弯"),        # 12号弯
+    ("sector", r"[Ss]\s*(\d{1,2})"),                       # S2
+    ("sector", r"第\s*(\d{1,2}|[一二三四五六七八九十])\s*段"),  # 第2段 / 第二段
+    # 裸"2段/二段"：前面**不能是字母或数字**，否则 `T1段` 会被当成"第 1 段"
+    ("sector", r"(?<![A-Za-z0-9])(\d{1,2}|[一二三四五六七八九十])\s*段"),
+]
+
+# 「慢/亏/差/快/多」+ 数字 —— 这些数字是在说"某个实体亏了多少/差多少"，
+# 因此必须属于**它前面那个实体**，不能是 facts 里别的实体的值。
+_LOSS_MARK = re.compile(r"(?:慢|亏|差|快|多)\s*了?\s*(" + _NUM_PAT + r")")
+
+# 续航：`油/电量 … 够 N 圈`。它不是"亏损"语义，单独判。
+_FUEL_BIND = re.compile(
+    r"(?:油|电量|燃料|电)[^，,。；;！!？?、]*?够\s*(" + _NUM_PAT + r")\s*圈")
+
+# 子句切分：归属判定**只在子句内**做，跨子句的"前面那个实体"不算。
+_CLAUSE_SPLIT = re.compile(r"[，,。；;！!？?、]")
+
+
+def _value_forms(v: float) -> set[str]:
+    """一个数值在句子里可能被写成的形态 —— 与 `fact_allow` 的数值分支同口径。
+
+    🔴 必须同口径：这边更严 → 白名单放行的句子被这里误杀；更松 → 放行。
+       （圈速那一支的 `M:SS.mmm` 拆分不在此列 —— 归属校验只比"秒数本身"。）
+    """
+    return {str(v)} | {f"{abs(v):.{p}f}" for p in (0, 1, 2, 3)}
+
+
+def _entity_refs(text: str) -> list[tuple[int, int, str, int]]:
+    """句子里点名的实体：`(start, end, 类别, 编号)`，按位置排序。
+
+    🔴 **重叠消解**：`T1段` 会同时命中「弯 `T1`」(0,2) 与「段 `1段`」(1,3)。
+       保留更靠左/更长的那个（弯），丢掉重叠的 —— 否则一句好话会被读成
+       "第 1 段"而与 facts 冲突。这是本闸唯一的"语义猜测"，写死在这里。
+    """
+    found: list[tuple[int, int, str, int]] = []
+    for kind, pat in _ENTITY_PATTERNS:
+        for m in re.finditer(pat, text):
+            raw = m.group(1)
+            if raw in _CN_DIGITS:
+                n = _CN_DIGITS[raw]
+            else:
+                try:
+                    n = int(raw)
+                except ValueError:
+                    continue
+            found.append((m.start(), m.end(), kind, n))
+    found.sort(key=lambda t: (t[0], -(t[1] - t[0])))     # 靠左优先，同左取长
+    kept: list[tuple[int, int, str, int]] = []
+    for start, end, kind, n in found:
+        if any(not (end <= s0 or start >= e0) for s0, e0, _, _ in kept):
+            continue                                     # 与已选中的重叠 → 丢
+        kept.append((start, end, kind, n))
+    return sorted(kept)
+
+
+def _entity_allow(kind: str, num: int, facts: dict[str, Any]) -> set[str] | None:
+    """该实体在 facts 里**被授权**的数值集合。
+
+    返回 `None` = facts 里根本没有这个实体 —— 那说明句子在说一件 facts 不支持
+    的事（点名了 S3，而 facts 只说过 S2），任何绑到它头上的数字都算越权。
+
+    🔴 字段名要**两套都认**：同一件事在两个 key 里叫两个名字 ——
+       `lap_advice` 用 `focus_label`/`focus_loss_s`，`next_focus` 用
+       `label`/`median_loss_s`。只认一套就会把另一个 key 的**本地模板**
+       整句误杀（实测就是这样：`T12 连续 12 圈慢 1.23` 被判张冠李戴）。
+    """
+    if kind == "sector":
+        if facts.get("sector") != num:
+            return None
+        vals = [facts.get("loss_s"), facts.get("gain_s")]
+    else:                                                # 弯（两种 facts schema）
+        labels = [v for v in (facts.get("focus_label"), facts.get("label"))
+                  if isinstance(v, str)]
+        if not any(re.search(r"\d{1,2}", lb)
+                   and int(re.search(r"\d{1,2}", lb).group()) == num
+                   for lb in labels):
+            return None
+        vals = [facts.get("focus_loss_s"), facts.get("median_loss_s")]
+
+    allowed: set[str] = set()
+    for v in vals:
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            allowed |= _value_forms(float(v))
+    return allowed
+
+
+def misattributed(text: str, facts: Any) -> list[str]:
+    """句子里被**张冠李戴**的数字 —— 非空即"把某个实体的值安到了别的实体头上"。
+
+    与前三道闸的分工：白名单管"数从哪来"、本闸管"数归谁"。
+    只判**明确点名了实体**的句子；没点名时一个数可以被合法地安在多个实体上，
+    那种模糊性不该由代码猜（宁可漏判）。
+    """
+    if not isinstance(facts, dict):
+        return []
+    hits: list[str] = []
+
+    # ① 续航：`油…够 N 圈` —— N 必须就是 laps_left
+    for m in _FUEL_BIND.finditer(text):
+        v = facts.get("laps_left")
+        if not isinstance(v, (int, float)) or isinstance(v, bool) \
+                or m.group(1) not in _value_forms(float(v)):
+            hits.append(m.group(0))
+
+    # ② 亏损类数字 → 绑给同一子句内、它前面最近的那个实体名
+    for clause in _CLAUSE_SPLIT.split(text):
+        if not clause:
+            continue
+        refs = _entity_refs(clause)
+        if not refs:
+            continue                                     # 没点名实体 → 不判
+        for lm in _LOSS_MARK.finditer(clause):
+            num_start, num_str = lm.start(1), lm.group(1)
+            owner: tuple[str, int] | None = None
+            for start, end, kind, n in refs:
+                if end <= num_start:
+                    owner = (kind, n)
+                else:
+                    break                                # refs 已按位置排序
+            if owner is None:
+                continue                                 # 数字在实体名之前 → 不判
+            allowed = _entity_allow(owner[0], owner[1], facts)
+            if allowed is None or num_str not in allowed:
+                hits.append(lm.group(0))
+    return hits
+
+
 def speech_s(text: str) -> float:
     """这句念出来要几秒 —— 与 `MAX_CHARS_*` 用同一个语速，所以两者永远不会打架。
 

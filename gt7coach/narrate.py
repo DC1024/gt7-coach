@@ -8,9 +8,13 @@
 
 🔴 四条硬规则（与方案 §0 一致）：
 
-  1. **数字只能来自本地 facts**。云句必须通过 `phrases.invented_numbers`
-     白名单断言；任何不在 facts 里的数字 → 丢弃云句、回落模板、记 num_violations。
-     这是**代码层拦截**，prompt 约束不住 LLM 编数字。
+  1. **数字只能来自本地 facts**。云句必须过**四道闸**（都在 `phrases.py`，
+     任何一道不过 → 丢弃云句、回落模板、计数）：
+       ① `invented_numbers` —— 数从哪来（编数字）
+       ② `missing_mandatory` —— 少说了主体（facts 有圈速而句子没说）
+       ③ `invented_advice`   —— 没授权的动作指令（"注意补油"）
+       ④ `misattributed`     —— 数归谁（把 vs_ref 的 0.42 安到"第二段"头上）
+     这是**代码层拦截**，prompt 约束不住 LLM 的这四类毛病。
   2. **失败永远回落模板，绝不静默**。云不可用体现为 `degraded` 状态位 +
      继续用本地句子，玩家不该感知到云的存在。
   3. **预算闸**。per_lap / per_session / per_day 超了直接走模板（如实标注"自律非强制"）。
@@ -152,9 +156,10 @@ class Narrator:
             # 计费要分输入/输出两档单价，所以分开记（tokens = 两者之和，保持兼容）
             "tokens_prompt": 0, "tokens_completion": 0,
             "no_key": 0, "cache_hits": 0, "budget_drops": 0, "switches": 0,
-            # 白名单查不出的两种毛病，各自单独计数（见 phrases 的"第二、三道闸"）
+            # 白名单查不出的三种毛病，各自单独计数（见 phrases 的"第二~四道闸"）
             "drop_missing": 0,      # 丢了主体（facts 里有圈速，云句里没说）
             "drop_advice": 0,       # 编了建议（facts 没授权的进站/补油类指令）
+            "drop_misattr": 0,      # 张冠李戴（把某个实体的值安到别的实体头上）
             "last_guard": None,     # 最近一次被闸掉的具体内容，便于排查
             "last_switch_to": None, "last_latency": None,
             "degraded": False,
@@ -314,22 +319,28 @@ class Narrator:
                 self._on_failure()
                 return None                     # 丢弃云句，回落模板
 
-            # 🔴 第二、三道闸。白名单只问"有没有编数字"，问不出这两件事：
+            # 🔴 第二~四道闸。白名单只问"句中的数字是不是来自 facts"，问不出这三件事：
             #    · 少说了一个数（丢主体）—— 实测云句两次都丢了圈速
             #    · 编了一句没有数字的指令（"注意补油"）—— 白名单对它完全无感
-            #    两条都在这里丢弃云句、回落模板。见 phrases 模块同名函数的注释。
+            #    · 张冠李戴（把 vs_ref 的 0.42 安到"第二段"头上）——
+            #      两个数都来自 facts，白名单照样放行
+            #    三条都在这里丢弃云句、回落模板。见 phrases 各同名函数的注释。
             missing = phrases.missing_mandatory(reply.content, facts)
             advice = phrases.invented_advice(reply.content, facts)
-            if missing or advice:
+            misattr = phrases.misattributed(reply.content, facts)
+            if missing or advice or misattr:
                 with self._lock:
                     self._st["errors"] += 1
                     if missing:
                         self._st["drop_missing"] += 1
                     if advice:
                         self._st["drop_advice"] += 1
+                    if misattr:
+                        self._st["drop_misattr"] += 1
                     self._st["last_guard"] = {"text": reply.content,
                                               "missing": missing,
-                                              "advice": advice}
+                                              "advice": advice,
+                                              "misattr": misattr}
                 # ⚠️ 与"编数字"同一条处理路径：也记一次失败。
                 #    代价是连着 3 次内容问题会触发熔断冷却，把云播报整体停 60s
                 #    —— 这是**有意**的（模型连续不守规矩就别再花钱了），
@@ -376,16 +387,18 @@ class Narrator:
             "budget_drops": st["budget_drops"],
             "errors": st["errors"],
             "num_violations": st["num_violations"],
-            # —— 三种"云句拿到了但不敢用"的原因，分开计 ——
+            # —— 四种"云句拿到了但不敢用"的原因，分开计 ——
             #    fallback_ratio = 被丢掉的云句 / 拿到的云句。这是判断
             #    "提示词调好没有""闸门是不是太严"的唯一量化口径：
             #    接近 0 = 云句基本都能用；接近 1 = 云在空烧钱，不如关掉。
             "drop_missing": st["drop_missing"],
             "drop_advice": st["drop_advice"],
+            "drop_misattr": st["drop_misattr"],
             "cloud_rejects": (st["num_violations"] + st["drop_missing"]
-                              + st["drop_advice"]),
+                              + st["drop_advice"] + st["drop_misattr"]),
             "fallback_ratio": (round((st["num_violations"] + st["drop_missing"]
-                                      + st["drop_advice"]) / st["calls"], 4)
+                                      + st["drop_advice"] + st["drop_misattr"])
+                                     / st["calls"], 4)
                                if st["calls"] else 0.0),
             "last_guard": st["last_guard"],
             "no_key": st["no_key"],

@@ -549,6 +549,11 @@ class TtsEngine:
             "voice": self.cfg.resolved_voice,
             "format": self.cfg.audio_format,
             "sample_rate": self.cfg.sample_rate,
+            # 🔴 这三个是 `POST /config` 唯一能改的 tts_* 项，必须回显 ——
+            #    否则"改了没生效"与"改了生效了"在状态里长得一模一样，
+            #    而这正是 rebuild_tts 要解决的失灵（见 engine.rebuild_tts）。
+            "max_chars": self.cfg.max_chars,
+            "timeout_s": self.cfg.timeout_s,
             # 🔴 只报变量名与 workspace，绝不回显 key 本身
             "api_key_env": self.cfg.api_key_env,
             "has_key": bool(os.environ.get(self.cfg.api_key_env, "")),
@@ -579,3 +584,22 @@ class TtsEngine:
         if self._worker is not None:
             self._worker.join(timeout=2.0)
             self._worker = None
+
+    # —— 配置热更新 ————————————————————————————————————
+
+    _CARRY = ("calls", "chars", "chars_day", "chars_session", "chars_lap",
+              "lap", "day", "errors", "cache_hits", "budget_drops", "dropped")
+
+    def carry_over(self, prev: "TtsEngine") -> None:
+        """从**上一台**引擎继承计费/计数状态（`POST /config` 改数值项后重建引擎时用）。
+
+        🔴 为什么必须继承：`self.cfg` 是 `tts_config()` 的快照，改了配置只能整体
+           重建。若重建顺手把预算计数清零，用户每改一次设置就白拿一份日/场/圈
+           配额 —— 而那是我们**唯一**的成本闸（`chars_per_day` 硬顶 ¥2.00/天）。
+           这不是洁癖：面板上滑一下 `tts_max_chars` 就能重置，闸门形同虚设。
+        只继承**计费与计数**，不继承队列/在制品 —— 重建本就是换一条新链路。
+        """
+        with prev._lock:                     # 先快照、再写入，避免同时持两把锁
+            snap = {k: prev._st[k] for k in self._CARRY if k in prev._st}
+        with self._lock:
+            self._st.update(snap)

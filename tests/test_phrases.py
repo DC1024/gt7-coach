@@ -17,8 +17,8 @@ from gt7coach import phrases
 from gt7coach.phrases import (MAX_CHARS_DEFAULT, MAX_CHARS_OVERRIDE,
                               fact_allow, fmt_lap_time, invented_advice,
                               invented_numbers, lap_time_tokens,
-                              missing_mandatory, numbers_in, over_budget,
-                              render, spell_digits)
+                              misattributed, missing_mandatory, numbers_in,
+                              over_budget, render, spell_digits)
 
 
 # ===========================================================================
@@ -87,10 +87,10 @@ class TestInventedNumbers:
 
 
 # ===========================================================================
-# 第二、三道闸 —— 白名单**查不出**的两种毛病
+# 闸②③④ —— 白名单**查不出**的三种毛病
 # ===========================================================================
 #
-# 🔴 为什么白名单不够（真 key 冒烟 2026-10-09 抓到的两个缺口，都不是"编数字"）：
+# 🔴 为什么白名单不够（真 key 冒烟抓到的缺口，都不是"编数字"）：
 #
 #   ① 丢了主体：`invented_numbers` 问的是"句中出现、但 facts 里没有的数字"，
 #      对**少说了一个数**完全无感。实测云句两次都把圈速主体丢了，而且丢得
@@ -98,8 +98,11 @@ class TestInventedNumbers:
 #   ② 编了建议：模型改用**不带数字的指令**绕过白名单（实测「注意补油」，
 #      而 facts 里 `laps_left=2.3`）。这条更危险：它是**指令**，
 #      车手可能真去提前进站。
+#   ③ 张冠李戴：把某个实体的值安到另一个实体头上（实测「第二段慢了0.42秒」，
+#      而 0.42 是"与参考圈的差"、分段损失是 0.31）。两个数都在 facts 里，
+#      白名单照样放行 —— 它判的是"数从哪来"，不是"数归谁"。
 #
-# 下面这两组用例就是"云句该被丢"的验收标准 —— 喂进去的都是模型返回的句子。
+# 下面这几组用例就是"云句该被丢"的验收标准 —— 喂进去的都是模型返回的句子。
 
 class TestLapTimeTokens:
     """圈速「说出来就算数」的写法 —— `fact_allow` 的子集，**减掉裸分位数**。
@@ -253,6 +256,93 @@ class TestInventedAdvice:
             {"unit": "油", "laps_left": phrases.FUEL_CRIT_LAPS}).endswith("这圈进站")
         assert invented_advice(
             "这圈进站", {"laps_left": phrases.FUEL_CRIT_LAPS}) == []
+
+
+class TestMisattributed:
+    """闸④：数字**归谁**（张冠李戴）。
+
+    🔴 真机实测（PROMPT_VERSION=4）：facts 是 `sector=2 / loss_s=0.31 / vs_ref_s=0.42`，
+       云句却是「这圈1:23.550，第二段慢了0.42秒」—— 0.42（与参考圈的差）
+       被安到了"第二段"头上。两个数**都来自 facts**，所以前三道闸
+       （编数字 / 丢主体 / 编建议）**全部放行**。这一闸判的是"是不是这个实体的"。
+
+    设计上刻意保守：**只在句子明确点名了实体、且实体名在数字之前**时才判。
+    没点名时一个数可以被合法地安在多个实体上，那种模糊性不该由代码猜。
+    """
+
+    F = {"lap_time_s": 83.45, "vs_ref_s": 0.42, "sector": 2, "loss_s": 0.31,
+         "focus_label": "T1", "focus_laps": 3, "focus_loss_s": 0.40,
+         "laps_left": 2.3, "unit": "油"}
+
+    # —— 必须拦下 ————————————————————————————————
+
+    def test_real_smoke_case(self):
+        """真机原句：分段被安上了「与参考圈的差」。"""
+        assert misattributed("这圈1:23.550，第二段慢了0.42秒",
+                             self.F) == ["慢了0.42"]
+
+    def test_focus_bound_to_sector_loss(self):
+        """T1 是弯，0.31 是分段的损失 —— 张冠李戴。"""
+        assert misattributed("1:23.450，T1 慢了0.31秒", self.F) == ["慢了0.31"]
+
+    def test_focus_bound_to_lap_delta(self):
+        assert misattributed("1:23.450，T1 慢了0.42秒", self.F) == ["慢了0.42"]
+
+    def test_sector_named_but_not_authorized(self):
+        """facts 只说过 S2，句子却点名 S3 —— 那个数不属于 S3。"""
+        assert misattributed("1:23.450，S3 慢 0.31", self.F) == ["慢 0.31"]
+
+    def test_unauthorized_focus(self):
+        assert misattributed("1:23.450，T7 慢了0.31秒", self.F) == ["慢了0.31"]
+
+    def test_fuel_bound_to_a_wrong_value(self):
+        """laps_left=2.3，句子却说"油还够 0.42 圈"（0.42 是圈差）。"""
+        assert misattributed("油还够 0.42 圈", self.F) == ["油还够 0.42 圈"]
+
+    def test_entity_absent_from_facts(self):
+        """facts 里压根没有分段 → 点名的任何段都是无授权的。"""
+        assert misattributed("S1 慢 0.31", {"laps_left": 2.3}) == ["慢 0.31"]
+
+    # —— 必须放行 ————————————————————————————————
+
+    def test_correct_bindings(self):
+        assert misattributed("1:23.450，第二段慢了0.31秒", self.F) == []
+        assert misattributed("1:23.450，S2 慢 0.31", self.F) == []
+        assert misattributed("1:23.450，T1 慢了0.40秒", self.F) == []
+        assert misattributed("油还够 2.3 圈", self.F) == []
+
+    def test_letter_prefixed_duan_is_a_corner_not_a_sector(self):
+        """🔴 `T1段` 里的"段"是**弯**的段，不是分段。
+
+        若按分段解 → 读成"第 1 段"，与 facts 的 `sector=2` 冲突 →
+        真机的**合法句**被误杀（重演上轮 100% 误杀那个坑）。
+        """
+        assert misattributed("一圈1:23.450，T1段慢了0.4秒", self.F) == []
+        assert misattributed("1:23.450，T1段慢了0.40秒", self.F) == []
+
+    def test_number_before_the_entity_is_not_judged(self):
+        """实体名在数字**之后** → 不判（那是另一个子句级的主语）。"""
+        assert misattributed("慢了0.42秒的是第二段", self.F) == []
+
+    def test_cross_clause_binding_is_not_judged(self):
+        """`还差 0.42` 与实体名不在同一子句 → 不判。"""
+        assert misattributed("S2 慢 0.31，还差 0.42", self.F) == []
+
+    def test_no_entity_named_is_not_judged(self):
+        """没点名实体 → 白名单已经够了，这一闸不猜。"""
+        assert misattributed("1:23.450，慢了0.42秒", self.F) == []
+
+    def test_next_focus_schema_uses_other_field_names(self):
+        """🔴 同一件事在两个 key 里叫两个名字：`next_focus` 用
+        `label`/`median_loss_s`，`lap_advice` 用 `focus_label`/`focus_loss_s`。
+        只认一套会把另一个 key 的**本地模板**整句误杀（实测踩过）。
+        """
+        f = {"label": "T12", "laps": 12, "median_loss_s": 1.234}
+        assert misattributed("T12 连续 12 圈慢 1.23", f) == []
+        assert misattributed("T12 连续 12 圈慢 0.42", f) == ["慢 0.42"]
+
+    def test_non_dict_facts_is_safe(self):
+        assert misattributed("第二段慢了0.42秒", None) == []
 
 
 # ===========================================================================
@@ -553,15 +643,17 @@ def test_numbers_shared_between_local_and_cloud():
 def test_local_templates_pass_their_own_guards(key):
     """🔴 **本地模板不能踩自己的闸** —— 否则"回落模板"的那句本身就该被丢。
 
-    云句被闸掉之后回落的正是这个模板句。模板若也过不了 `missing_mandatory`
-    （比如将来有人把 lap_advice 的圈速槽位挪到后面被预算挤掉），
-    就会出现"丢了云句、换回一句同样丢掉主体的模板" —— 白改。
-    这条把两类闸与全部模板一次锁在一起。
+    云句被闸掉之后回落的正是这个模板句。模板若也过不了这几道闸
+    （比如将来有人把 lap_advice 的圈速槽位挪到后面被预算挤掉，
+    或者给某个模板句加了 facts 里没有的实体名），就会出现
+    "丢了云句、换回一句同样不合格的模板" —— 白改。
+    这条把四道闸与全部模板一次锁在一起。
     """
     facts = RICH_CASES[key]
     txt = render(key, facts)
     assert missing_mandatory(txt, facts) == [], f"{key} 模板丢了主体：{txt}"
     assert invented_advice(txt, facts) == [], f"{key} 模板编了建议：{txt}"
+    assert misattributed(txt, facts) == [], f"{key} 模板张冠李戴：{txt}"
 
 
 # ===========================================================================

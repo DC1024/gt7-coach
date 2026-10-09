@@ -433,6 +433,31 @@ class CoachEngine:
         self._ticks = 0
         self._ref_sess_key: tuple | None = None
 
+    # —— 配置热更新 ————————————————————————————————————
+
+    def rebuild_tts(self) -> dict[str, Any]:
+        """按当前 `cfg` 重建 TtsEngine（`POST /config` 改了 `tts_*` 之后调）。
+
+        🔴 为什么需要它：`TtsEngine.__init__` 把 `cfg.tts_config()` 的**快照**
+           收进 `self.cfg` 之后再不回看 `CoachConfig`。于是
+           `POST /config {"coach":{"tts_max_chars":20}}` 会"存进 cfg 但不生效"——
+           最糟的一种失灵：**读回配置像是改了、行为一点没变**。
+
+        磁盘缓存按内容 hash 寻址，`cache_dir` 没变就继续命中（不重复花钱）；
+        计费计数由 `carry_over` 继承，改配置不能白拿一份配额。
+
+        ⚠️ 已知竞态：若正好有一帧在旧引擎上 `request()`，那条约会拿到一个
+           永远不会就绪的 `tts_url`，前端等不到音频就回落浏览器 TTS（优雅降级）。
+           这是手动改配置时才可能撞上的一瞬，不值得为它加全局锁。
+        """
+        old = getattr(self, "tts", None)
+        new = TtsEngine(self.cfg.tts_config())
+        if old is not None:
+            new.carry_over(old)
+            old.close()
+        self.tts = new
+        return new.status()
+
     # —— 对外 ——————————————————————————————————————————
 
     def tick(self) -> CoachState:

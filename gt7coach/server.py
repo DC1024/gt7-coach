@@ -220,7 +220,22 @@ class CoachService:
                 names.append(k)
             if names:
                 applied[section] = names
-        return {"ok": True, "applied": applied, "config": self.config()}
+
+        # 🔴 改到 `tts_*` 必须**重建** TtsEngine 才生效 —— 它在构造时把
+        #    `tts_config()` 的快照收进 `self.cfg`，之后不回看 CoachConfig。
+        #    不重建就是"存进 cfg 但不生效"：读回配置像是改了、行为一点没变。
+        #    见 Engine.rebuild_tts 的说明（含缓存与配额如何保住）。
+        tts_rebuilt = False
+        if any(k.startswith("tts_") for k in applied.get("coach", ())):
+            self.engine.rebuild_tts()
+            tts_rebuilt = True
+
+        out: dict[str, Any] = {"ok": True, "applied": applied,
+                               "config": self.config()}
+        if tts_rebuilt:
+            out["tts_rebuilt"] = True
+            out["tts"] = self.engine.tts.status()
+        return out
 
 
 class _Handler(BaseHTTPRequestHandler):

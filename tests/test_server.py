@@ -107,6 +107,21 @@ class TestRoutes:
             _post(server + "/api/v1/coach/config", {"gate": {"max_per_lap": "x"}})
         assert ei.value.code == 400
 
+    def test_config_tts_change_over_http(self, server):
+        """改 `tts_*` 要**重建** TtsEngine 并把新状态回给调用方。"""
+        code, d = _post(server + "/api/v1/coach/config",
+                        {"coach": {"tts_max_chars": 33}})
+        assert code == 200
+        assert d["applied"]["coach"] == ["tts_max_chars"]
+        assert d["tts_rebuilt"] is True
+        assert d["config"]["coach"]["tts_max_chars"] == 33
+        assert d["tts"]["max_chars"] == 33      # 真的进了引擎，不只是进了 cfg
+
+    def test_config_other_change_does_not_rebuild_tts(self, server):
+        _code, d = _post(server + "/api/v1/coach/config",
+                         {"gate": {"max_per_lap": 4}})
+        assert "tts_rebuilt" not in d
+
     def test_404(self, server):
         with pytest.raises(urllib.error.HTTPError) as ei:
             _get(server + "/api/v1/coach/nope")
@@ -190,6 +205,64 @@ class TestServiceRobustness:
             assert svc.health()["ticks"] > 0, "服务应当还在跑"
         finally:
             svc.stop()
+
+
+class TestTtsConfigHotReload:
+    """🔴 `POST /config` 改 `tts_*` 必须**重建** TtsEngine 才生效。
+
+    `TtsEngine.__init__` 把 `tts_config()` 的**快照**收进 `self.cfg`，
+    之后再不回看 `CoachConfig` —— 所以不重建就会"存进 cfg 但不生效"：
+    **读回配置像是改了、行为一点没变**（最糟的一种失灵，因为它看不出来）。
+    """
+
+    class _Src:
+        last_error = None
+
+        def poll(self):
+            return None
+
+    def _svc(self):
+        return CoachService(CoachEngine(self._Src(), CoachConfig()))
+
+    def test_numeric_tts_change_swaps_the_engine(self):
+        svc = self._svc()
+        old = svc.engine.tts
+        out = svc.update_config({"coach": {"tts_max_chars": 20}})
+        assert out["applied"]["coach"] == ["tts_max_chars"]
+        assert out["tts_rebuilt"] is True
+        new = svc.engine.tts
+        assert new is not old, "必须换一台新引擎 —— 旧引擎读的是旧快照"
+        assert new.cfg.max_chars == 20          # 新值真的进了引擎
+        assert out["tts"]["max_chars"] == 20
+        assert new.enabled is False             # 没配 workspace → 静默禁用
+
+    def test_rebuild_keeps_budget_counters(self):
+        """改配置不能白拿一份配额（`chars_per_day` 是唯一的成本硬顶）。"""
+        svc = self._svc()
+        svc.engine.tts.note_lap(3)                 # 🔴 先 note_lap：它会清零本圈计数
+        svc.engine.tts._st["chars_day"] = 123
+        svc.engine.tts._st["chars_lap"] = 45
+        svc.update_config({"coach": {"tts_max_chars": 30}})
+        st = svc.engine.tts.status()
+        assert st["chars_today"] == 123
+        assert st["chars_lap"] == 45
+
+    def test_other_changes_leave_tts_alone(self):
+        svc = self._svc()
+        old = svc.engine.tts
+        out = svc.update_config({"gate": {"max_per_lap": 4}})
+        assert "tts_rebuilt" not in out
+        assert svc.engine.tts is old
+
+    def test_tts_string_fields_are_still_rejected(self):
+        """`tts_workspace_id` 是字符串 —— 仍走"只允许改数值项"的硬规则。
+
+        放开它没有好处：`tts_config()` 会把值原样收进快照，一个笔误
+        （比如把 workspace 写成别的空间）在状态里只表现为"合成 403"。
+        """
+        svc = self._svc()
+        with pytest.raises(ValueError):
+            svc.update_config({"coach": {"tts_workspace_id": "ws-x"}})
 
 
 class TestHealthDiagnostics:
