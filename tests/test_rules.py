@@ -6,6 +6,7 @@ import pytest
 
 from gt7coach.contract import Frame
 from gt7coach.refindex import RefLap
+from gt7coach import phrases
 from gt7coach.rules import Ctx, RuleConfig, RuleSet, fmt_lap_time
 from gt7coach.synth import synth_profile
 
@@ -163,12 +164,29 @@ class TestWheelSlip:
 
 class TestBrakeWarn:
     def test_fires_within_window(self, rs, st, ref):
+        """R2.1 改文案：**只说行动信息**。
+
+        原句「1.0 秒后重刹区」→「1.0 秒后重刹」：少两个字，
+        ttl 从固定 1.2 s 改成跟着信息有效期走（t_go + 0.6）。
+        `v_min_kph`（参考最低速）是分析信息、念不完，移进 evidence。
+        """
         # s=350，距 400 还有 50 m，180 km/h = 50 m/s → t_go = 1.0 s
         us = feed(rs, st, ref=ref, s=350.0)
         bw = by_prefix(us, "brake_warn@")
         assert len(bw) == 1
-        assert "重刹区" in bw[0].text
+        assert "后重刹" in bw[0].text
         assert bw[0].evidence["t_go_s"] == pytest.approx(1.0, abs=0.05)
+        assert bw[0].evidence["v_min_kph"] == 90.0, "分析信息仍要留着（给云/复盘）"
+
+    def test_ttl_tracks_message_lifetime(self, rs, st, ref):
+        """🔴 ttl 跟**信息有效期**走，不是固定值。
+
+        这条消息一进刹车区就没用了（之后是 `brake_late` 接手），
+        所以它的 ttl 必须 ≈ 剩余时间 —— 固定 1.2 s 会在 t_go=3 s 时
+        让"3 秒后重刹"还没说完就过期。
+        """
+        bw = by_prefix(feed(rs, st, ref=ref, s=350.0), "brake_warn@")
+        assert bw[0].ttl_s >= bw[0].evidence["t_go_s"] + 0.5
 
     def test_key_carries_zone_identity(self, rs, st, ref):
         """key 必须带刹车区标识 —— 闸门靠它做「同一个弯只提醒一次」。"""
@@ -183,10 +201,16 @@ class TestBrakeWarn:
         assert by_prefix(feed(rs, st, ref=ref, s=450.0), "brake_warn@") == []
 
     def test_extra_when_faster_than_reference(self, rs, st, ref):
+        """比参考快时，说的**只有"快多少 + 准备重刹"** —— 8 字，念得完。
+
+        原来会在句尾再挂「，参考最低 90」，整句 17 字≈3.8 s，
+        而 ttl 只有 1.2 s：话说一半就过期。参考最低速移进 evidence。
+        """
         v_ref = ref.v_at_s(350.0)
         us = feed(rs, st, ref=ref, s=350.0, speed_kph=v_ref + 12.0)
         bw = by_prefix(us, "brake_warn@")
-        assert "比参考快" in bw[0].text
+        assert bw[0].text == "快 12，准备重刹"
+        assert len(bw[0].text) <= 10
         assert bw[0].evidence["v_ref_kph"] == pytest.approx(v_ref, abs=0.5)
 
     def test_no_warn_without_ref(self, rs, st):
@@ -309,11 +333,18 @@ class TestLapSummary:
         assert ls and ls[0].text.startswith("1:32.412")
 
     def test_compares_to_reference(self, rs, st, ref):
+        """R2.1 措辞：去掉了"比参考"（工程词），差值保留两位小数。
+
+        "参考"对开车的人没有意义 —— 快慢是相对**自己**的，
+        所以文案只剩「1:32.412，慢 0.37」。数字一个没少。
+        """
         slower = (ref.lap_time_s + 0.37) * 1000.0
         ls = [u for u in feed(rs, st, ref=ref, last_lap_ms=slower)
               if u.key == "lap_summary"]
-        assert "比参考慢 0.37" in ls[0].text
+        assert "慢 0.37" in ls[0].text and "参考" not in ls[0].text
         assert ls[0].evidence["vs_ref_s"] == pytest.approx(0.37, abs=0.02)
+        # 超预算的字一律不加 —— 长度是 R2.1 的验收口径（见 test_phrases）
+        assert len(ls[0].text) <= 24
 
     def test_no_last_lap_silent(self, rs, st, ref):
         assert [u for u in feed(rs, st, ref=ref, last_lap_ms=None)
@@ -404,10 +435,16 @@ class TestSectorLoss:
         assert "S2" in u.text
 
     def test_includes_potential_gain(self, rs, st):
+        """R2.1 措辞：「潜在 0.80」→「还差 0.80」。
+
+        "潜在"是工程词（提示的是"潜在提升空间"），开车的人不会这么说；
+        "还差 0.80"是同一件事的日常说法 —— 而**数字与 evidence 完全不变**。
+        """
         c = Ctx(f=mk(), lap=self._lap([31.0, 41.0, 25.0]),
                 theory=self._theory([30.0, 40.0, 25.0], [3, 3, 3], gain=0.8))
         u = rs._sector_loss(c)
-        assert u and "潜在 0.80" in u.text
+        assert u and "还差 0.80" in u.text and "潜在" not in u.text
+        assert u.evidence["gain_s"] == pytest.approx(0.8)
 
     def test_skips_sectors_with_few_samples(self, rs, st):
         """某段样本 <2 时"最好值"就是本圈自己，差值恒 0，报它没意义。"""
@@ -450,14 +487,28 @@ class TestFuelRange:
         assert rs._fuel_range(Ctx(f=mk(), fuel=self._fuel(9.0))) is None
 
     def test_ev_says_battery(self, rs, st):
-        """电车说"电量"、油车说"油量" —— 说错一次就没人信了。"""
+        """电车说"电量"、油车说"油" —— 说错一次就没人信了。"""
         u = rs._fuel_range(Ctx(f=mk(powertrain="electric"),
                                fuel=self._fuel(1.8)))
         assert u and "电量" in u.text
 
+    def test_advises_pit_when_truly_low(self, rs, st):
+        """真不够（≤1 圈）才给行动建议。
+
+        🔴 阈值卡在 1.0 圈是为了防"狼来了"：每圈都喊"进站"，
+           喊到第三次就没人听了 —— 那比不说还糟。
+        """
+        u = rs._fuel_range(Ctx(f=mk(), fuel=self._fuel(0.8)))
+        assert u and "进站" in u.text
+        # 1.8 圈（还够两圈）时**不该**提进站
+        u2 = rs._fuel_range(Ctx(f=mk(), fuel=self._fuel(1.8)))
+        assert u2 and "进站" not in u2.text
+
     def test_fuel_says_fuel(self, rs, st):
+        """R2.1 措辞：油车说「油」不说「油量」——「油量还够 1.8 圈」是说明书腔。"""
         u = rs._fuel_range(Ctx(f=mk(powertrain="fuel"), fuel=self._fuel(1.8)))
-        assert u and "油量" in u.text
+        assert u and u.text.startswith("油还够")
+        assert u.evidence["unit"] == "油"
 
     def test_silent_without_data(self, rs, st):
         assert rs._fuel_range(Ctx(f=mk(), fuel=None)) is None
@@ -484,11 +535,40 @@ class TestNextFocus:
                          sectors=[24.0, 23.0, 22.7], ok=True)
 
     def test_fires_with_habit(self, rs, st):
+        """R2.1 措辞：「下一圈重点：T3，最近亏 0.42」→「T3 连续 3 圈慢 0.42」。
+
+        🔴 三个变化都不是修辞：
+           ① 说「连续 3 圈」而不是「最近」—— 不报样本数，玩家不知道这是偶发
+              还是习惯，而"习惯"是这条规则的全部价值；
+           ② 去掉 8 个字的前缀（主持人腔），句子才有余量装信息；
+           ③ 无刹车区证据时**不给提示**（`ls_share` 缺席 → 不说"注意刹车点"）。
+        """
         c = Ctx(f=mk(), lap=self._lap_result(5),
                 corners={"habit": self._habit("T3", 0.42)})
         u = rs._next_focus(c)
-        assert u and "下一圈重点：T3" in u.text
+        assert u and u.text == "T3 连续 3 圈慢 0.42"
+        assert "刹车点" not in u.text, "没有刹车区证据就不该开处方"
         assert u.evidence["median_loss_s"] == pytest.approx(0.42)
+
+    def test_hinting_when_loss_in_brake_zone(self, rs, st):
+        """有证据（损失主要出在刹车区）才给「注意刹车点」。
+
+        🔴 这仍然是**指出**不是**处方**：证据来自参考圈各刹车区的入点
+           （`corner_loss_split` 算的占比），不是我们猜"他怎么开错的"。
+        """
+        h = self._habit("T3", 0.42)
+        h["ls_share"] = 0.72
+        u = rs._next_focus(Ctx(f=mk(), lap=self._lap_result(5),
+                               corners={"habit": h}))
+        assert u and "注意刹车点" in u.text
+
+    def test_no_hint_when_evidence_weak(self, rs, st):
+        """占比不到一半 → 提示可能误导（那损失主要在出弯加速而非刹车）。"""
+        h = self._habit("T3", 0.42)
+        h["ls_share"] = 0.31
+        u = rs._next_focus(Ctx(f=mk(), lap=self._lap_result(5),
+                               corners={"habit": h}))
+        assert u and "刹车点" not in u.text
 
     def test_repeats_only_every_n_laps(self, rs, st):
         """同一个弯每圈都念同一句就成了唠叨 —— 而唠叨会让人开始忽略教练。"""
@@ -519,3 +599,196 @@ class TestNextFocus:
         """没有刚跑完的圈就没有"下一圈"可言。"""
         c = Ctx(f=mk(), lap=None, corners={"habit": self._habit("T3", 0.42)})
         assert rs._next_focus(c) is None
+
+
+def _lap_result(lap_no=5):
+    """给新类用的一圈统计（与 TestNextFocus._lap_result 同构）。"""
+    from gt7coach.lapstats import LapResult
+    return LapResult(lap=lap_no, length_m=3770.0, lap_time_s=69.7,
+                     sectors=[24.0, 23.0, 22.7], ok=True)
+
+
+def _theory(best, samples, gain=None):
+    return {"n_sectors": len(best), "best_each_s": list(best),
+            "samples": list(samples), "theory_best_s": sum(best),
+            "best_actual_s": None, "gain_s": gain, "laps": 3}
+
+
+class TestTtlFitsSpeech:
+    """🔴 句子长度与 `ttl_s` 必须匹配 —— 用 rules **真实产出的** Utterance 校验。
+
+    为什么要有这条：`ttl_s` 在契约里的定义是"过期作废，免得攒到出弯再播一条
+    旧消息"，但它目前**还没有消费者**。R2.1 把这四句加长之后，
+    "2 秒有效期 vs 4 秒语音"这种矛盾就出现了 —— 而一旦补上过期检查，
+    第一批发不出声的就是这几句（最恼人的失败：屏幕上什么也没错，就是不说话）。
+
+    语速常数与长度预算共用同一个（`phrases.CHAR_PER_S`），
+    所以"不超预算"和"不超 ttl"两件事不会各说各话。
+    """
+
+    def test_lap_summary_fits(self, rs, st, ref):
+        u = [x for x in feed(rs, st, ref=ref, last_lap_ms=(ref.lap_time_s + 0.37) * 1000)
+             if x.key == "lap_summary"][0]
+        assert phrases.speech_s(u.text) <= u.ttl_s, (u.text, u.ttl_s)
+
+    def test_sector_loss_fits(self, rs, st):
+        lap = _lap_result(5)
+        lap.sectors = [31.0, 41.0, 25.0]
+        c = Ctx(f=mk(), lap=lap, theory=_theory([30.0, 40.0, 25.0],
+                                                [3, 3, 3], gain=0.8), st=st)
+        u = [x for x in RuleSet(RuleConfig()).evaluate(c)
+             if x.key == "sector_loss"][0]
+        assert phrases.speech_s(u.text) <= u.ttl_s, (u.text, u.ttl_s)
+
+    def test_projected_lap_fits(self, rs, st, ref):
+        """R2.1 把它从 2.0 提到 3.0 —— 因为 11 字 ≈ 2.4 s 语音，2.0 装不下。"""
+        c = Ctx(f=mk(lap_time_s=ref.t_at_s(2000.0) + 0.6, last_lap_ms=90000.0),
+                ref=ref, s=2000.0, theory=_theory([30.0, 40.0, 25.0], [3, 3, 3]),
+                st=st)
+        us = RuleSet(RuleConfig()).evaluate(c)
+        p = [x for x in us if x.key == "projected_lap"]
+        if p:
+            assert phrases.speech_s(p[0].text) <= p[0].ttl_s, (p[0].text, p[0].ttl_s)
+
+    def test_fuel_range_fits(self, rs, st):
+        u = RuleSet(RuleConfig())._fuel_range(
+            Ctx(f=mk(powertrain="electric"), st=st,
+                fuel={"per_lap": 8.0, "level": 10.0, "laps_left": 0.8,
+                      "samples": 3}))
+        assert u and phrases.speech_s(u.text) <= u.ttl_s, (u.text, u.ttl_s)
+
+    def test_brake_warn_fits(self, rs, st, ref):
+        """🔴 这条是被数据打脸的：原句 17 字 ≈ 3.8 s 语音，ttl 只有 1.2 s。
+
+        改动前 A 档**从没被算过一次**（我以为"≤6 字的短句不用管"），
+        实测才发现引导句其实有 17 字。所以 A 档也要过这把尺。
+        """
+        bw = by_prefix(feed(rs, st, ref=ref, s=350.0), "brake_warn@")
+        assert bw and phrases.speech_s(bw[0].text) <= bw[0].ttl_s, bw[0]
+
+    def test_brake_warn_long_window_fits(self, rs, st, ref):
+        """扫**真实可达**的整个预告窗（t_go ∈ (0, brake_warn_s]）都要念得完。
+
+        🔴 别再用「t_go=3 s」当"长窗口"了 —— `brake_warn_s = 1.5` 是硬上限，
+        `_brake_warn` 里 `if not (0 < t_go <= cfg.brake_warn_s)` 会直接把
+        t_go=3 挡掉，那样写出来的测试**根本没有 utterance 可比**，
+        只会得到一个永远不执行断言的假绿。边界由 50 m/s ⇒ s=400−t_go·50
+        反推：t_go 1.4/1.0/0.4 ⇒ s=330/350/380。
+        """
+        cfg = RuleConfig()
+        for t_go in (1.4, 1.0, 0.4):
+            s_at = ZONE_S - t_go * 50.0        # 180 km/h = 50 m/s
+            assert 0.0 < t_go <= cfg.brake_warn_s
+            bw = by_prefix(feed(rs, st, ref=ref, s=s_at), "brake_warn@")
+            assert bw, (t_go, s_at)
+            assert phrases.speech_s(bw[0].text) <= bw[0].ttl_s, (bw[0].text,
+                                                                bw[0].ttl_s)
+
+    def test_brake_warn_ttl_never_shorter_than_speech(self, rs, st, ref):
+        """🔴 回归守卫：ttl 下限写死 1.2 s 时 `t_go≈0` 的短窗会丢消息。
+
+        「1.0 秒后重刹」8 字 ≈ 1.78 s > 1.2 s，而 `brake_warn_s=1.5` 又
+        让 `t_go + 0.6` 最多到 2.1 —— 看似够，但 t_go 小的时候①只剩 1.2 s。
+        所以 ttl 必须取 `max(speech_s, t_go + 0.6)`，两个约束一个都不能少。
+        """
+        bw = by_prefix(feed(rs, st, ref=ref, s=ZONE_S - 20.0), "brake_warn@")
+        assert bw, "t_go=0.4 s 仍在预告窗内，必须产出"
+        u = bw[0]
+        assert u.ttl_s >= phrases.speech_s(u.text), (u.text, u.ttl_s)
+        assert u.ttl_s >= u.evidence["t_go_s"] + 0.5, u.ttl_s
+
+    def test_brake_late_fits(self, rs, st, ref):
+        """「刹车晚了 30 米」= 9~10 字 ≈ 2.0~2.2 s > 原 ttl 1.5 s（已提到 2.5 s）。
+
+        🔴 触发参数必须抄 `TestBrakeLate::test_fires_when_still_not_braking`：
+        要**过入点 30 m 且仍在入弯段**（`s=400+30`，apex 在 480 —— 超过 apex
+        后 `_brake_late` 会主动静默，之前误用 s=430 才拿到空列表）。
+        """
+        v_in = ref.v_at_s(ZONE_S) or 200.0
+        us = feed(rs, st, ref=ref, s=ZONE_S + 30.0, ticks=3, brake=0.0,
+                  speed_kph=v_in)
+        bl = by_prefix(us, "brake_late@")
+        assert bl, us
+        assert phrases.speech_s(bl[0].text) <= bl[0].ttl_s, (bl[0].text,
+                                                            bl[0].ttl_s)
+
+    def test_next_focus_worst_case_fits(self, rs, st):
+        """最坏输入：两位数的弯号 + 两位数的圈数 + 一个 1.23 的损失 + 有提示。"""
+        h = {"label": "T12", "median_loss_s": 1.234, "metric": 1.234,
+             "laps": 12, "recent": [1.2, 1.3], "ls_share": 0.9}
+        u = rs._next_focus(Ctx(f=mk(), lap=_lap_result(12), st=st,
+                               corners={"habit": h}))
+        assert u and phrases.speech_s(u.text) <= u.ttl_s, (u.text, u.ttl_s)
+
+
+class TestEverySpokenNumberIsInEvidence:
+    """🔴 全规则扫描：**任何**播报里出现的数字都必须能在它自己的
+    `evidence` 里找到 —— 这是 `phrases.fact_allow` 那份白名单在
+    rules 层的镜像。
+
+    为什么单开一类（而不是只在 phrases 里测）：`test_phrases.py` 的
+    `test_no_invented_numbers` 只喂**手工构造**的 RICH_CASES，facts 是我
+    自己写的，当然自洽 —— 它测的是"phrases 不编数字"。**它测不到
+    rules 忘了往 evidence 里写字段**。
+
+    真事：`_brake_warn` 算出了 `over = speed_kph - v_ref`、句子说
+    「快 57，准备重刹」，但 `over` 从没进 evidence（只写了 `v_ref_kph`）。
+    合成数据下 forever 绿；**真车场次回放**才被数字白名单抓出来
+    （INVENTED ['57']）。所以这一类必须用**真实/合成赛道跑完整引擎**，
+    而不是单点构造 —— 单点构造永远不会碰到那个分支。
+    """
+
+    @staticmethod
+    def _sweep(eng, src):
+        said = []
+        for _ in range(len(src._frames) + 20):
+            st = eng.tick()
+            for u in st.say:
+                said.append(u)
+            if not st.connected:
+                break
+        return said
+
+    def test_synthetic_lap_numbers_all_traceable(self):
+        """合成赛道跑 4 圈（会触发 brake_warn / delta / lap_summary 等）。"""
+        from gt7coach.engine import CoachConfig, CoachEngine
+        from gt7coach.source import ReplaySource
+        from gt7coach.synth import synth_lap_frames, synth_profile
+        frames = synth_lap_frames(laps=4)
+        src = ReplaySource(frames, profile=synth_profile(), loop=False)
+        eng = CoachEngine(src, CoachConfig(poll_interval_s=0.0),
+                          clock=src.clock)
+        said = self._sweep(eng, src)
+        assert said, "合成赛道应该至少产出一条播报"
+        bad = []
+        for u in said:
+            inv = phrases.invented_numbers(u.text, u.evidence)
+            if inv:
+                bad.append((u.key, u.text, inv, u.evidence))
+        assert not bad, f"有播报的数字不在 evidence 里：{bad}"
+
+    def test_brake_warn_over_speed_is_in_evidence(self, rs, st, ref):
+        """精确回归：`over_kph`（"快 57"里的 57）必须在 evidence 里。
+
+        用比参考快 12 km/h 触发 `over` 分支 —— 这正是当天漏掉的那条路径。
+        """
+        v_ref = ref.v_at_s(350.0)
+        us = feed(rs, st, ref=ref, s=350.0, speed_kph=v_ref + 12.0)
+        bw = by_prefix(us, "brake_warn@")
+        assert bw, us
+        u = bw[0]
+        assert u.text == "快 12，准备重刹"
+        assert u.evidence["over_kph"] == pytest.approx(12.0, abs=1.0)
+        assert phrases.invented_numbers(u.text, u.evidence) == []
+
+    def test_sweep_all_synthetic_brake_positions(self, rs, st, ref):
+        """把整个刹车预告窗扫一遍（含 over 分支）逐点查白名单。"""
+        v_ref = ref.v_at_s(350.0)
+        for s_at, spd in ((350.0, None), (350.0, v_ref + 30.0),
+                          (380.0, v_ref + 5.0), (330.0, v_ref + 40.0)):
+            kw = {"ref": ref, "s": s_at}
+            if spd is not None:
+                kw["speed_kph"] = spd
+            for u in by_prefix(feed(rs, st, **kw), "brake_warn@"):
+                assert phrases.invented_numbers(u.text, u.evidence) == [], \
+                    (u.text, u.evidence)

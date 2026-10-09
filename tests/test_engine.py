@@ -639,3 +639,61 @@ class TestCornerHabitEndToEnd:
         st = eng.tick()
         assert "corners" in st.stats and "corner_habit" in st.stats
         assert st.stats["corners"]["corners"] >= 1
+
+
+class TestCornerAccountingOncePerLap:
+    """🔴 回归守卫：**每圈只能记一次**每弯损失。
+
+    这条测试是被一个真 bug 逼出来的：`_finalize_lap` 里那段"每弯累积"的代码
+    因为生成脚本跑了两遍而**重复出现了两次**，后果是每圈的损失被记两遍、
+    `laps` 翻倍 —— "连续 3 圈"实际是"连续 6 圈"。
+    而当时 231 项测试**全绿**：因为断言只看了"有没有播报"，
+    没看样本数。样本数是这条规则唯一的信息量所在（"偶发"vs"习惯"），
+    翻倍等于把偶发说成习惯 —— 这是最坏的一种错。
+    """
+
+    def test_lap_counted_once_per_lap(self):
+        frames = synth_lap_frames(radius_m=R, hz=10.0, laps=5,
+                                  base_kph=190.0, dip_kph=85.0)
+        src = ReplaySource(frames, profile=synth_profile(radius_m=R), loop=True)
+        eng = CoachEngine(src, CoachConfig(sess_poll_boot_s=0.02,
+                                           sess_poll_idle_s=0.05),
+                          clock=src.clock)
+        assert wait_ref(eng)
+        for _ in range(2900):
+            eng.tick()
+        losses = eng._corners.losses.get("T1") or []
+        laps_done = eng._prev_lap.lap if eng._prev_lap else 0
+        assert losses, "跑了好几圈却一条损失都没记"
+        # 5 圈 → 最多 5 条（首圈可能不完整）。翻倍会是 8~10 条。
+        assert len(losses) <= laps_done, (
+            f"记了 {len(losses)} 条损失，但只跑了 {laps_done} 圈 —— "
+            f"每弯累积被记了多次（见本类文档）")
+        assert eng._corners.habit()["laps"] == len(losses)
+
+    def test_laps_count_matches_actual_laps_in_speech(self):
+        """播报里说的圈数必须等于真实样本数 —— 玩家听到的"连续 N 圈"要可信。"""
+        frames = synth_lap_frames(radius_m=R, hz=10.0, laps=6,
+                                  base_kph=185.0, dip_kph=85.0)
+        src = ReplaySource(frames, profile=synth_profile(radius_m=R), loop=True)
+        eng = CoachEngine(src, CoachConfig(sess_poll_boot_s=0.02,
+                                           sess_poll_idle_s=0.05),
+                          clock=src.clock)
+        assert wait_ref(eng)
+        spoken = []
+        for _ in range(len(frames) + 50):
+            st = eng.tick()
+            for u in st.say:
+                if u.key.startswith("corner_habit"):
+                    spoken.append(u)
+        assert spoken, "6 圈之后应当播报过"
+        for u in spoken:
+            n = u.evidence["laps"]
+            # 🔴 只能校验「文本自洽」与「当时至少够门槛」，**不能**拿
+            #    `eng._corners.losses` 的**当前长度**去比 —— 那是"事后状态"，
+            #    而播报是第 3 圈那一刻发生的（之后样本还在继续增长）。
+            #    初版就这么写错了，于是断言 3 == 5 失败，看起来像代码有问题。
+            #    「用活的、会继续增长的状态去校验过去的事件」是个通用陷阱。
+            assert n >= 3, f"样本不足就不该播报：{u.evidence}"
+            assert f"连续 {n} 圈" in u.text, u.text
+            assert u.evidence["label"] in u.text

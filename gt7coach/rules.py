@@ -53,9 +53,15 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:      # 只为注解，避免 rules↔lapstats 循环 import
     from .lapstats import LapResult
 
+from . import phrases
 from .contract import (Frame, P_CRITICAL, P_HIGH, P_LOW, P_NORMAL,
                        Utterance)
 from .refindex import RefLap
+
+# 🔴 措辞（怎么说）已经搬到 `phrases.py`，判断（什么时候说）留在这里。
+#    `fmt_lap_time` 从 phrases 转出来只为兼容既有调用方（__init__/cli/tests）——
+#    新代码请直接用 `phrases.fmt_lap_time`。
+fmt_lap_time = phrases.fmt_lap_time
 
 G = 9.80665
 
@@ -122,14 +128,6 @@ class RuleConfig:
     # 同一个弯两次提醒之间隔几圈。每圈都念同一句就成了唠叨；
     # 隔 3 圈 = 提醒之后给你 3 圈去改，改不好再提。
     corner_repeat_laps: int = 3
-
-
-def fmt_lap_time(seconds: float | None) -> str:
-    """92.412 → "1:32.412"。"""
-    if not seconds or seconds <= 0:
-        return "-"
-    m = int(seconds // 60)
-    return f"{m}:{seconds - m * 60:06.3f}"
 
 
 @dataclass
@@ -287,16 +285,38 @@ class RuleSet:
             "v_min_kph": z.get("v_min_kph"),
         }
         v_ref = c.ref.v_at_s(c.s)
-        extra = ""
+        over = None
         if v_ref is not None and c.f.speed_kph > v_ref + cfg.brake_warn_kph:
-            extra = f"，比参考快 {c.f.speed_kph - v_ref:.0f}"
+            over = c.f.speed_kph - v_ref
             ev["v_ref_kph"] = round(v_ref, 1)
-        vmin = z.get("v_min_kph")
-        vmin_txt = f"，参考最低 {vmin:.0f}" if vmin else ""
+            # 🔴 `over` 必须进 evidence —— 它是句子「快 57」里的**唯一数字**。
+            #    之前只算了不存，于是真车回放被数字白名单抓出「编造 57」：
+            #    白名单的规则是"句子里每个数都要能在 facts 里找到"，
+            #    而 `v_ref_kph` 与 `speed_kph` 都不等于 57（那是两者的差）。
+            #    这正好证明白名单不是形式主义 —— 它抓的是**真漏**。
+            ev["over_kph"] = round(over, 1)
+        # 🔴 文案只有两种，都 ≤8 字 —— 这是被 `ttl_s` 逼出来的硬约束：
+        #    A 档的 ttl 由**信息有效期**决定（这条消息一进刹车区就没用了），
+        #    而不是由"我愿意等它念完"决定。原来那句
+        #    「1.4 秒后重刹区，参考最低 90」＝17 字≈3.8 s 语音 > ttl 1.2 s，
+        #    意味着它**根本来不及念完**就过期 —— 实测才发现（见
+        #    tests/test_rules.py::TestTtlFitsSpeech）。
+        #    `v_min_kph`（参考最低速）是分析信息不是行动信息，移进 evidence。
+        txt = (f"快 {over:.0f}，准备重刹" if over is not None
+               else f"{t_go:.1f} 秒后重刹")
+        # 🔴 ttl 由 `phrases.ttl_for` 统一算（**别再手写常数**）：
+        #    `floor_s = t_go + 0.6` 是"信息有效期"—— 进刹车区后 0.6 s 内
+        #    还算"预告"，再晚就该 `brake_late` 接手说"你晚了"；
+        #    再叠加"这句话本身的语音时长"，取大者。
+        #    原来写死 1.2 s 是**错的**：`brake_warn_s=1.5` ⇒ t_go 最大 1.5
+        #    ⇒ ①只给到 2.1 s，而「1.0 秒后重刹」8 字就需 1.78 s，
+        #    在 t_go≤1.0（最常见的接近窗口）①只剩 1.2 s ⇒ 整段静默丢消息。
+        ttl = phrases.ttl_for(txt, P_HIGH, floor_s=t_go + 0.6)
         return Utterance(
             key=f"brake_warn@{int(z['s_in_m'] // 10) * 10}",
-            text=f"{t_go:.1f} 秒后重刹区{vmin_txt}{extra}",
-            priority=P_HIGH, ttl_s=1.2, short="准备刹车", evidence=ev)
+            text=txt,
+            priority=P_HIGH, ttl_s=ttl,
+            short="准备刹车", evidence=ev)
 
     # —— 4. 刹车点晚了 ————————————————————————————————
 
@@ -330,9 +350,15 @@ class RuleSet:
         tag = f"brake_late@{int(z['s_in_m'] // 10) * 10}"
         if self._hold(c.st, "blate", bad, c.dt) < cfg.brake_late_hold_s:
             return None
+        txt = f"刹车晚了 {over:.0f} 米"
+        # ttl 2.5 s：这条消息的有效期是"到你减速到位为止"，不是 1.5 s。
+        # 原值 1.5 s 装不下这句话本身（9~10 字 ≈ 2.0~2.2 s 语音）——
+        # 同 brake_warn，由 TestTtlFitsSpeech 抓出来。
+        # 用 ttl_for（floor_s = 信息有效期）统一算，别手写 speech_s 兜底。
+        ttl = phrases.ttl_for(txt, P_CRITICAL, floor_s=2.5)
         return Utterance(
-            key=tag, text=f"刹车晚了 {over:.0f} 米", priority=P_CRITICAL,
-            ttl_s=1.5, short=f"晚 {over:.0f}",
+            key=tag, text=txt, priority=P_CRITICAL,
+            ttl_s=ttl, short=f"晚 {over:.0f}",
             evidence={"over_m": round(over, 1), "metric": round(over, 1),
                       "s_in_m": z["s_in_m"]})
 
@@ -354,7 +380,8 @@ class RuleSet:
             return None
         return Utterance(
             key=f"apex_slow@{int(a['s_m'] // 10) * 10}",
-            text=f"弯心慢了 {gap:.0f}", priority=P_NORMAL, ttl_s=1.5,
+            text=f"弯心慢了 {gap:.0f}", priority=P_NORMAL,
+            ttl_s=phrases.ttl_for(f"弯心慢了 {gap:.0f}", P_NORMAL, "apex_slow"),
             short=f"慢 {gap:.0f}",
             evidence={"gap_kph": round(gap, 1), "metric": round(gap, 1),
                       "s_m": a["s_m"], "ref_kph": a["speed_kph"]})
@@ -377,7 +404,9 @@ class RuleSet:
             return None
         return Utterance(
             key=f"throttle_late@{int(a['s_m'] // 10) * 10}",
-            text="给油晚了", priority=P_NORMAL, ttl_s=1.5, short="给油",
+            text="给油晚了", priority=P_NORMAL,
+            ttl_s=phrases.ttl_for("给油晚了", P_NORMAL, "throttle_late"),
+            short="给油",
             evidence={"s_m": a["s_m"],
                       "throttle": round(c.f.throttle, 2)})
 
@@ -408,11 +437,17 @@ class RuleSet:
         names = ["左前", "右前", "左后", "右后"]
         if hot:
             i = tt.index(max(tt))
-            return Utterance(key="tyre_hot", text=f"{names[i]}胎过热 {tt[i]:.0f}",
-                             priority=P_NORMAL, ttl_s=4.0, short="胎温",
+            txt = f"{names[i]}胎过热 {tt[i]:.0f}"
+            return Utterance(key="tyre_hot", text=txt,
+                             priority=P_NORMAL,
+                             ttl_s=phrases.ttl_for(txt, P_NORMAL, "tyre_temp"),
+                             short="胎温",
                              evidence={"tyre_temp_c": [round(x, 1) for x in tt]})
         return Utterance(key="tyre_cold", text="轮胎太凉，抓地不够",
-                         priority=P_NORMAL, ttl_s=4.0, short="胎温",
+                         priority=P_NORMAL,
+                         ttl_s=phrases.ttl_for("轮胎太凉，抓地不够", P_NORMAL,
+                                               "tyre_temp"),
+                         short="胎温",
                          evidence={"tyre_temp_c": [round(x, 1) for x in tt]})
 
     # —— 9. delta ——————————————————————————————————————
@@ -427,8 +462,10 @@ class RuleSet:
         if abs(delta) < self.cfg.delta_threshold_s:
             return None
         sign = "+" if delta > 0 else "-"
-        return Utterance(key="delta", text=f"{delta:+.2f}", priority=P_LOW,
-                         ttl_s=1.5, short=f"{sign}{abs(delta):.1f}",
+        txt = f"{delta:+.2f}"
+        return Utterance(key="delta", text=txt, priority=P_LOW,
+                         ttl_s=phrases.ttl_for(txt, P_LOW, "delta"),
+                         short=f"{sign}{abs(delta):.1f}",
                          evidence={"delta_s": round(delta, 3),
                                    "s_m": round(c.s, 1)})
 
@@ -439,15 +476,15 @@ class RuleSet:
         if not ms or ms <= 0:
             return None
         sec = ms / 1000.0
-        txt = fmt_lap_time(sec)
-        ev: dict[str, Any] = {"last_lap_ms": round(ms, 1)}
+        ev: dict[str, Any] = {"last_lap_ms": round(ms, 1),
+                              "lap_time_s": round(sec, 3)}
         if c.ref is not None and c.ref.lap_time_s > 0:
-            d = sec - c.ref.lap_time_s
-            ev["vs_ref_s"] = round(d, 3)
-            if abs(d) >= 0.05:
-                txt += f"，比参考{'慢' if d > 0 else '快'} {abs(d):.2f}"
+            ev["vs_ref_s"] = round(sec - c.ref.lap_time_s, 3)
+            ev["ref_lap_time_s"] = round(c.ref.lap_time_s, 3)
+        txt = phrases.render("lap_summary", ev)
         return Utterance(key="lap_summary", text=txt, priority=P_LOW,
-                         ttl_s=5.0, short=txt, evidence=ev)
+                         ttl_s=phrases.ttl_for(txt, P_LOW, "lap_summary"),
+                         short=txt, evidence=ev)
 
     # —— 11. 预测圈速 ————————————————————————————————————
     #
@@ -473,13 +510,22 @@ class RuleSet:
         projected = c.ref.lap_time_s + delta
         if not (10.0 < projected < 3600.0):
             return None
-        return Utterance(
-            key="projected_lap", text=f"预计 {fmt_lap_time(projected)}",
-            priority=P_LOW, ttl_s=2.0,
-            short=f"{projected:.1f}",
-            evidence={"projected_s": round(projected, 3),
-                      "ref_lap_time_s": round(c.ref.lap_time_s, 3),
-                      "delta_s": round(delta, 3), "s_m": round(c.s, 1)})
+        ev: dict[str, Any] = {"projected_s": round(projected, 3),
+                              "ref_lap_time_s": round(c.ref.lap_time_s, 3),
+                              "delta_s": round(delta, 3),
+                              "s_m": round(c.s, 1)}
+        # 🔴 这里**故意不做"比最好圈快/慢多少"的比较**（试过，撤回了）：
+        #    按参考圈口径算，它就是 `delta` 本身（已单独播报，纯重复）；
+        #    按自己最好圈口径算，会和同一圈里 `lap_summary` 的参考圈口径打架。
+        #    详细账记在 `phrases.projected_lap` 的文档里。
+        # 🔴 ttl 2.0 s 与句子长度是绑在一起的：R2.1 定为「预计 1:11.010」
+        #    （11 字 ≈ 2.4 s 语音）。要加长这句，ttl 必须同时加长 ——
+        #    tests/test_rules.py::TestTtlFitsSpeech 守着这个等式。
+        txt = phrases.render("projected_lap", ev)
+        return Utterance(key="projected_lap", text=txt,
+                         priority=P_LOW,
+                         ttl_s=phrases.ttl_for(txt, P_LOW, "projected_lap"),
+                         short=f"{projected:.1f}", evidence=ev)
 
     # —— 12. 圈后分段 ————————————————————————————————————
     #
@@ -509,19 +555,19 @@ class RuleSet:
         loss, idx = max(losses)
         if loss < cfg.sector_loss_min_s:
             return None
-        gain = c.theory.get("gain_s")
-        txt = f"S{idx + 1} 慢了 {loss:.2f}"
         ev: dict[str, Any] = {
             "sector": idx + 1, "loss_s": round(loss, 3),
             "metric": round(loss, 3), "lap": c.lap.lap,
             "sectors": [round(x, 3) for x in c.lap.sectors],
             "best_each_s": [round(x, 3) for x in best],
         }
+        gain = c.theory.get("gain_s")
         if gain and gain >= cfg.sector_loss_min_s:
-            txt += f"，潜在 {gain:.2f}"
-            ev["potential_gain_s"] = round(gain, 3)
+            ev["gain_s"] = round(gain, 3)
+        txt = phrases.render("sector_loss", ev)
         return Utterance(key="sector_loss", text=txt, priority=P_NORMAL,
-                         ttl_s=5.0, short=f"S{idx + 1} 慢 {loss:.1f}",
+                         ttl_s=phrases.ttl_for(txt, P_NORMAL, "sector_loss"),
+                         short=f"S{idx + 1} 慢 {loss:.1f}",
                          evidence=ev)
 
     # —— 13. 续航 ————————————————————————————————————————
@@ -532,16 +578,19 @@ class RuleSet:
         left = c.fuel.get("laps_left")
         if left is None or left > self.cfg.fuel_warn_laps:
             return None
-        # 电车是"电量还够"，油车是"油量还够" —— 说错一次就没人信了
-        unit = "电量" if (c.f.powertrain or "") == "electric" else "油量"
+        # 电车是"电量还够"，油车是"油还够" —— 说错一次就没人信了
+        unit = "电量" if (c.f.powertrain or "") == "electric" else "油"
+        ev: dict[str, Any] = {"unit": unit, "laps_left": round(left, 2),
+                              "per_lap": c.fuel.get("per_lap"),
+                              "level": c.fuel.get("level"),
+                              "powertrain": c.f.powertrain or None}
+        txt = phrases.render("fuel_range", ev)
         return Utterance(
-            key="fuel_range",
-            text=f"{unit}还够 {left:.1f} 圈",
-            priority=P_NORMAL, ttl_s=6.0, short=f"还够 {left:.1f} 圈",
-            evidence={"laps_left": round(left, 2),
-                      "per_lap": c.fuel.get("per_lap"),
-                      "level": c.fuel.get("level"),
-                      "powertrain": c.f.powertrain or None})
+            key="fuel_range", text=txt,
+            priority=P_NORMAL,
+            ttl_s=phrases.ttl_for(txt, P_NORMAL, "fuel_range"),
+            short=f"{unit}够 {left:.1f} 圈",
+            evidence=ev)
 
     # —— 14. 主动建议（R2.4）：哪个弯反复亏 ————————————————————
     #
@@ -577,8 +626,11 @@ class RuleSet:
         if c.lap.lap - last < self.cfg.corner_repeat_laps:
             return None
         seen[h["label"]] = c.lap.lap
+        txt = phrases.render("next_focus", h)
         return Utterance(
             key=f"corner_habit@{h['label']}",
-            text=f"下一圈重点：{h['label']}，最近亏 {h['median_loss_s']:.2f}",
-            priority=P_NORMAL, ttl_s=6.0, short=f"重点 {h['label']}",
+            text=txt,
+            priority=P_NORMAL,
+            ttl_s=phrases.ttl_for(txt, P_NORMAL, "next_focus"),
+            short=f"重点 {h['label']}",
             evidence=h)

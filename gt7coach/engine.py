@@ -26,7 +26,8 @@ from typing import Any, Callable
 from .contract import CoachState, Frame, Utterance
 from .gate import Gate, GateConfig
 from .lapstats import (CornerTracker, FuelTracker, LapResult,
-                       SectorTracker, corner_losses, lap_result)
+                       SectorTracker, corner_loss_split, corner_losses,
+                       lap_result)
 from .refindex import RefLap
 from .rules import Ctx, RuleConfig, RuleSet
 from .source import HttpSource, ReplaySource
@@ -570,30 +571,21 @@ class CoachEngine:
             self._sector_len_m = res.length_m
         self._sectors.add(res.sectors, res.lap_time_s)
         # —— 每弯累积（R1.6）：用同一份弧长/时间算每个弯相对参考亏多少 ——
+        #
+        # 🔴 这段**只能出现一次**。它曾经因为生成脚本跑了两遍而重复，
+        #    后果是每圈的损失被记两次、`laps` 翻倍（"连续 3 圈"变成"连续 6 圈"），
+        #    而当时的测试只断言了"有没有播报"、没断言样本数，所以全绿放行。
+        #    现在 tests/test_engine.py::test_lap_counted_once_per_lap 锁死这一点。
         ref = self._current_ref()
         if ref is not None and res.s_arr:
             if not self._corners.windows:
                 self._corners.setup(ref)     # 窗口一生成一次，跨圈钉死
             if self._corners.windows:
-                self._corners.add(corner_losses(res.s_arr, res.t_arr,
-                                                self._corners.windows, ref))
-        # —— 每弯累积（R1.6）：用同一份弧长/时间算每个弯相对参考亏多少 ——
-        ref = self._current_ref()
-        if ref is not None and res.s_arr:
-            if not self._corners.windows:
-                self._corners.setup(ref)     # 窗口一生成一次，跨圈钉死
-            if self._corners.windows:
-                self._corners.add(corner_losses(res.s_arr, res.t_arr,
-                                                self._corners.windows, ref))
-
-    def _corner_snapshot(self) -> dict[str, Any] | None:
-        habit = self._corners.habit()
-        if habit is None and not self._corners.losses:
-            return None
-        return {"habit": habit,
-                "corners": len(self._corners.windows),
-                "tracked": sorted(self._corners.losses),
-                "min_laps": self._corners.min_laps}
+                w = self._corners.windows
+                self._corners.add(corner_losses(res.s_arr, res.t_arr, w, ref))
+                # 同一批窗口的"损失主要出在刹车区吗" —— 给 next_focus 的证据
+                self._corners.add_shares(
+                    corner_loss_split(res.s_arr, res.t_arr, w, ref))
 
     def _corner_snapshot(self) -> dict[str, Any] | None:
         habit = self._corners.habit()

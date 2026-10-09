@@ -12,7 +12,8 @@ import pytest
 
 from gt7coach.contract import Frame
 from gt7coach.lapstats import (CornerTracker, FuelTracker, SectorTracker,
-                               corner_losses, corner_windows, lap_result,
+                               corner_loss_split, corner_losses,
+                               corner_windows, lap_result,
                                ref_sector_times, sector_times)
 from gt7coach.refindex import RefLap, arc_lengths
 from gt7coach.synth import synth_lap_frames, synth_profile
@@ -452,3 +453,81 @@ class TestCornerTracker:
         assert st.setup(ref1) is True
         assert st.setup(ref2) is False, "第二次 setup 不该重建窗口"
         assert st.windows == st.windows
+
+
+class TestCornerLossSplit:
+    """每个弯的损失「有多少出在刹车区」—— 给 next_focus 的证据（不是新结论）。
+
+    🔴 它与 `corner_losses` 必须**同口径**：同一个弯，一个算、另一个不算，
+       share 就会配到不存在的损失上。合成圆上两者都只应给出 T1。
+    """
+
+    def test_split_in_unit_range(self):
+        fs = synth_lap_frames(radius_m=R, hz=10.0, laps=1,
+                              base_kph=190.0, dip_kph=85.0)
+        ref = RefLap.from_profile(synth_profile(radius_m=R, step_m=5.0))
+        w = corner_windows(ref)
+        s, _ = arc_lengths([f.x for f in fs], [f.z for f in fs])
+        t = [f.lap_time_s for f in fs]
+        sh = corner_loss_split(s, t, w, ref)
+        assert sh and all(0.0 <= v <= 1.0 for v in sh.values()), sh
+
+    def test_same_window_set_as_corner_losses(self):
+        """两个函数对「算不算这个弯」必须一致 —— 否则 share 会错配。"""
+        fs = synth_lap_frames(radius_m=R, hz=10.0, laps=1,
+                              base_kph=190.0, dip_kph=85.0)[:400]
+        ref = RefLap.from_profile(synth_profile(radius_m=R, step_m=5.0))
+        ref.apex = [{"s_m": 2500.0, "speed_kph": 120.0, "glat": 0.05,
+                     "radius_m": 900.0, "turn": "右"}]
+        w = corner_windows(ref)
+        s, _ = arc_lengths([f.x for f in fs], [f.z for f in fs])
+        t = [f.lap_time_s for f in fs]
+        assert set(corner_loss_split(s, t, w, ref)) == set(corner_losses(s, t, w, ref))
+
+    def test_decaying_corner_not_in_brake_zone(self):
+        """弯心后 300 m 才减速：损失（若有）不在刹车区里 —— 占比该低。
+
+        🔴 这正是「占比」存在的意义：不是每个慢弯都该说"注意刹车点"。
+        """
+        ref = RefLap.from_profile(synth_profile(radius_m=R, step_m=5.0))
+        # 一个远离 reference 刹车区的弯心 → 分割函数找不到对应 brake_in
+        ref.apex = [{"s_m": 3000.0, "speed_kph": 120.0, "glat": 0.05,
+                     "radius_m": 900.0, "turn": "右"}]
+        ref.brake_in = []
+        w = corner_windows(ref)
+        fs = synth_lap_frames(radius_m=R, hz=10.0, laps=1,
+                              base_kph=170.0, dip_kph=80.0)
+        s, _ = arc_lengths([f.x for f in fs], [f.z for f in fs])
+        t = [f.lap_time_s for f in fs]
+        sh = corner_loss_split(s, t, w, ref)
+        assert sh.get("T1") == 0.0, sh
+
+    def test_empty_when_no_window(self):
+        ref = RefLap.from_profile(synth_profile(radius_m=R, step_m=5.0))
+        assert corner_loss_split([], [], [], ref) == {}
+
+
+class TestTrackerShares:
+    def test_shares_recorded_and_trimmed(self):
+        st = CornerTracker(min_laps=3, min_loss_s=0.30, window=2)
+        st.add_shares({"T1": 0.1, "T2": 0.9})
+        st.add_shares({"T1": 0.3, "T2": 0.7})
+        st.add_shares({"T1": 0.5, "T2": 0.5})    # 只有最近 2 次
+        assert st.shares["T1"] == [0.3, 0.5]
+
+    def test_habit_carries_median_share(self):
+        st = CornerTracker(min_laps=3, min_loss_s=0.30)
+        st.losses["T1"] = [0.4, 0.5, 0.6]
+        st.add_shares({"T1": 0.2})
+        st.add_shares({"T1": 0.8})
+        st.add_shares({"T1": 0.9})
+        h = st.habit()
+        assert h and h["ls_share"] == pytest.approx(0.8)   # 中位数
+        assert h["ls_share_laps"] == 3
+
+    def test_habit_without_shares_has_no_key(self):
+        """没有占比数据时**不要**编一个 0 —— 缺证据与"证据说是 0"是两回事。"""
+        st = CornerTracker(min_laps=3, min_loss_s=0.30)
+        st.losses["T1"] = [0.4, 0.5, 0.6]
+        h = st.habit()
+        assert h and "ls_share" not in h

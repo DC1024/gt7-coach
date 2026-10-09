@@ -367,6 +367,64 @@ def corner_losses(s: list[float], t: list[float], windows: list[dict],
     return out
 
 
+def corner_loss_split(s: list[float], t: list[float], windows: list[dict],
+                      ref: RefLap) -> dict[str, float]:
+    """每个弯的损失里，有多大比例发生在**刹车区窗口**内。
+
+    这是 `next_focus` 决定「要不要说'注意刹车点'」的**证据**，不是新结论：
+
+    🔴 为什么按刹车区而不是按"入弯段"：
+       `brake_in` 是参考圈上各刹车区的入点（`RefLap` 已有，`brake_warn` /
+       `brake_late` 两条规则一直在用它），它就是"该刹车的那一段"的定义。
+       而"入弯段"是个模糊说法 —— 无法用已有数据划出唯一一条边界。
+
+    🔴 为什么是**占比**而不是"刹车区损失秒数"：
+       不同弯的窗口长度不同（连续 S 弯合并后可能 400 m，单弯 300 m），
+       绝对秒数不可比。占比才是"这个弯的损失主要出在哪一步"。
+
+    只算**窗口完整落在本圈内**的弯，与 `corner_losses` 同一口径 ——
+    两个函数对同一个弯给出"算/不算"必须一致，否则 share 会配到不存在的那一圈。
+    """
+    out: dict[str, float] = {}
+    if not windows or not s or s[-1] <= 0:
+        return out
+    for w in windows:
+        if w["s2"] > s[-1]:
+            continue
+        total = (interp_at(s, t, w["s2"]) - interp_at(s, t, w["s1"])) - (
+            (ref.t_at_s(w["s2"]) or 0.0) - (ref.t_at_s(w["s1"]) or 0.0))
+        if total <= 0.05:
+            out[w["label"]] = 0.0      # 没亏（或亏得看不出）→ 谈不上"主要出在刹车"
+            continue
+        brake = 0.0
+        for z in (ref.brake_in or []):
+            s_in = z.get("s_in_m")
+            if s_in is None:
+                continue
+            # 刹车区在**参考圈**上的跨度：入点 → 对应的弯心（没有则取 +120 m）
+            apex = ref.apex_of_zone(z)
+            s_out = (apex["s_m"] if apex else s_in + 120.0)
+            a = max(s_in, w["s1"])
+            b = min(s_out, w["s2"])
+            if b - a < 5.0:
+                continue
+            lb = (interp_at(s, t, b) - interp_at(s, t, a)) - (
+                (ref.t_at_s(b) or 0.0) - (ref.t_at_s(a) or 0.0))
+            if lb > 0:
+                brake += lb
+        out[w["label"]] = round(min(1.0, brake / total), 3)
+    return out
+
+
+def _median(xs: list[float]) -> float:
+    """中位数。全项目统一口径 —— 均值对单圈离群值不鲁棒（见 habit/FuelTracker）。"""
+    if not xs:
+        return 0.0
+    srt = sorted(xs)
+    n = len(srt)
+    return srt[n // 2] if n % 2 else (srt[n // 2 - 1] + srt[n // 2]) / 2.0
+
+
 @dataclass
 class CornerTracker:
     """跨圈累积每个弯的损失，找出「反复亏」的那个弯。
@@ -380,6 +438,10 @@ class CornerTracker:
     window: int = 5                   # 取最近 N 圈的均值（老圈的失误会淡出）
     windows: list[dict] = field(default_factory=list)
     losses: dict[str, list[float]] = field(default_factory=dict)
+    # 损失的**构成**：每个弯的损失里有多大比例发生在刹车区。
+    # 它不是另一份"损失"，而是对同一份损失的解释 —— 用于让 `next_focus`
+    # 决定「给不给'注意刹车点'这句提示」（见 phrases.next_focus 的说明）。
+    shares: dict[str, list[float]] = field(default_factory=dict)
 
     def setup(self, ref: RefLap) -> bool:
         """用参考圈的弯心建窗口；已建过就返回 False（不重建）。"""
@@ -395,6 +457,13 @@ class CornerTracker:
             xs.append(v)
             del xs[:-self.window]
 
+    def add_shares(self, per: dict[str, float]) -> None:
+        """记每个弯的「刹车区损失占比」（与 `add` 同圈、同一批 label）。"""
+        for k, v in per.items():
+            xs = self.shares.setdefault(k, [])
+            xs.append(v)
+            del xs[:-self.window]
+
     def habit(self) -> dict[str, Any] | None:
         """「反复亏」的弯：样本 ≥min_laps、**中位损失** ≥min_loss_s 里最严重的。
 
@@ -407,15 +476,19 @@ class CornerTracker:
         for label, xs in self.losses.items():
             if len(xs) < self.min_laps:
                 continue
-            srt = sorted(xs)
-            n = len(srt)
-            med = srt[n // 2] if n % 2 else (srt[n // 2 - 1] + srt[n // 2]) / 2.0
+            med = _median(xs)
             if med < self.min_loss_s:
                 continue
             if best is None or med > best["median_loss_s"]:
                 best = {"label": label, "median_loss_s": round(med, 3),
-                        "metric": round(med, 3), "laps": n,
+                        "metric": round(med, 3), "laps": len(xs),
                         "recent": [round(x, 2) for x in xs]}
+        if best is None:
+            return None
+        sh = self.shares.get(best["label"]) or []
+        if sh:
+            best["ls_share"] = round(_median(sh), 2)
+            best["ls_share_laps"] = len(sh)
         return best
 
     def to_dict(self) -> dict[str, Any]:
