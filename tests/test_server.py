@@ -66,8 +66,16 @@ class TestRoutes:
                   "stats"):
             assert k in d, k
         assert d["api_version"] == 1
-        assert d["ref_ready"] is True
+        # 🔴 这一刻还在**第 1 圈**，所以 `ref_ready` 必须是 False，而且
+        #    `ref_lap` / `ref_len_m` 要一起为 None（三个字段说的是同一个 ref）。
+        #    但**手上确实有东西** —— `stats.ref_source` 说明它是从哪来的，
+        #    `ref_blocked` 说明为什么按着（暖胎期 / 半圈 / 暂无）。
+        #    "有"与"能用"是两个概念，接口要能同时说清这两件事。
+        assert d["ref_ready"] is False
+        assert d["ref_lap"] is None and d["ref_len_m"] is None
         assert d["stats"]["ref_source"] == "profile"
+        assert "暖胎" in (d["stats"]["ref_blocked"] or "")
+        assert d["stats"]["run_laps"] == 0
 
     def test_say_is_edge_triggered(self, server):
         """`/say` 取走就没了；再取应当为空（除非这期间又说了新的）。"""

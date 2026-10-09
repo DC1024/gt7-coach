@@ -56,12 +56,19 @@ def mk(**over) -> Frame:
 
 
 def feed(rs, st, *, ticks=1, dt=0.1, s=None, lateral=None, ref=None,
-         **frame_over):
-    """连续跑 N 个 tick，返回所有产生的 utterance。"""
+         warmup=False, **frame_over):
+    """连续跑 N 个 tick，返回所有产生的 utterance。
+
+    `warmup=True` 模拟"本场还没跑完一圈"（引擎侧会同时把 ref 收回去）。
+    **单独放出这个开关是故意的**：正因为依赖参考圈的规则都写着
+    `if c.ref is None or c.s is None: return None`，暖胎期"只说不依赖参考圈的
+    信息"这件事才不用每条规则各判一次；而 `f.last_lap_ms` 那条（上一圈成绩）
+    是唯一一个不吃 `ref` 却会串到上一轮的，所以它必须自己认这个标志。
+    """
     out = []
     for _ in range(ticks):
         c = Ctx(f=mk(**frame_over), ref=ref, s=s, lateral_m=lateral, dt=dt,
-                st=st)
+                st=st, warmup=warmup)
         out += rs.evaluate(c)
     return out
 
@@ -359,6 +366,20 @@ class TestLapSummary:
         us = feed(rs, st, ref=ref, last_lap_ms=92412.0)
         assert [u for u in us if u.key == "lap_summary"]
         assert not [u for u in us if u.key == "lap_advice"]
+
+    def test_warmup_silent_about_last_lap(self, rs, st, ref):
+        """暖胎期（本场还没跑完一圈）**不能**念"上一圈成绩"。
+
+        🔴 `f.last_lap_ms` 是游戏给的"最后一次冲线"值，**重开比赛后它还停在
+           上一轮** —— 不按住它，新的一局刚发车，教练先把上一局的圈速念一遍。
+           而这条规则是唯一一个不吃 `c.ref` 的（所以"收回参考圈"挡不住它），
+           必须自己认 `c.warmup`。
+        """
+        for flag in (True, False):
+            rs.cfg.lap_advice = flag
+            us = feed(rs, st, ref=ref, last_lap_ms=92412.0, warmup=True)
+            assert [u for u in us
+                    if u.key in ("lap_advice", "lap_summary")] == [], us
 
 
 class TestLapAdvice:

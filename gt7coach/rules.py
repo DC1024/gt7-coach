@@ -159,6 +159,15 @@ class Ctx:
     theory: dict[str, Any] | None = None   # 本场各段最好值 → 理论最快圈
     fuel: dict[str, Any] | None = None     # 每圈油耗 / 还能跑几圈
     corners: dict[str, Any] | None = None  # 每弯累积（含 habit：反复亏的那个弯）
+    # 本场**还没跑完第一圈**（暖胎期）→ 一个字都别乱说。
+    #
+    # 🔴 依赖参考圈的规则不用自己判这个：引擎在暖胎期会把 `ref`/`s` 收回去，
+    #    而每一条依赖它的检查开头都写着 `if c.ref is None or c.s is None: return None`，
+    #    于是"把参考圈收回去"就等于"自动只播报不依赖参考圈的信息"。
+    #    这个标志是留给**另一类坑**的：「上一圈成绩」（`f.last_lap_ms`）是游戏
+    #    给的"最后一次冲线"值，**重开比赛后它还停在上一轮** —— 不按住它，
+    #    新的一局刚发车，教练先把上一局的圈速念一遍。
+    warmup: bool = False
 
 
 class RuleSet:
@@ -502,6 +511,11 @@ class RuleSet:
     # —— 10. 圈后小结 ——————————————————————————————————
 
     def _lap_summary(self, c: Ctx) -> Utterance | None:
+        # 🔴 暖胎期**不能**报"上一圈成绩"：`last_lap_ms` 是游戏给的"最后一次
+        #    冲线"值，重开比赛后它还停在上一轮 —— 报出来就是"新的一局刚发车，
+        #    教练先念上一局的圈速"。本场没跑完一圈时，这个数一定不是本场的。
+        if c.warmup:
+            return None
         ms = c.f.last_lap_ms
         if not ms or ms <= 0:
             return None

@@ -25,7 +25,14 @@ R = 600.0
 L = 2.0 * math.pi * R
 
 
-def make_engine(*, with_profile=True, laps=3, interval=0.01, **cfg_over):
+def make_engine(*, with_profile=True, laps=6, interval=0.01, **cfg_over):
+    """默认 laps=6 —— 故意给足圈数。
+
+    🔴 回放源 `loop=True` 绕回来时，"下一帧"就是第 1 圈第 0 帧，与**重开比赛**
+       在引擎眼里**一模一样**（圈号倒退 → `_reset_run`，清掉自攒参考圈、
+       分段基准、每弯累积）。那是引擎正确的行为，但会让"只想看跑了 4 圈以后
+       长什么样"的测试在第 5 圈悄悄被清空。给足圈数就不会撞上这件事。
+    """
     frames = synth_lap_frames(radius_m=R, hz=10.0, laps=laps)
     prof = synth_profile(radius_m=R) if with_profile else None
     src = ReplaySource(frames, profile=prof, loop=True)
@@ -41,6 +48,20 @@ def drive(eng, n, sleep=0.0):
         st = eng.tick()
         if sleep:
             time.sleep(sleep)
+    return st
+
+
+def drive_to_lap(eng, lap_n, max_iter=4000):
+    """一直 tick 到**跑到第 lap_n 圈**为止，返回那一刻的 state。
+
+    比数帧数稳健：一圈几帧会随合成参数漂移，而这些测试真正关心的时刻是
+    「第 1 圈跑完之后」（参考圈从这一圈起才拿得出手）。
+    """
+    st = None
+    for _ in range(max_iter):
+        st = eng.tick()
+        if st.lap >= lap_n:
+            return st
     return st
 
 
@@ -175,7 +196,10 @@ class TestStateSurface:
     def test_state_fields_populated_with_profile(self):
         eng, _ = make_engine(with_profile=True)
         assert wait_ref(eng)
-        st = drive(eng, 30)
+        # 🔴 第 1 圈只播报不依赖参考圈的信息（见 TestWarmupNoReferenceLap），
+        #    `ref_ready` 在这一圈必须是 False —— 要验"字段填对了"就得先跑完
+        #    第 1 圈。
+        st = drive_to_lap(eng, 2)
         assert st.ref_ready and st.ref_lap == 1
         assert st.ref_len_m == pytest.approx(L, rel=0.01)
         assert st.s_m is not None and 0 <= st.s_m <= L * 1.01
@@ -186,7 +210,7 @@ class TestStateSurface:
         """合成帧就走在参考线上，横向距离应当接近 0。"""
         eng, _ = make_engine(with_profile=True)
         assert wait_ref(eng)
-        st = drive(eng, 20)
+        st = drive_to_lap(eng, 2)
         assert st.stats["lateral_m"] is not None
         assert st.stats["lateral_m"] < 3.0
 
@@ -206,11 +230,14 @@ class TestStateSurface:
 
     def test_delta_sign_is_plausible(self):
         """合成帧与参考圈同源，delta 应当在 0 附近（±1 s 内），
-        不该出现几秒级的偏差 —— 那说明距离轴或时间轴错位了。"""
+        不该出现几秒级的偏差 —— 那说明距离轴或时间轴错位了。
+
+        🔴 第 1 圈不收（暖胎期不把参考圈交给规则层），所以要多跑一点。
+        """
         eng, _ = make_engine(with_profile=True)
         assert wait_ref(eng)
         seen = []
-        for _ in range(200):
+        for _ in range(1400):
             st = eng.tick()
             if st.delta_s is not None:
                 seen.append(st.delta_s)
@@ -510,7 +537,9 @@ class TestLocalLapStats:
 
     def test_partial_lap_does_not_pollute_theory(self):
         """中途接入时第一圈是残圈，不能进理论最快圈的统计。"""
-        frames = synth_lap_frames(radius_m=R, hz=10.0, laps=2)
+        # laps=3（不是 2）：回放绕回圈号倒退 = 引擎眼里的"重开比赛"（见
+        # make_engine 的说明），圈数给足，避免在观察窗内撞上那次清空。
+        frames = synth_lap_frames(radius_m=R, hz=10.0, laps=3)
         # 从第 1 圈中途开始（掐掉前 25 秒）
         src = ReplaySource(frames[250:], profile=synth_profile(radius_m=R),
                            loop=True)
@@ -542,7 +571,7 @@ class TestBestLapRefreshDoesNotWipeLapBuffer:
 
     @staticmethod
     def _engine():
-        frames = synth_lap_frames(radius_m=R, hz=10.0, laps=3)
+        frames = synth_lap_frames(radius_m=R, hz=10.0, laps=5)
         src = ReplaySource(frames, profile=None, loop=True)
         src._session = {"file": "live.jsonl", "live": True, "best_lap_s": 69.7,
                         "car_name": "X"}
@@ -610,7 +639,10 @@ class TestCornerHabitEndToEnd:
 
     def test_fires_after_three_laps_of_same_corner(self):
         # 直播车整体比参考圈慢 ~5% → 每个弯都亏，累积 3 圈后应当主动指出
-        frames = synth_lap_frames(radius_m=R, hz=10.0, laps=4,
+        # laps=5：弯窗口在第 1 圈跑完时才依据参考圈生成，随后每圈记一条损失；
+        # 攒够 corner_min_laps=3 条要到第 4 圈末，而回放绕回会被当成重开比赛
+        # （见 make_engine），所以圈数要留出余量。
+        frames = synth_lap_frames(radius_m=R, hz=10.0, laps=5,
                                   base_kph=190.0, dip_kph=85.0)
         src = ReplaySource(frames, profile=synth_profile(radius_m=R), loop=True)
         eng = CoachEngine(src, CoachConfig(sess_poll_boot_s=0.02,
@@ -636,7 +668,10 @@ class TestCornerHabitEndToEnd:
 
     def test_does_not_fire_every_lap(self):
         """同一个弯隔 3 圈才提醒第二次 —— 每圈念同一句就成了唠叨。"""
-        frames = synth_lap_frames(radius_m=R, hz=10.0, laps=4,
+        # laps=5：弯窗口在第 1 圈跑完时才依据参考圈生成，随后每圈记一条损失；
+        # 攒够 corner_min_laps=3 条要到第 4 圈末，而回放绕回会被当成重开比赛
+        # （见 make_engine），所以圈数要留出余量。
+        frames = synth_lap_frames(radius_m=R, hz=10.0, laps=5,
                                   base_kph=190.0, dip_kph=85.0)
         src = ReplaySource(frames, profile=synth_profile(radius_m=R), loop=True)
         eng = CoachEngine(src, CoachConfig(sess_poll_boot_s=0.02,
@@ -661,7 +696,9 @@ class TestCornerHabitEndToEnd:
                                            sess_poll_idle_s=0.05),
                           clock=src.clock)
         assert wait_ref(eng)
-        for _ in range(700):
+        # 900 帧 > 一圈（约 700 帧）—— 弯窗口是在第 1 圈**跑完**那一刻依参考圈
+        # 生成的，700 帧只是勉强够到边界（wait_ref 已经吃掉几十帧）。
+        for _ in range(900):
             eng.tick()
         st = eng.tick()
         assert "corners" in st.stats and "corner_habit" in st.stats
@@ -725,6 +762,157 @@ class TestCornerAccountingOncePerLap:
             assert n >= 3, f"样本不足就不该播报：{u.evidence}"
             assert f"连续 {n} 圈" in u.text, u.text
             assert u.evidence["focus_label"] in u.text
+
+
+class TestWarmupNoReferenceLap:
+    """开局第 1 圈：**只播报不需要参考圈的信息**。
+
+    这是用户的明确要求：「跑完一圈（参考圈从第 1 圈变成第 2 圈）才开始播报」。
+    它背后是两个真 bug：
+      · Dash 的 `/profile` 在本场只有一圈时会把**正在跑的那一圈**回给我们
+        （那边 `usable = trimmed or usable`），于是第 1 圈在拿半圈跟自己比，
+        报出「1.4 秒后重刹」「给油晚了」；
+      · 重开比赛 / 换场次之后教练还在接着播报（上一轮的参考圈与每弯累积）。
+
+    判据因此从"有没有 ref 对象"改成"本场有没有**跑完**的圈"。
+    """
+
+    # 依赖参考圈的规则键（引擎在暖胎期把 ref/s 收回去，这些自然全都出不来）
+    REF_KEYS = ("off_track", "brake_warn", "brake_late", "apex_slow",
+                "throttle_late", "delta", "projected_lap")
+
+    BAD = dict(brake=0.0, throttle=1.0, speed_kph=195.0)
+
+    @classmethod
+    def _frames(cls, laps, bad=(1, 2)):
+        """把 `bad` 里那几圈的 400~480 m 段改成「该刹不刹」，并顺手拉爆转速。
+
+        🔴 参考圈**始终**是同一份完整的合成剖面，所以"第 1 圈不说、第 2 圈说"
+           只可能由暖胎期解释，不是夹具在偏心。转速拉爆是为了留一个
+           **不依赖参考圈**的正对照（`shift`）—— 否则"第 1 圈什么都没说"
+           和"教练整个哑掉了"分不出来。
+        """
+        out = []
+        for f in synth_lap_frames(radius_m=R, hz=10.0, laps=laps):
+            s = (math.atan2(f.z, f.x) % (2 * math.pi)) * R if f.coords_ok else None
+            if f.lap in bad and s is not None and 400.0 <= s <= 480.0:
+                over = dict(f.__dict__)
+                over.update(cls.BAD, rpm=8600.0)
+                v = over.get("speed_kph", f.speed_kph) / 3.6
+                over["wheel_rads"] = (v / 0.34,) * 4
+                f = Frame(**over)
+            out.append(f)
+        return out
+
+    @staticmethod
+    def _engine(frames, **cfg_over):
+        src = ReplaySource(frames, profile=synth_profile(radius_m=R), loop=False)
+        cfg = CoachConfig(sess_poll_boot_s=0.02, sess_poll_idle_s=0.05, **cfg_over)
+        return CoachEngine(src, cfg, clock=src.clock), src
+
+    def _drive(self, eng, n):
+        """跑完 n 帧，返回 [(tick, lap, key)]。"""
+        said = []
+        for i in range(n):
+            st = eng.tick()
+            for u in st.say:
+                said.append((i, st.lap, u.key.split("@")[0]))
+        return said
+
+    def test_first_lap_says_nothing_ref_dependent(self):
+        frames = self._frames(3)
+        eng, _ = self._engine(frames)
+        said = self._drive(eng, len(frames))
+        lap1 = {k for (_i, lap, k) in said if lap == 1}
+        assert lap1, "第 1 圈不是不能说话，只是不能说依赖参考圈的话"
+        assert not (lap1 & set(self.REF_KEYS)), sorted(lap1 & set(self.REF_KEYS))
+        # 正对照：同样的开法，第 2 圈就该说了
+        lap2 = {k for (_i, lap, k) in said if lap == 2}
+        assert lap2 & set(self.REF_KEYS), sorted(lap2)
+
+    def test_state_admits_no_reference_during_warmup(self):
+        """仪表盘那个「参考圈：车载 60Hz · 第 N 圈」标签的数据源必须诚实。
+
+        🔴 关键场景是"手上**已经**有一份 ref 对象，但还不能用"：
+           暖胎期 `ref_ready` 必须是 False，`ref_lap`/`ref_len_m` 必须一起为
+           None（三个字段描述同一个 ref）。只改 `ref_ready` 的话，标签会变成
+           "建立中…·第 1 圈"这种自相矛盾的串。
+        """
+        frames = self._frames(3)
+        eng, _ = self._engine(frames)
+        assert wait_ref(eng), "手上得先有一份 ref —— 否则测不出「有但不用」"
+        st = eng.tick()
+        assert st.lap == 1, f"这一刻应当还在第 1 圈（实际第 {st.lap} 圈）"
+        assert eng._current_ref() is not None, "手上明明有 ref"
+        assert st.ref_ready is False
+        assert st.ref_lap is None and st.ref_len_m is None
+        # `ref_source` 说的是"**手上这份**从哪来"（排障用），与"能不能用"分开：
+        # 此刻手上确实有一份 profile，只是被暖胎期那道闸按住。
+        assert st.stats["ref_source"] == "profile"
+        assert st.stats["run_laps"] == 0
+        assert "暖胎" in (st.stats["ref_blocked"] or "")
+        # 跑完第 1 圈 → 参考圈才"拿得出手"，且三个字段说的是同一个 ref
+        for _ in range(len(frames)):
+            st = eng.tick()
+            if st.ref_ready:
+                break
+        assert st.ref_ready, "跑完一圈之后应当有可用参考圈"
+        assert st.ref_lap is not None and st.ref_len_m is not None
+        assert st.ref_len_m == pytest.approx(L, rel=0.05)
+
+    def test_in_progress_profile_is_never_published(self):
+        """Dash 明说"这一圈还在跑" → 当没取到处理，**绝不发布**。
+
+        发布出去就是三重污染：拿去定位（凭空的"出界了"）、存进本地缓存
+        （把半圈存成"这条赛道的最好圈"）、当形状比对基准（把后面每次
+        "是不是同一条赛道"的判断一起带偏）。
+        """
+        prof = dict(synth_profile(radius_m=R))
+        prof["meta"] = {"file": "replay.jsonl", "in_progress": True}
+        frames = self._frames(2)
+        src = ReplaySource(frames, profile=prof, loop=False)
+        eng = CoachEngine(src, CoachConfig(sess_poll_boot_s=0.02,
+                                           sess_poll_idle_s=0.05),
+                          clock=src.clock)
+        for _ in range(150):
+            eng.tick()
+        assert src.profile_calls >= 1, "得真去取过，才谈得上拒绝"
+        assert eng._current_ref() is None, "半圈剖面绝不能被发布成参考圈"
+        st = eng.tick()
+        assert st.ref_ready is False
+        assert st.stats["ref_state"] == "failed"
+        # 错误得说得清：这是"内容还不能用"，不是网络/服务端的问题
+        assert "还在跑" in (st.stats["ref_error"] or ""), st.stats["ref_error"]
+
+    def test_restart_wipes_previous_run(self):
+        """重开比赛（圈号倒退）→ 上一轮的东西一件都不能留。
+
+        用户看到的现象是「切换场次 / 重新比赛，赛道工程师还在继续工作」——
+        因为旧代码只把"圈号变了"当成"跑完一圈"，圈号倒退回 1 时它既不结算、
+        也不作废，参考圈与每弯累积全是上一轮的，于是新一轮第 1 圈继续播报。
+        """
+        frames = self._frames(3) + self._frames(2)     # 后一段：圈号回到 1
+        eng, _ = self._engine(frames)
+        seen_run, restarted_at = 0, None
+        said = []
+        for i in range(len(frames)):
+            st = eng.tick()
+            seen_run = max(seen_run, eng._run_laps)
+            if restarted_at is None and seen_run >= 2 and eng._run_laps == 0:
+                restarted_at = i
+                assert eng._self_ref is None, "自攒参考圈是上一轮的，必须作废"
+                assert eng._prev_lap is None, "上一圈成绩是上一轮的"
+                assert eng._lap_buf == [] or len(eng._lap_buf) <= 1
+            for u in st.say:
+                said.append((i, st.lap, u.key.split("@")[0]))
+        assert restarted_at is not None, "夹具没造出「圈号倒退」"
+        after1 = [(i, k) for (i, lap, k) in said
+                  if i > restarted_at and lap == 1]
+        assert after1, "重开之后第 1 圈仍该说不需要参考圈的话"
+        assert not ({k for _i, k in after1} & set(self.REF_KEYS)), after1
+        # 新一轮第 2 圈：参考圈该回来了（不是被永久关掉）
+        after2 = {k for (i, lap, k) in said if i > restarted_at and lap == 2}
+        assert after2 & set(self.REF_KEYS), sorted(after2)
 
 
 class TestSpeechDigits:

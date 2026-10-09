@@ -92,6 +92,28 @@ def interp_at(dists: list[float], values: list[float], d: float) -> float:
 _KAPPA_EPS = 5e-4
 
 
+def _meta_in_progress(meta: dict[str, Any], lap: int) -> bool:
+    """Dash 的响应有没有明说「返回给你的这一圈还在跑」。
+
+    两种写法都认：
+      · `in_progress: true`                  —— 布尔，直说（新 Dash 这么发）；
+      · `in_progress_lap: N` 且 N == 返回的那一圈 —— 等价说法，
+        也方便手工拼响应 / 用 JSON 手测（不用回去数布尔）。
+    两个都没有（老版 Dash）→ False。**那时靠 `engine._ref_block_reason` 里
+    「圈号撞上当前圈 + 同一个场次文件」那条兜底判据**，不是不管了。
+    """
+    v = meta.get("in_progress")
+    if v is not None:
+        return bool(v)
+    il = meta.get("in_progress_lap")
+    if il is None or lap <= 0:
+        return False
+    try:
+        return int(il) == int(lap)
+    except (TypeError, ValueError):
+        return False
+
+
 @dataclass
 class RefLap:
     """一圈的按位置索引剖面。所有数组 `grid_m` 一一对齐。"""
@@ -99,6 +121,21 @@ class RefLap:
     lap: int = 0
     # "profile" 本场最快圈（Dash 60Hz）| "self" 自攒 | "history" 跨场次历史最快
     source: str = "profile"
+    # 🔴 这份参考圈**来自哪个场次文件**。没有它就无法区分两种完全不同的情况：
+    #      · 这份 ref 是本场跑完的一圈（lap < 当前圈）→ 可以放心用；
+    #      · 这份 ref 就是**本场正在跑的那一圈**（lap == 当前圈，几何只覆盖
+    #        半条赛道）→ 拿它定位会大面积失配，必须拒绝。
+    #    跨场次的（缓存 / history）与 `lap` 号跨场不可比，所以只能靠文件名分辨。
+    #    `from_frames` 自攒的那份填 ""：它按构造就是本场已跑完的圈，天然可信。
+    session_file: str = ""
+    # 🔴 这份剖面**还在跑**。Dash 在「本场只有一圈」时会把正在跑的那一圈回给我们
+    #    （它自己的注释：`usable = trimmed or usable`，"不能把唯一的一圈也排掉"），
+    #    于是"手上有一个 ref 对象"根本不等价于"有可用的参考圈"：
+    #    那半圈的折线只覆盖半条赛道、圈长还随车前进**一直变长**（实测一场里
+    #    5491 m 一路涨到 7493 m）。拿它做最近点定位 → 横向距离算成几十米 →
+    #    一句"出界了"；拿它预告刹车点 → 指到别的弯。而这一切都发生在刚开局、
+    #    车手最需要听清的时候。判据必须落在这里，见 `engine._ref_block_reason`。
+    in_progress: bool = False
     grid_m: list[float] = field(default_factory=list)
     speed_kph: list[float] = field(default_factory=list)
     throttle: list[float] = field(default_factory=list)
@@ -117,12 +154,19 @@ class RefLap:
 
     @staticmethod
     def from_profile(d: dict[str, Any], require_geometry: bool = True,
-                     source: str = "profile") -> "RefLap":
+                     source: str | None = None) -> "RefLap":
         """解析 GT7 Dash `/profile` 的响应。
 
         `require_geometry=True`（缺省）时，**没有坐标的剖面直接拒绝** ——
         没有折线就没法做实时最近点定位，硬用积分距离定位会错十几米。
         宁可退回自己攒图（那个至少有本轮实测坐标）。
+
+        `source=None` 时优先读 `meta.source`（`to_profile` 往返会带上它，
+        所以经本地缓存转一圈回来的参考圈仍能记住自己是 history 还是 profile）；
+        都没有才落到 `"profile"`。
+
+        🔴 同时会把 `meta` 里的"这一圈还在跑"读进 `in_progress`。**这里不拒绝它**
+           （调用方要能看见"取到了但还不能用"），拒绝在 `engine._fetch_ref` 里做。
         """
         if not d or d.get("error"):
             raise ValueError(f"profile 不可用: {(d or {}).get('error', '空响应')}")
@@ -135,9 +179,13 @@ class RefLap:
             raise ValueError("profile 没有可用的坐标折线（无法实时定位）")
 
         mk = d.get("markers") or {}
+        _meta = d.get("meta") or {}
+        lap = int(d.get("lap") or 0)
         ref = RefLap(
-            lap=int(d.get("lap") or 0),
-            source=source,
+            lap=lap,
+            source=source or str(_meta.get("source") or "") or "profile",
+            session_file=str(_meta.get("file") or ""),
+            in_progress=_meta_in_progress(_meta, lap),
             grid_m=[float(v) for v in grid],
             speed_kph=[float(v) for v in (d.get("speed_kph") or [])],
             throttle=[float(v) for v in (d.get("throttle") or [])],
@@ -462,6 +510,11 @@ class RefLap:
         return {
             "lap": self.lap,
             "frames": 0,
+            # 🔴 带上"来自哪一场、是哪一类、跑完了没有"，否则经本地缓存往返
+            #    一圈回来这些都会丢成空/False —— 而它们正是"这份参考圈能不能
+            #    现在用"的全部判据（见 `engine._ref_block_reason`）。
+            "meta": {"file": self.session_file, "source": self.source,
+                     "in_progress": self.in_progress},
             "length_m": self.length_m,
             "length_by_speed_m": self.length_m,
             "length_drift_pct": None,
