@@ -1,0 +1,544 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GT7 赛道工程师 —— 给你的 PS5 配一个副驾</title>
+<meta name="description" content="实时读取 GT7 遥测，在刹车点、弯心、打滑的那一刻说一句该说的话。纯本地判断，零云依赖。">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%232563eb'/><path d='M7 21l5-11 4 7 3-5 6 9z' fill='white'/></svg>">
+<style>
+:root{
+  --bg:#fbfbfd; --panel:#ffffff; --ink:#12151c; --ink2:#454b58; --ink3:#767d8d;
+  --line:#e4e7ee; --line2:#d3d8e3;
+  --blue:#2563eb; --blue-l:#eff4ff; --blue-d:#1b47b8;
+  --amber:#b45309; --amber-l:#fef6e7;
+  --red:#c2261f; --red-l:#fdeeed; --red-d:#8f1a15;
+  --green:#0f7b4f; --green-l:#e8f6ef;
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+  --sh:0 1px 2px rgba(18,21,28,.05),0 4px 14px rgba(18,21,28,.045);
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);
+  font-size:15px;line-height:1.72;-webkit-font-smoothing:antialiased}
+.wrap{max-width:1000px;margin:0 auto;padding:0 24px}
+a{color:var(--blue);text-decoration:none}
+a:hover{text-decoration:underline}
+
+/* 顶栏 */
+nav{position:sticky;top:0;z-index:50;background:rgba(251,251,253,.86);
+  backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}
+nav .wrap{display:flex;align-items:center;gap:26px;height:58px}
+.brand{display:flex;align-items:center;gap:9px;font-weight:600;font-size:15px;
+  color:var(--ink);letter-spacing:-.01em}
+.brand svg{flex:none}
+nav .links{margin-left:auto;display:flex;gap:24px;font-size:13.5px}
+nav .links a{color:var(--ink2);font-weight:450}
+nav .links a:hover{color:var(--blue);text-decoration:none}
+@media(max-width:720px){nav .links{display:none}}
+
+/* 首屏 */
+header{padding:74px 0 60px;border-bottom:1px solid var(--line);
+  background:linear-gradient(180deg,#fff 0%,var(--bg) 100%)}
+.eyebrow{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;
+  font-weight:500;color:var(--blue-d);background:var(--blue-l);
+  border:1px solid #d5e0fd;border-radius:99px;padding:5px 13px;margin-bottom:20px}
+.dot{width:6px;height:6px;border-radius:50%;background:var(--green);flex:none}
+h1{font-size:41px;line-height:1.22;margin:0 0 18px;font-weight:600;
+  letter-spacing:-.025em;max-width:19em}
+h1 .hl{color:var(--blue)}
+.lede{font-size:17px;color:var(--ink2);max-width:38em;margin:0 0 30px;line-height:1.68}
+.cta{display:flex;flex-wrap:wrap;gap:11px;margin-bottom:34px}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:11px 20px;
+  border-radius:9px;font-size:14.5px;font-weight:500;border:1px solid transparent;
+  transition:.15s;white-space:nowrap}
+.btn-p{background:var(--blue);color:#fff;box-shadow:0 1px 2px rgba(37,99,235,.28)}
+.btn-p:hover{background:var(--blue-d);text-decoration:none}
+.btn-s{background:#fff;color:var(--ink);border-color:var(--line2)}
+.btn-s:hover{border-color:var(--ink3);text-decoration:none}
+.facts{display:flex;flex-wrap:wrap;gap:8px 26px;font-size:13px;color:var(--ink3)}
+.facts span{display:flex;align-items:center;gap:6px}
+.facts b{color:var(--ink);font-weight:500}
+
+/* 演示条 */
+.demo{margin:0 0 0;border:1px solid var(--line);border-radius:13px;
+  background:var(--panel);box-shadow:var(--sh);overflow:hidden}
+.demo-h{display:flex;align-items:center;gap:8px;padding:11px 15px;
+  border-bottom:1px solid var(--line);background:#fafbfd}
+.demo-h .lbl{font-family:var(--mono);font-size:12px;color:var(--ink3)}
+.demo-h .pill{margin-left:auto;font-size:11.5px;font-family:var(--mono);
+  color:var(--green);background:var(--green-l);border:1px solid #cceadd;
+  border-radius:99px;padding:2px 9px}
+.radio{padding:16px 18px;display:flex;flex-direction:column;gap:11px}
+.msg{display:flex;gap:12px;align-items:flex-start;font-size:14px}
+.prio{flex:none;width:22px;height:22px;border-radius:6px;display:grid;
+  place-items:center;font-family:var(--mono);font-size:10.5px;font-weight:600;
+  color:#fff;margin-top:1px}
+.p0{background:var(--red)} .p1{background:var(--amber)} .p3{background:var(--ink3)}
+.msg .t{font-family:var(--mono);font-size:12px;color:var(--ink3);
+  min-width:52px;padding-top:3px}
+.msg .q{color:var(--ink);font-weight:500}
+.msg .q em{font-style:normal;color:var(--ink3);font-weight:400;font-size:13px}
+.msg.state .q{color:var(--ink3);font-weight:400}
+@media(max-width:560px){.msg .t{display:none}}
+
+/* 通用区块 */
+section{padding:66px 0;border-bottom:1px solid var(--line)}
+section:last-of-type{border-bottom:0}
+h2{font-size:25px;font-weight:600;letter-spacing:-.018em;margin:0 0 10px}
+h2 .n{font-family:var(--mono);font-size:14px;color:var(--blue);
+  font-weight:500;margin-right:9px}
+.sub{color:var(--ink2);max-width:44em;margin:0 0 34px;font-size:15px}
+
+/* 卡片网格 */
+.grid{display:grid;gap:15px}
+.g3{grid-template-columns:repeat(3,1fr)}
+.g2{grid-template-columns:repeat(2,1fr)}
+@media(max-width:860px){.g3{grid-template-columns:1fr 1fr}}
+@media(max-width:620px){.g3,.g2{grid-template-columns:1fr}}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+  padding:20px;box-shadow:var(--sh)}
+.card .ic{width:30px;height:30px;border-radius:8px;display:grid;place-items:center;
+  margin-bottom:13px;background:var(--blue-l);color:var(--blue)}
+.card h3{font-size:15px;margin:0 0 7px;font-weight:600}
+.card p{margin:0;font-size:13.5px;color:var(--ink2);line-height:1.66}
+.card code{font-family:var(--mono);font-size:12px;background:#f4f5f8;
+  border:1px solid var(--line);border-radius:4px;padding:1px 5px;color:var(--ink)}
+
+/* 原则 */
+/* 🔴 用 `minmax(0, 1fr)` 而不是 `1fr`：栅格项默认 `min-width:auto`，
+   会被里面那张 `min-width:520px` 的表格撑破容器 —— 移动端就横向溢出。
+   `minmax(0,…)` 把轨道的最小值归零，配合 `.tw{overflow-x:auto}` 让表格
+   自己内部滚动，而不是把整页顶宽。 */
+.principle{display:grid;grid-template-columns:58px minmax(0, 1fr);gap:18px;
+  padding:22px 0;border-top:1px solid var(--line)}
+.principle:first-of-type{border-top:0;padding-top:0}
+.pnum{font-family:var(--mono);font-size:26px;font-weight:500;color:var(--line2);
+  line-height:1;padding-top:3px}
+.principle h3{font-size:16.5px;margin:0 0 8px;font-weight:600}
+.principle p{margin:0 0 12px;color:var(--ink2);font-size:14px}
+.principle p:last-child{margin-bottom:0}
+
+/* 表格 */
+/* `.tw` 是横向滚动容器：里面表格有 `min-width`，超窄屏时在这里滚，
+   不让页面整体溢出。`max-width:100%` 兜底防它自身被撑开。 */
+.tw{overflow-x:auto;max-width:100%;border:1px solid var(--line);border-radius:11px;
+  background:var(--panel);box-shadow:var(--sh)}
+table{width:100%;border-collapse:collapse;font-size:13.5px;min-width:520px}
+th{text-align:left;font-weight:500;color:var(--ink3);font-size:12.5px;
+  padding:11px 16px;border-bottom:1px solid var(--line);background:#fafbfd;
+  white-space:nowrap}
+td{padding:11px 16px;border-bottom:1px solid #f0f2f6;color:var(--ink2);
+  vertical-align:top}
+tr:last-child td{border-bottom:0}
+td:first-child{color:var(--ink);font-weight:450;white-space:nowrap}
+.tag{display:inline-block;font-family:var(--mono);font-size:11px;font-weight:600;
+  padding:2px 7px;border-radius:5px;line-height:1.5}
+.t0{background:var(--red-l);color:var(--red-d);border:1px solid #f7d4d1}
+.t1{background:var(--amber-l);color:var(--amber);border:1px solid #f7e3c2}
+.t2{background:var(--blue-l);color:var(--blue-d);border:1px solid #d5e0fd}
+.t3{background:#f4f5f8;color:var(--ink3);border:1px solid var(--line2)}
+.yes{color:var(--green);font-weight:600}
+.no{color:var(--red);font-weight:600}
+
+/* 代码块 */
+pre{background:#f7f8fb;border:1px solid var(--line);border-radius:11px;
+  padding:16px 18px;overflow-x:auto;font-family:var(--mono);font-size:12.8px;
+  line-height:1.78;color:var(--ink);margin:0 0 15px}
+pre .c{color:var(--ink3)}
+pre .k{color:var(--blue-d)}
+pre .s{color:var(--green)}
+
+/* 诚实清单 */
+.honest{display:grid;gap:0;border:1px solid var(--line);border-radius:11px;
+  overflow:hidden;background:var(--panel);box-shadow:var(--sh)}
+.hrow{display:grid;grid-template-columns:1fr 1fr;border-bottom:1px solid #f0f2f6}
+.hrow:last-child{border-bottom:0}
+.hrow>div{padding:13px 17px;font-size:13.5px}
+.hrow>div:first-child{color:var(--ink2);border-right:1px solid #f0f2f6}
+.hrow>div:last-child{color:var(--ink2)}
+.hrow .ok{color:var(--green)}
+.hrow .bad{color:var(--red)}
+@media(max-width:620px){.hrow{grid-template-columns:1fr}
+  .hrow>div:first-child{border-right:0;border-bottom:1px solid #f0f2f6;padding-bottom:6px}
+  .hrow>div:last-child{padding-top:6px}}
+
+/* 路线图 */
+.road{display:flex;flex-direction:column;gap:0}
+.ritem{display:grid;grid-template-columns:78px 1fr auto;gap:15px;align-items:baseline;
+  padding:13px 0;border-top:1px solid var(--line);font-size:14px}
+.ritem:first-child{border-top:0}
+.rid{font-family:var(--mono);font-size:12.5px;color:var(--ink3);font-weight:500}
+.rtxt{color:var(--ink2)}
+.ritem.done .rtxt{color:var(--ink)}
+.rdone{font-size:11.5px;color:var(--green);background:var(--green-l);
+  border:1px solid #cceadd;border-radius:5px;padding:1px 8px;white-space:nowrap}
+.rnext{font-size:11.5px;color:var(--ink3);background:#f4f5f8;
+  border:1px solid var(--line2);border-radius:5px;padding:1px 8px;white-space:nowrap}
+@media(max-width:620px){.ritem{grid-template-columns:64px 1fr;row-gap:3px}
+  .ritem .rbadge{grid-column:2}}
+
+/* 数字条 */
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;
+  background:var(--line);border:1px solid var(--line);border-radius:12px;
+  overflow:hidden;box-shadow:var(--sh)}
+.stat{background:var(--panel);padding:22px 18px;text-align:center}
+.stat .v{font-size:27px;font-weight:600;letter-spacing:-.03em;
+  font-variant-numeric:tabular-nums;line-height:1.15}
+.stat .v small{font-size:14px;font-weight:500;color:var(--ink3);margin-left:2px}
+.stat .l{font-size:12.5px;color:var(--ink3);margin-top:5px}
+@media(max-width:620px){.stats{grid-template-columns:1fr 1fr}}
+
+/* 尾部 */
+footer{padding:46px 0 56px;background:#fff;border-top:1px solid var(--line)}
+.fgrid{display:flex;flex-wrap:wrap;gap:32px;justify-content:space-between;
+  align-items:flex-start;margin-bottom:30px}
+.fcol h4{font-size:12.5px;color:var(--ink3);font-weight:500;margin:0 0 11px;
+  text-transform:uppercase;letter-spacing:.05em}
+.fcol a{display:block;font-size:13.5px;color:var(--ink2);margin-bottom:7px}
+.fnote{font-size:12.5px;color:var(--ink3);border-top:1px solid var(--line);
+  padding-top:20px;line-height:1.75}
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="wrap">
+    <div class="brand">
+      <svg width="21" height="21" viewBox="0 0 32 32" aria-hidden="true">
+        <rect width="32" height="32" rx="7" fill="#2563eb"/>
+        <path d="M7 21l5-11 4 7 3-5 6 9z" fill="#fff"/>
+      </svg>
+      赛道工程师
+    </div>
+    <div class="links">
+      <a href="#what">它能做什么</a>
+      <a href="#how">怎么做到</a>
+      <a href="#honest">数据边界</a>
+      <a href="#start">开始使用</a>
+    </div>
+  </div>
+</nav>
+
+<header>
+  <div class="wrap">
+    <div class="eyebrow"><span class="dot"></span>v1.0.0-beta.1 已发布 · 纯本地闭环</div>
+    <h1>给你的 PS5 配一个<span class="hl">副驾</span>。<br>在刹车点前 1.5 秒，它开口。</h1>
+
+    <p class="lede">
+      盯着 GT7 的实时遥测，在你该被提醒的那一刻说一句话 ——
+      刹车晚了多少米、弯心慢了多少、这个弯你连续三圈都在亏。
+      <strong>不是事后剪辑解说，是边开边说。</strong>
+    </p>
+
+    <div class="cta">
+      <a class="btn btn-p" href="https://github.com/DC1024/gt7-coach/releases/latest">
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+        下载 v1.0.0-beta.1
+      </a>
+      <a class="btn btn-s" href="https://github.com/DC1024/gt7-coach">
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+        查看源码
+      </a>
+    </div>
+
+    <div class="facts">
+      <span><b>零依赖</b> 纯 Python 标准库</span>
+      <span><b>10 Hz</b> 实时轮询</span>
+      <span><b>&lt;300 ms</b> 硬实时档</span>
+      <span><b>MIT</b> 许可</span>
+    </div>
+  </div>
+</header>
+
+<div class="wrap" style="padding-top:34px">
+  <div class="demo">
+    <div class="demo-h">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="#767d8d" stroke-width="1.4" aria-hidden="true"><path d="M2 8h3l2-5 2 10 2-5h3"/></svg>
+      <span class="lbl">无线电 · 斯帕-弗朗科尔尚 · 第 3 圈</span>
+      <span class="pill">10.0 /s</span>
+    </div>
+    <div class="radio">
+      <div class="msg"><span class="prio p0">P0</span><span class="t">s=2810m</span><span class="q">刹车晚了 15 米 <em>· 前车已进弯</em></span></div>
+      <div class="msg"><span class="prio p1">P1</span><span class="t">s=5850m</span><span class="q">1.5 秒后重刹区 <em>· 参考最低 92</em></span></div>
+      <div class="msg"><span class="prio p0">P0</span><span class="t">s=3980m</span><span class="q">后轮打滑</span></div>
+      <div class="msg"><span class="prio p3">P3</span><span class="t">圈末</span><span class="q">1:32.412，慢 0.37 <em>· T3 连续 3 圈慢 0.40</em></span></div>
+      <div class="msg" style="border-top:1px dashed var(--line);padding-top:11px"><span class="prio p3">P3</span><span class="t">s=1715m</span><span class="q">P5，追回 2 位</span></div>
+      <div class="msg state"><span class="prio p3" style="background:#e4e7ee;color:#767d8d">—</span><span class="t">s=2100m</span><span class="q">（这一段没什么可说的 —— 闸门拦住了 6 条候选）</span></div>
+    </div>
+  </div>
+  <p style="font-size:12.5px;color:var(--ink3);margin:13px 0 0;text-align:center">
+    以上是真实场次离线回放的输出，不是示意图。最后一条才是重点 —— <strong>该闭嘴时它真的会闭嘴。</strong>
+  </p>
+</div>
+
+<section id="what">
+  <div class="wrap">
+    <h2><span class="n">01</span>它能做什么</h2>
+    <p class="sub">
+      14 条播报规则，按延迟分成三档。P0/P1 是硬实时档 —— 必须在 300 毫秒内出声，
+      因为它说的是「还有 1.5 秒就要刹车了」这种来不及补的话。
+    </p>
+
+    <div class="tw">
+      <table>
+        <thead>
+          <tr><th>什么时候说</th><th>档</th><th>触发条件</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>出界了，回到赛道</td><td><span class="tag t0">P0</span></td><td>距参考线横向 &gt; 18 m 持续 0.4 s</td></tr>
+          <tr><td>前轮 / 后轮 / 四轮打滑</td><td><span class="tag t0">P0</span></td><td>滑移率 &gt; 0.15 持续 0.25 s</td></tr>
+          <tr><td>刹车晚了 N 米</td><td><span class="tag t0">P0</span></td><td>过了刹车入点 &gt; 8 m 还没踩</td></tr>
+          <tr><td>1.5 秒后重刹区</td><td><span class="tag t1">P1</span></td><td>距下一个刹车入点 &lt; 1.5 s</td></tr>
+          <tr><td>该换挡了</td><td><span class="tag t1">P1</span></td><td>转数到换挡灯上限持续 0.5 s</td></tr>
+          <tr><td>弯心慢了 N</td><td><span class="tag t2">P2</span></td><td>弯中速度比参考低 &gt; 5 km/h</td></tr>
+          <tr><td>给油晚了</td><td><span class="tag t2">P2</span></td><td>过弯心 40~120 m 油门仍 &lt; 0.3</td></tr>
+          <tr><td>轮胎太凉 / 过热</td><td><span class="tag t2">P2</span></td><td>任一胎温 &lt; 60 / &gt; 110 °C 持续 2 s</td></tr>
+          <tr><td>S2 慢 0.31，还差 0.80</td><td><span class="tag t2">P2</span></td><td>圈后：指出相对本场最好最慢的那段</td></tr>
+          <tr><td>油还够 2.4 圈</td><td><span class="tag t2">P2</span></td><td>圈后：按本场油耗中位数算（≤3 圈才提醒）</td></tr>
+          <tr><td>T3 连续 3 圈慢 0.40</td><td><span class="tag t2">P2</span></td><td><strong>跨圈累积</strong>：同一个弯反复亏才提醒</td></tr>
+          <tr><td>1:32.412，慢 0.37</td><td><span class="tag t3">P3</span></td><td>每圈结束报成绩与参考差</td></tr>
+          <tr><td>预计 1:22.800</td><td><span class="tag t3">P3</span></td><td>跑过 35% 后预测最终圈速</td></tr>
+          <tr><td>P5，追回 2 位</td><td><span class="tag t3">P3</span></td><td>名次变化 / 后半区鼓励 / 领跑提醒</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p style="font-size:13px;color:var(--ink3);margin-top:15px">
+      ⚠️ 表格里的数字是<strong>实测值</strong>，不是设计稿。
+    </p>
+  </div>
+</section>
+
+<section id="how">
+  <div class="wrap">
+    <h2><span class="n">02</span>怎么做到的</h2>
+    <p class="sub">三条设计原则，后面所有取舍都服从它们。</p>
+
+    <div class="principle">
+      <div class="pnum">01</div>
+      <div>
+        <h3>判断在本地，措辞才上云</h3>
+        <p>
+          「该不该说、说的是哪个数」全部由本地确定性代码完成 —— 毫秒级、零成本、不会编数字。
+          只有「把结论变成一句人话」这一层留给云。<strong>而且必须是可选的</strong>：断网的车库里也要能全功能工作。
+        </p>
+        <p>
+          反过来做（让大模型看着遥测自己判断）必翻车：一次调用 0.5~2 秒，而 250 km/h 时
+          2 秒等于 <strong>139 米</strong> ——「T1 刹车点提前 10 米」晚 139 米就是废话，而且模型会编数字。
+        </p>
+      </div>
+    </div>
+
+    <div class="principle">
+      <div class="pnum">02</div>
+      <div>
+        <h3>按延迟分档，硬实时档禁走云</h3>
+        <div class="tw" style="box-shadow:none;margin-top:4px">
+          <table>
+            <thead><tr><th>档</th><th>延迟预算</th><th>生成方式</th><th>触发场景</th></tr></thead>
+            <tbody>
+              <tr><td>A 硬实时</td><td>&lt; 300 ms</td><td>本地规则</td><td>刹车点 / 弯心 / 给油 / 打滑 / 出界</td></tr>
+              <tr><td>B 圈后</td><td>&lt; 2.5 s</td><td>本地算 + 云润色</td><td>每圈结束的 delta 与归因</td></tr>
+              <tr><td>C 问答</td><td>&lt; 3 s</td><td>云模型</td><td>用户主动提问</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div class="principle">
+      <div class="pnum">03</div>
+      <div>
+        <h3>不打扰，优先于多说话</h3>
+        <p>
+          一个话痨副驾比没有副驾更糟。所以有四道闸拦着：同类冷却 20 秒、跨类冷却 6 秒、
+          每圈上限 6 句、同一个弯只提醒一次。
+        </p>
+        <p>
+          再加一条<strong>弯中禁言</strong>：横向加速度超过 0.8 G 时只念 4 字以内的短句，
+          没有短句就干脆不说 —— 那时玩家手上没空听句子。
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2><span class="n">03</span>教练和仪表盘，不是一回事</h2>
+    <p class="sub">
+      仪表盘告诉你<strong>现在</strong>；教练告诉你<strong>你的习惯</strong>。这是它俩最大的分工。
+    </p>
+
+    <div class="grid g2">
+      <div class="card">
+        <div class="ic"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1.5" y="2.5" width="13" height="9" rx="1.5"/><path d="M5 14.5h6"/></svg></div>
+        <h3>仪表盘：当前状态</h3>
+        <p>四轮胎温、油量续航、实时 delta、下一刹车点距离 —— 你<em>看一眼</em>就知道的信息。</p>
+      </div>
+      <div class="card">
+        <div class="ic"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M1.5 11l3.5-5.5 3 3L11 4l3.5 7"/><path d="M1.5 14h13"/></svg></div>
+        <h3>教练：跨圈累积</h3>
+        <p>同一个弯连续 3 圈中位亏 0.3 秒以上才开口，之后隔 3 圈再说一次。它记着你的模式。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2><span class="n">04</span>全本地能算到什么程度</h2>
+    <p class="sub">
+      「不上云」不是把功能砍掉，而是把能本地算的都算完。下面这些<strong>一个接口都不用调</strong>。
+    </p>
+
+    <div class="tw">
+      <table>
+        <thead><tr><th>能力</th><th>怎么算出来的</th></tr></thead>
+        <tbody>
+          <tr><td>分段用时 S1/S2/S3</td><td>从实时帧的几何弧长按绝对距离等分，边界插值</td></tr>
+          <tr><td>理论最快圈 / 潜在空间</td><td>本场各段最好值之和 vs 实际最快圈</td></tr>
+          <tr><td>每圈油耗 / 续航</td><td>圈首圈尾剩余量做差，取近 5 圈中位数</td></tr>
+          <tr><td>预测圈速</td><td>参考圈圈速 + 当前 delta</td></tr>
+          <tr><td>轮胎半径自标定</td><td>自由滚动帧累计，前后轴分开（实测前 0.3391 / 后 0.3435）</td></tr>
+          <tr><td>跨场次历史参考圈</td><td>场次列表的 best_lap + 几何形状比对确认同赛道</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="stats" style="margin-top:26px">
+      <div class="stat"><div class="v">10.0<small>/s</small></div><div class="l">实测 tick 速率</div></div>
+      <div class="stat"><div class="v">14</div><div class="l">条播报规则</div></div>
+      <div class="stat"><div class="v">0</div><div class="l">个第三方依赖</div></div>
+      <div class="stat"><div class="v">0.07<small>s</small></div><div class="l">分段算法与参考差</div></div>
+    </div>
+  </div>
+</section>
+
+<section id="honest">
+  <div class="wrap">
+    <h2><span class="n">05</span>数据边界（诚实清单）</h2>
+    <p class="sub">
+      GT7 遥测是<strong>单车流</strong>，有些东西就是拿不到。<strong>不许编</strong>是硬规矩。
+    </p>
+
+    <div class="honest">
+      <div class="hrow">
+        <div>只有你一台车的数据</div>
+        <div><span class="bad">✗</span> 不能说「Hamilton 在你后面 0.8 秒」，只能说名次</div>
+      </div>
+      <div class="hrow">
+        <div>胎压 / 胎耗（格式 A 恒为 0）</div>
+        <div><span class="bad">✗</span> 不能说「胎耗 12%」，只能说胎温</div>
+      </div>
+      <div class="hrow">
+        <div>协议没有转向角</div>
+        <div><span class="ok">✓</span> 已用曲率 κ = G_lat·g/v² 替代（半径 + 左右方向）</div>
+      </div>
+      <div class="hrow">
+        <div>没有赛道里程碑</div>
+        <div><span class="bad">✗</span> 不能说「100 米标刹车」，只能说「1.5 秒后重刹区」</div>
+      </div>
+    </div>
+
+    <p style="margin-top:20px;font-size:14px;color:var(--ink2);max-width:44em">
+      最后一条恰好是这个项目的性格：<strong>说不了精确的距离，就说你来得及反应的时间</strong>。
+      「1.5 秒后重刹区」比「100 米标刹车」在 250 km/h 和 80 km/h 下都成立。
+    </p>
+  </div>
+</section>
+
+<section id="start">
+  <div class="wrap">
+    <h2><span class="n">06</span>开始使用</h2>
+    <p class="sub">
+      需要 Python 3.10+。<strong>不需要 pip install 任何东西</strong> —— 整个包只用标准库。
+    </p>
+
+    <pre><span class="c"># 1. 自检：用内置的合成赛道跑一遍，不连任何东西</span>
+<span class="k">python</span> -m gt7coach demo
+<span class="c"># 打开 http://127.0.0.1:8788/ 按一下就能听</span>
+
+<span class="c"># 2. 接真车（配合 GT7 Dash 使用）</span>
+<span class="k">python</span> -m gt7coach serve --dash http://192.168.43.18:8787
+
+<span class="c"># 3. 排障：跑几次 tick，把状态打到 stdout</span>
+<span class="k">python</span> -m gt7coach once --dash http://192.168.43.18:8787
+
+<span class="c"># 4. 离线调参：改阈值不用上车</span>
+<span class="k">python</span> -m gt7coach replay 场次.jsonl --conf brake_late_m=12
+<span class="c"># 拿历史场次跑一遍，直接打出「会说的话」列表 + 逐圈统计</span></pre>
+
+    <p class="sub" style="margin-bottom:16px">或者用 Docker，一条命令：</p>
+    <pre><span class="k">git</span> clone https://github.com/DC1024/gt7-coach &amp;&amp; <span class="k">cd</span> gt7-coach
+<span class="k">docker</span> compose up -d
+<span class="k">curl</span> http://127.0.0.1:8788/api/v1/coach/health</pre>
+
+    <div class="grid g3" style="margin-top:30px">
+      <div class="card">
+        <div class="ic"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M8 1.5v9M4.5 7L8 10.5 11.5 7"/><path d="M2.5 13.5h11"/></svg></div>
+        <h3>要配合 GT7 Dash</h3>
+        <p>遥测接收 + 仪表盘由 <a href="https://github.com/DC1024/gt7-dash">gt7-dash</a> 负责。两个仓库只通过 HTTP 契约耦合，各跑各的进程，可以跨机器。</p>
+      </div>
+      <div class="card">
+        <div class="ic"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6.2"/><path d="M8 4.6v3.6l2.4 1.6"/></svg></div>
+        <h3>启动顺序无所谓</h3>
+        <p>教练连不上 Dash 时会退避重试（2s → 15s），Dash 起来后自动接上，不会崩。</p>
+      </div>
+      <div class="card">
+        <div class="ic"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2.5 12.5V5a1.5 1.5 0 011.5-1.5h4l1.5 2h3A1.5 1.5 0 0114 7v5.5a1 1 0 01-1 1H3.5a1 1 0 01-1-1z"/></svg></div>
+        <h3>完全离线可用</h3>
+        <p>云端只留给可选的「措辞润色」。不配任何 key，功能一个不少 —— 只是措辞走本地模板。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2><span class="n">07</span>路线图</h2>
+    <p class="sub">已完成的部分全部零云依赖。</p>
+    <div class="road">
+      <div class="ritem done"><span class="rid">R1</span><span class="rtxt">本地闭环：参考圈索引 + 实时定位 + 十条规则 + 闸门 + HTTP 接口</span><span class="rbadge"><span class="rdone">已完成</span></span></div>
+      <div class="ritem done"><span class="rid">R1.5</span><span class="rtxt">本地极限：分段 / 理论最快圈 / 油耗续航 / 预测圈速 + 离线调参</span><span class="rbadge"><span class="rdone">已完成</span></span></div>
+      <div class="ritem done"><span class="rid">R1.6</span><span class="rtxt">每弯累积失误：跨圈累积哪个弯反复亏，第 3 圈起主动提醒</span><span class="rbadge"><span class="rdone">已完成</span></span></div>
+      <div class="ritem done"><span class="rid">R2.1</span><span class="rtxt">措辞层分离 + 数字白名单 + 长度预算 / ttl 对齐</span><span class="rbadge"><span class="rdone">已完成</span></span></div>
+      <div class="ritem done"><span class="rid">R3.1</span><span class="rtxt">名次与情绪向播报：追回 / 掉位、后半区鼓励、领跑提醒</span><span class="rbadge"><span class="rdone">已完成</span></span></div>
+      <div class="ritem"><span class="rid">R2.2</span><span class="rtxt">云润色措辞，失败自动回落本地模板</span><span class="rbadge"><span class="rnext">下一步</span></span></div>
+      <div class="ritem"><span class="rid">R2.3</span><span class="rtxt">可靠性层：幂等缓存 / 预算闸 / 熔断退避 / 降级状态位</span><span class="rbadge"><span class="rnext">计划中</span></span></div>
+      <div class="ritem"><span class="rid">R3</span><span class="rtxt">云 TTS 音色（仅 B/C 档；A 档必须保持本地）</span><span class="rbadge"><span class="rnext">计划中</span></span></div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div class="fgrid">
+      <div class="fcol">
+        <h4>项目</h4>
+        <a href="https://github.com/DC1024/gt7-coach">gt7-coach 源码</a>
+        <a href="https://github.com/DC1024/gt7-coach/releases">发行版</a>
+        <a href="https://github.com/DC1024/gt7-coach/blob/main/README.md">完整文档</a>
+      </div>
+      <div class="fcol">
+        <h4>配套</h4>
+        <a href="https://github.com/DC1024/gt7-dash">gt7-dash 仪表盘</a>
+        <a href="https://github.com/DC1024/gt7-dash/releases">Dash 发行版</a>
+      </div>
+      <div class="fcol">
+        <h4>关于</h4>
+        <a href="https://github.com/DC1024">@DC1024</a>
+        <a href="https://github.com/DC1024/gt7-coach/blob/main/LICENSE">MIT 许可</a>
+      </div>
+    </div>
+    <div class="fnote">
+      GT7 赛道工程师 · 给 PS5《GT7》的实时副驾。本项目与 Sony Interactive Entertainment、
+      Polyphony Digital 无隶属关系。《Gran Turismo》及相关商标归其各自所有者。
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>
