@@ -56,7 +56,7 @@ GROUPS: list[dict[str, Any]] = [
         #    不是一回事，合并了就等于没得选。
         "id": "mood", "label": "名次与情绪",
         "desc": "名次变化 / 后半区鼓励 / 领跑提醒（R3.1）",
-        "prefixes": ("position", "encourage", "leader"),
+        "prefixes": ("position", "encourage", "leader", "race_finish"),
     },
 ]
 

@@ -1401,3 +1401,57 @@ class TestMood:
 
         for key in ("position", "encourage", "leader@take", "leader@hold"):
             assert panel.group_of_key(key) == "mood"
+
+
+class TestRaceFinish:
+    """R3.2：最后一圈冲线后报最终名次，且只报一次。"""
+
+    @staticmethod
+    def _ctx(st, *, position=3, num_cars=16, lap_no=5, laps_in_race=5,
+             warmup=False):
+        return Ctx(f=mk(lap=lap_no, position=position, num_cars=num_cars,
+                        laps_in_race=laps_in_race),
+                   st=st, warmup=warmup, lap=_lap_result(lap_no))
+
+    def test_announces_at_final_lap(self, rs, st):
+        u = rs._race_finish(self._ctx(st))
+        assert u is not None
+        assert u.key == "race_finish"
+        assert u.text == "此次比赛第 3 位（共 16 车）"
+
+    def test_silent_before_final_lap(self, rs, st):
+        # 还在最后一圈之前（第 4 圈刚完）→ 不报
+        assert rs._race_finish(self._ctx(st, lap_no=4)) is None
+
+    def test_one_shot(self, rs, st):
+        # 同一局只报一次：播报后 on_spoken 记下 laps_in_race，下一帧静默
+        u = rs._race_finish(self._ctx(st))
+        assert u is not None
+        rs.on_spoken([u], st)
+        assert rs._race_finish(self._ctx(st)) is None
+
+    def test_resets_on_new_race(self, rs, st):
+        # 报过一局后，新一局（已完成圈数 < 总圈数）应当复位、可再报
+        u = rs._race_finish(self._ctx(st))
+        assert u is not None
+        rs.on_spoken([u], st)
+        assert rs._race_finish(self._ctx(st, lap_no=4)) is None  # 新局未到终局
+        # 新局跑完最后一圈应再次触发（finish_done_laps 已清除）
+        st.pop("finish_done_laps", None)
+        u2 = rs._race_finish(self._ctx(st))
+        assert u2 is not None
+
+    def test_silent_without_position(self, rs, st):
+        # 名次 / 车数无效（菜单态、时间赛）→ 闭嘴
+        assert rs._race_finish(self._ctx(st, position=0, num_cars=0)) is None
+
+    def test_silent_warmup(self, rs, st):
+        assert rs._race_finish(self._ctx(st, warmup=True)) is None
+
+    def test_silent_no_laps_in_race(self, rs, st):
+        # 时间赛 / 未知总圈数（laps_in_race=0）→ 不报
+        assert rs._race_finish(self._ctx(st, laps_in_race=0)) is None
+
+    def test_key_in_mood_group(self, rs, st):
+        from gt7coach import panel
+        assert panel.group_of_key("race_finish") == "mood"

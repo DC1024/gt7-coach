@@ -851,6 +851,17 @@ def position_now(f: dict[str, Any]) -> str:
     return f"P{pos}，{'追回' if moved > 0 else '掉了'} {abs(moved)} 位"
 
 
+def race_finish(f: dict[str, Any]) -> str:
+    """冲线名次：「此次比赛第 3 位（共 16 车）」。
+
+    facts: {position, num_cars}。仅比赛终局播一次（见 rules._race_finish）。
+    本地模板，不走云润色 —— 名次是游戏给的硬事实，扩写容易编出处方。
+    """
+    pos = int(f.get("position") or 0)
+    cars = int(f.get("num_cars") or 0)
+    return f"此次比赛第 {pos} 位（共 {cars} 车）"
+
+
 def encourage(f: dict[str, Any]) -> str:
     """后半区鼓励：「还在 P13，别急，稳住自己的节奏」。
 

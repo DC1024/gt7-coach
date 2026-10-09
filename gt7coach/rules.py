@@ -30,6 +30,7 @@
 | `encourage`             | P3 | **R3.1**：后半区 → 每 N 圈随机鼓励一次 |
 | `leader@take`           | P3 | **R3.1**：刚拿到 P1 |
 | `leader@hold`           | P3 | **R3.1**：持续领跑时隔 N 圈提醒"保持住" |
+| `race_finish`           | P3 | **R3.2**：最后一圈冲线后报最终名次（此次比赛第X位）|
 
 > `lap_advice`（R2.4）：默认 `RuleConfig.lap_advice=True` 时，圈后**只发这一条**
 > 合并句（`lap_summary`/`sector_loss`/`fuel_range`/`next_focus` 的**判断**照跑、
@@ -268,7 +269,8 @@ class RuleSet:
         # 🔴 独立于上面的圈后合并句：情绪不该去挤成绩/习惯那些硬信息的
         #    位置（合并句有长度预算，加鼓励就会把主体挤掉），而且要能
         #    在面板上单独关掉（分组 `mood`）—— 有人就是不想被鼓励。
-        for fn in (self._position_now, self._encourage, self._leader):
+        for fn in (self._position_now, self._encourage, self._leader,
+                   self._race_finish):
             u = fn(c)
             if u is not None:
                 out.append(u)
@@ -303,6 +305,8 @@ class RuleSet:
             elif base == "leader":
                 st["leader_was"] = True
                 st["leader_hold_lap"] = int(ev.get("lap") or 0)
+            elif base == "race_finish":
+                st["finish_done_laps"] = int(ev.get("laps_in_race") or 0)
 
     # —— 1. 出界 ———————————————————————————————————————
 
@@ -990,3 +994,35 @@ class RuleSet:
         return Utterance(key=f"leader@{mode}", text=txt, priority=P_LOW,
                          ttl_s=phrases.ttl_for(txt, P_LOW, "leader"),
                          short="P1", evidence=ev)
+
+    # —— 20. 冲线名次（R3.2）————————————————————————————
+    #
+    # 固定圈数比赛跑完最后一圈、冲过终点的那一刻，报最终名次。
+    #
+    # 🔴 触发用「已完成的圈数 ≥ 本局总圈数」：`c.lap.lap` 是**刚跑完的那一圈**
+    #    的编号（第 5 圈完成 → c.lap.lap == 5），而 `f.lap` 在最后一圈全程
+    #    都 == laps_in_race（第五圈里它一直是 5）。若只看 `f.lap` 会从最后一圈
+    #    一开始就误报；看「完成了几圈」才精确卡在冲线那一下。
+    #
+    # 🔴 只报一次：用 `st["finish_done_laps"]` 记这一局已报过的 laps_in_race；
+    #    新一局（已完成圈数 < 总圈数）自动复位，下一局再报。
+    def _race_finish(self, c: Ctx) -> Utterance | None:
+        cfg = self.cfg
+        f = c.f
+        if c.warmup or f.laps_in_race <= 0:
+            return None
+        if c.lap is None or c.lap.lap < f.laps_in_race:
+            # 还没跑完最后一圈（含新一局刚开始）→ 清掉上一局标记，准备重报
+            c.st.pop("finish_done_laps", None)
+            return None
+        if not self._race_ok(c, cfg.position_min_cars):
+            return None
+        if c.st.get("finish_done_laps") == f.laps_in_race:
+            return None  # 这一局已经报过
+        ev: dict[str, Any] = {"position": int(f.position),
+                              "num_cars": int(f.num_cars),
+                              "laps_in_race": int(f.laps_in_race)}
+        txt = phrases.race_finish(ev)
+        return Utterance(key="race_finish", text=txt, priority=P_LOW,
+                         ttl_s=phrases.ttl_for(txt, P_LOW, "race_finish"),
+                         short=f"P{int(f.position)}", evidence=ev)
