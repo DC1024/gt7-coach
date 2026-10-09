@@ -10,6 +10,7 @@
   3. **不打扰优先于多说话**：冷却 + 每圈上限 + 弯中禁言 + 只报新信息。
 """
 
+from .version import version as _version
 from .contract import (COACH_API_VERSION, CoachState, Frame, P_CRITICAL,
                        P_HIGH, P_LOW, P_NORMAL, Utterance, has_coords)
 from .engine import CoachConfig, CoachEngine, RefProvider
@@ -20,7 +21,10 @@ from .refindex import RefLap
 from .rules import Ctx, RuleConfig, RuleSet, fmt_lap_time
 from .source import FileSource, HttpSource, ReplaySource, SourceError
 
-__version__ = "0.1.0"
+# PEP 440 里预发布的规范写法是 `1.0.0b1`（不是 `1.0.0-beta.1`）——
+# 后者是 git tag / Release 用的发行标识，两者指同一个版本。
+# 版本号唯一定义在 `version.py`，此处只是转出。
+__version__ = _version
 __all__ = [
     "COACH_API_VERSION", "CoachState", "Frame", "Utterance", "has_coords",
     "P_CRITICAL", "P_HIGH", "P_NORMAL", "P_LOW",

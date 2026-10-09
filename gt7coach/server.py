@@ -50,6 +50,7 @@ from urllib.parse import parse_qs, urlparse
 
 from .contract import CoachState
 from .engine import CoachConfig, CoachEngine
+from .version import version
 
 DEFAULT_PORT = 8788  # 紧挨着仪表盘的 8787，别抢
 
@@ -303,7 +304,10 @@ class CoachService:
 
 
 class _Handler(BaseHTTPRequestHandler):
-    server_version = "gt7-coach/0.1"
+    # 从版本模块取，避免发行时漏改这一处（曾经硬编码成 0.1 而漂移）。
+    # 用 `version` 子模块而不是 `from . import __version__`：后者会在
+    # 包 `__init__` 执行到一半时回环导入本模块，属于隐性循环。
+    server_version = "gt7-coach/" + version
     protocol_version = "HTTP/1.1"
 
     # 日志交给调用方（默认太吵，10Hz 轮询会刷屏）
