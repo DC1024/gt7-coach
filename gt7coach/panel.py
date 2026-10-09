@@ -50,6 +50,14 @@ GROUPS: list[dict[str, Any]] = [
         "prefixes": ("lap_advice", "lap_summary", "sector_loss",
                      "fuel_range", "next_focus", "corner_habit"),
     },
+    {
+        # 🔴 单独一组而不是并进 `debrief`：有人**只想关掉鼓励**，不想连
+        #    "这圈 1:32.412、T3 连续 3 圈慢 0.42" 一起关掉。情绪类和事实类
+        #    不是一回事，合并了就等于没得选。
+        "id": "mood", "label": "名次与情绪",
+        "desc": "名次变化 / 后半区鼓励 / 领跑提醒（R3.1）",
+        "prefixes": ("position", "encourage", "leader"),
+    },
 ]
 
 

@@ -74,6 +74,14 @@ TTL_CAP_S: dict[str, float] = {
     "delta": 2.0,           # 秒级刷新，过期极快
     "apex_slow": 2.0,       # 弯心后 60 m 内有效
     "throttle_late": 2.0,   # 同上
+    # —— 名次 / 情绪向（R3.1）——
+    # 🔴 这三条**不在 `RENDERERS` 里**，所以永不走云润色 —— 它们只是本地
+    #    模板，但预算仍要登记，因为 `ttl_for` 是按 key 查这张表的。
+    #    不登记的话会掉进 `MAX_CHARS_DEFAULT`（P_LOW → 8 字），而鼓励句
+    #    光"还在 P13，"就 7 个字了 —— 直接被判超预算。
+    "position": 3.0,        # 名次变化：说一次就够
+    "encourage": 5.0,       # 鼓励：一整句要说完，且值当听完
+    "leader": 6.0,          # P1 提醒：最长的一句（含"保持当前状态"）
 }
 # 预算 = 容量 × 语速 × 0.9（留 10% 余量：是"说完"，不是"说到最后一个字就过期"）
 BUDGET_HEADROOM = 0.9
@@ -593,6 +601,9 @@ def ttl_for(text: str, priority: int, key: str = "", *,
 #   projected_lap  {projected_s}
 #   fuel_range     {unit, laps_left}
 #   next_focus     {label, laps, median_loss_s}
+#   position       {position, moved, num_cars?, lap?}      ← 本地专属
+#   encourage      {position, num_cars, lap}               ← 本地专属
+#   leader         {mode}                                  ← 本地专属
 #
 # 注意：这些 key（facts 的字段名）与 `Utterance.evidence` 里的一致 ——
 # 规则把 evidence 原样传进来，**不另造一套中间结构**（少一层就少一处会分叉）。
@@ -649,18 +660,33 @@ def projected_lap(f: dict[str, Any]) -> str:
 
 
 def fuel_range(f: dict[str, Any]) -> str:
-    """续航：「油还够 2.4 圈」/「油只够 0.8 圈，这圈进站」。
+    """续航：「油还够 2.4 圈」/「油只够 0.8 圈，这圈进站」/「油够到终点，余 0.4 圈」。
 
     `unit` 由规则判定（电车说"电量"、油车说"油"）—— 说错一次就没人信了。
     🔴 只有**真的不够**（≤ `FUEL_CRIT_LAPS`）才给行动建议：不然每圈都在喊
        "进站"，那是狼来了。`invented_advice` 把这个阈值也用在云句上 ——
        模板不敢说的话，云也不许说。
+
+    `laps_to_go`（到终点还剩几圈，含当前圈）**有值**时优先说够不够——
+    车手要的是这一个判断，不是"还能跑几圈"。总圈数未知（时间赛/练习赛）或
+    离谱（`Frame.laps_to_go` 判不出来）时退回"还够 N 圈"。
+
+    🔴 注意"差 N 圈"**不带行动指令**：还没到 `FUEL_CRIT_LAPS` 就让人进站
+       是狼来了，而"该怎么开"是车手自己能判断的事 —— 本地只给事实。
     """
     unit = f.get("unit") or "油"
     left = float(f.get("laps_left") or 0.0)
     if left <= FUEL_CRIT_LAPS:
         return f"{unit}只够 {left:.1f} 圈，这圈进站"
-    return f"{unit}还够 {left:.1f} 圈"
+    to_go = f.get("laps_to_go")
+    if to_go is None:
+        return f"{unit}还够 {left:.1f} 圈"
+    # 🔴 说"够到终点"时那个余量是**派生值**，必须同时塞进 facts
+    #    （由 `_fuel_range` 放进 `margin_laps`）—— 否则数字白名单会把它
+    #    当成"编的数字"：它确实是这句话里唯一的数。
+    need = float(to_go) - left
+    return (f"{unit}够到终点，余 {abs(need):.1f} 圈" if need <= 0.0
+            else f"{unit}差 {need:.1f} 圈")
 
 
 def next_focus(f: dict[str, Any]) -> str:
@@ -737,7 +763,17 @@ def lap_advice(f: dict[str, Any]) -> str:
         slots.append(f"S{sec} 慢 {float(loss):.2f}")
 
     if left is not None and not fuel_crit and float(left) <= FUEL_LOW_LAPS:
-        slots.append(f"{unit}够 {float(left):.1f} 圈")
+        to_go = f.get("laps_to_go")
+        if to_go is not None:
+            # 有总圈数 → 直接回答"够不够跑完这一局"。这才是车手据以决策的数，
+            # 「够跑 2.4 圈」只是半个答案。
+            need = float(to_go) - float(left)
+            slots.append(f"{unit}够到终点，余 {abs(need):.1f} 圈"
+                         if need <= 0.0
+                         else f"{unit}差 {need:.1f} 圈")
+        else:
+            # 总圈数未知（时间赛 / 练习赛）→ 退回"够跑 N 圈"，不猜。
+            slots.append(f"{unit}够 {float(left):.1f} 圈")
 
     out: list[str] = []
     for p in slots:
@@ -747,10 +783,111 @@ def lap_advice(f: dict[str, Any]) -> str:
     return "，".join(out)
 
 
+# ===========================================================================
+# 名次 / 情绪向（R3.1）—— **本地专属**，不进 RENDERERS
+# ===========================================================================
+#
+# 🔴 为什么这三条**不走云润色**（因此不在 `RENDERERS` 里，也就不会被
+#    `Narrator._cloudable` 认领）：
+#
+#    ① **云会把鼓励扩写成处方**。第四道闸之前的实测：模型拿到"别急"这类
+#       情绪词会自行补一句「注意补油」—— 而 facts 里只有 `position=13`，
+#       没有任何燃油字段。`invented_advice` 能拦住，但拦住的代价是**回落
+#       本地模板**，等于花了一次钱 + 一次 0.5~2 s 延迟，拿回本来就该直出的
+#       那句话。这类话在本地就够口语了，润色没有增量。
+#    ② **频率**。名次每圈都可能变、鼓励每 N 圈一次，都属于"高频低价值"，
+#       不该和 `lap_advice`（每圈一次、真正需要压缩的那句）抢每圈云预算。
+#
+#    ⚠️ 代价：这三条不受 RICH_CASES 那三条硬门（数字白名单 / 长度 /
+#       纯函数）的**自动覆盖** —— 它们是靠 `tests/test_rules.py::TestMood`
+#       手动断言的。新增情绪向文案时记得同步加用例。
+
+# 鼓励词库。🔴 每条 **≤ 8 字**（前缀「还在 P13，」是 7 字，加起来 15 ≤ 20）。
+#
+# 🔴 库里**绝对不能出现「加油」** —— 它在中文里既是"come on"也是"refuel"，
+#    而 `_ADVICE_RULES` 把「加油」登记成了**燃油处方词**（需要 `laps_left
+#    ≤ FUEL_CRIT_LAPS` 授权）。一句"加油！"会被判成"编了个进站指令"，
+#    整句丢掉。想加这个词，得先去改 `_ADVICE_RULES` 的歧义处理。
+ENCOURAGE_POOL: tuple[str, ...] = (
+    "别急，稳住自己的节奏",
+    "前车会犯错，等它",
+    "后面还有大把机会",
+    "这一圈先跑干净",
+    "差距在缩小，顶住",
+    "专注自己的刹车点",
+    "别放弃，稳扎稳打",
+)
+
+
+def _pick(pool: tuple[str, ...], *seed: Any) -> str:
+    """从 `pool` 里按 `*seed` **确定性地**挑一条 —— 同一个种子永远同一条。
+
+    🔴 为什么不能用 `random.choice` / 内置 `hash()`：
+
+     - `random` 模块是**有状态**的：全局那个 Mersenne Twister 引擎会被
+       进程里任何一处调用推着往前走。教练是**确定性系统**（`FileSource`
+       回放是核心调试手段 —— 同一份 jsonl 必须产出同一串播报），一旦
+       挑词依赖全局状态，回放就不可复现、测试也无从断言。
+     - 内置 `hash()` 对 `str` **每个进程都不同**（启动时 PYTHONHASHSEED
+       随机化），同一场比赛重启一次进程就换一套鼓励词，同样是破坏可复现。
+
+    所以这里用 `hashlib` 做一个**无状态**摘要：输入决定输出的纯函数，
+    跨进程、跨平台、跨 Python 版本都稳定。
+    """
+    import hashlib
+
+    blob = "|".join(repr(s) for s in seed).encode("utf-8")
+    idx = int.from_bytes(hashlib.sha256(blob).digest()[:4], "big") % len(pool)
+    return pool[idx]
+
+
+def position_now(f: dict[str, Any]) -> str:
+    """名次变化：「P7，追回 1 位」/「P13，掉了 2 位」。
+
+    facts: {position, moved, num_cars?, lap?}，`moved` >0 = 前进了几位。
+    """
+    pos = int(f.get("position") or 0)
+    moved = int(f.get("moved") or 0)
+    return f"P{pos}，{'追回' if moved > 0 else '掉了'} {abs(moved)} 位"
+
+
+def encourage(f: dict[str, Any]) -> str:
+    """后半区鼓励：「还在 P13，别急，稳住自己的节奏」。
+
+    facts: {position, num_cars, lap}。挑哪一条由 `(lap, position, num_cars)`
+    决定 —— 见 `_pick` 里"为什么必须确定性"。
+
+    🔴 带上名次不是为了凑字数：干巴巴一句"别急"没有任何信息，
+       而"还在 P13"把**你在哪、还有多少空间**说清楚了 ——
+       这才是副驾该给的，不是心灵鸡汤。
+    """
+    pos = int(f.get("position") or 0)
+    tail = _pick(ENCOURAGE_POOL, f.get("lap", 0), pos,
+                 f.get("num_cars", 0))
+    return f"还在 P{pos}，{tail}"
+
+
+def leader(f: dict[str, Any]) -> str:
+    """P1 提醒：刚拿到时「已经是 P1，做得很好，稳扎稳打」，之后「保持当前状态，稳扎稳打」。
+
+    facts: {mode} = "take"（刚拿到）| "hold"（持续保持）。
+
+    🔴 为什么拆成两句而不是每次都念同一句：第一句只在**名次从非 1 变成 1**
+       那一圈说一次，第二句每隔 N 圈才提醒一次。同一句反复念 = 唠叨，
+       而唠叨会让人开始忽略教练（比不说还糟，见 `gate.py` 模块头）。
+    """
+    if f.get("mode") == "take":
+        return "已经是 P1，做得很好，稳扎稳打"
+    return "保持当前状态，稳扎稳打"
+
+
 # 🔴 有措辞层的 key（= R2.2 里"值得花一次云调用"的候选集）。
 #    不在表里的 key 保持原样：A 档短句、以及本身已经够口语的几句
 #    （"出界了，回到赛道" / "四轮打滑" / "换挡" / "给油晚了" …）。
 #    这张表是 R2.2 的唯一入口 —— 云润色只走这里列出的 key。
+#
+#    ⚠️ `position` / `encourage` / `leader` 故意**不在**这里（理由见紧邻上方的
+#    "名次 / 情绪向"段落）。它们的本地模板由 `rules.py` 直接调用。
 RENDERERS = {
     "lap_advice": lap_advice,
     "lap_summary": lap_summary,

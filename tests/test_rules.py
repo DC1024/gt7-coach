@@ -56,7 +56,7 @@ def mk(**over) -> Frame:
 
 
 def feed(rs, st, *, ticks=1, dt=0.1, s=None, lateral=None, ref=None,
-         warmup=False, **frame_over):
+         warmup=False, ref_pace_ok=True, **frame_over):
     """连续跑 N 个 tick，返回所有产生的 utterance。
 
     `warmup=True` 模拟"本场还没跑完一圈"（引擎侧会同时把 ref 收回去）。
@@ -64,11 +64,14 @@ def feed(rs, st, *, ticks=1, dt=0.1, s=None, lateral=None, ref=None,
     `if c.ref is None or c.s is None: return None`，暖胎期"只说不依赖参考圈的
     信息"这件事才不用每条规则各判一次；而 `f.last_lap_ms` 那条（上一圈成绩）
     是唯一一个不吃 `ref` 却会串到上一轮的，所以它必须自己认这个标志。
+
+    `ref_pace_ok=False` 模拟"手上这份参考圈来自性能差一截的另一辆车"
+    （跨车型采用历史圈）—— 速度类规则该闭嘴，几何类规则照常。
     """
     out = []
     for _ in range(ticks):
         c = Ctx(f=mk(**frame_over), ref=ref, s=s, lateral_m=lateral, dt=dt,
-                st=st, warmup=warmup)
+                st=st, warmup=warmup, ref_pace_ok=ref_pace_ok)
         out += rs.evaluate(c)
     return out
 
@@ -611,6 +614,77 @@ class TestFuelRange:
         assert rs._fuel_range(Ctx(f=mk(), fuel={"laps_left": None})) is None
 
 
+class TestFuelRangeLapsToGo:
+    """加油建议接上「还剩几圈到终点」。
+
+    🔴 这是本轮的**新增地基**：`Frame.laps_to_go` 让续航播报从
+       「油够跑 2.4 圈」升级成「够不够跑完这一局」。
+
+    ⚠️ 两个必须钉住的边界：
+       ① 余量是**派生值**，必须进 evidence，否则数字白名单会误杀这一句；
+       ② 总圈数未知时**不猜**，退回旧说法。
+    """
+
+    @staticmethod
+    def _fuel(left, per=8.0, level=24.0):
+        return {"per_lap": per, "level": level, "laps_left": left,
+                "samples": 3}
+
+    def test_enough_reports_margin_and_stays_factual(self, rs, st):
+        # 10 圈赛在第 9 圈上 → 还剩 2 圈；油够 2.4 圈 ⇒ 够，余 0.4 圈
+        f = mk(lap=9, laps_in_race=10)
+        u = rs._fuel_range(Ctx(f=f, fuel=self._fuel(2.4)))
+        assert u is not None
+        assert "够到终点" in u.text
+        assert "余 0.4 圈" in u.text
+        assert "进站" not in u.text
+
+    def test_short_reports_gap_without_advice(self, rs, st):
+        """不够跑完 → 只报差多少，**不**指挥进站（还没到 FUEL_CRIT_LAPS）。"""
+        f = mk(lap=9, laps_in_race=10)            # 还剩 2 圈
+        u = rs._fuel_range(Ctx(f=f, fuel=self._fuel(1.5)))
+        assert u is not None
+        assert "差 0.5 圈" in u.text
+        assert "进站" not in u.text
+
+    def test_margin_is_in_evidence(self, rs, st):
+        """派生余量必须在 evidence 里 —— 数字白名单靠它放行。"""
+        f = mk(lap=9, laps_in_race=10)
+        u = rs._fuel_range(Ctx(f=f, fuel=self._fuel(1.5)))
+        assert u.evidence["laps_to_go"] == 2
+        assert u.evidence["margin_laps"] == pytest.approx(-0.5)
+
+    def test_unknown_total_laps_falls_back(self, rs, st):
+        """时间赛 / 练习赛：没总圈数 → 退回"还够 N 圈"，
+
+        而且 evidence 里**不写** laps_to_go —— 没有的东西就不该出现在
+        facts 里，否则云会以为自己有依据。
+        """
+        f = mk(lap=3, laps_in_race=0)
+        u = rs._fuel_range(Ctx(f=f, fuel=self._fuel(2.4)))
+        assert u is not None
+        assert u.text == "油还够 2.4 圈"
+        assert "laps_to_go" not in u.evidence
+
+    def test_no_sentence_number_outside_facts(self, rs, st):
+        """端到端：句子里的每个数字都能在 evidence 里找到。"""
+        f = mk(lap=9, laps_in_race=10)
+        u = rs._fuel_range(Ctx(f=f, fuel=self._fuel(1.5)))
+        assert phrases.invented_numbers(u.text, u.evidence) == []
+
+    def test_no_advice_word_slips_in(self, rs, st):
+        """措辞里不能冒出 `invented_advice` 管的指令词。
+
+        🔴 这条守的是「**说法升级 ≠ 变成指挥**」：加了"够到终点"之后，
+           很容易顺手写成"够了，不用进站"或"不够，赶紧进站省油"——
+           两个都越界了。
+        """
+        for left in (2.4, 1.5):
+            f = mk(lap=9, laps_in_race=10)
+            u = rs._fuel_range(Ctx(f=f, fuel=self._fuel(left)))
+            assert phrases.invented_advice(u.text, u.evidence) == []
+
+
 class TestNextFocus:
     """R1.6 + R2.4：哪个弯**反复**亏 —— 教练和仪表盘最本质的区别。
 
@@ -903,3 +977,427 @@ class TestEverySpokenNumberIsInEvidence:
             for u in by_prefix(feed(rs, st, **kw), "brake_warn@"):
                 assert phrases.invented_numbers(u.text, u.evidence) == [], \
                     (u.text, u.evidence)
+
+
+# —— 参考圈「分层」：几何面 vs 速度面 ——————————————————————
+#
+# 背景（方案的头号结论）：跨车型复用历史参考圈时，参考圈里只有**位置**
+# 是能跨车用的，**速度**不能。所以规则层要按"用哪一面"分开处理 ——
+# 速度面不可比时七条规则静默，几何面永远可用。
+
+#: 速度面：跨车型时必须闭嘴的规则 key 前缀
+SPEED_FACE_KEYS = ("brake_warn@", "brake_late@", "apex_slow@",
+                   "delta", "projected_lap")
+#: 几何面：跨车型时**照常工作**的规则 key 前缀
+GEOMETRY_FACE_KEYS = ("off_track", "throttle_late@")
+
+
+class TestReferenceLayering:
+    """🔴 跨车型（速度差一截）时：速度类规则静默，几何类规则照常。"""
+
+    def test_speed_face_rules_go_silent(self, rs, st, ref):
+        # 已过刹车入点 30 m、没踩刹车、速度还是入点速度 → 正常会报"刹车晚了"
+        kw = dict(ref=ref, s=ZONE_S + 30.0, ticks=6, brake=0.0,
+                  speed_kph=ref.v_at_s(ZONE_S) or 200.0)
+        assert by_prefix(feed(rs, st, **kw), "brake_late@"), \
+            "同一条件在速度面可用时**必须**还会报（否则这条测试没在测东西）"
+        st2 = RuleSet.fresh_state()
+        us = feed(rs, st2, ref_pace_ok=False, **kw)
+        for pre in SPEED_FACE_KEYS:
+            assert by_prefix(us, pre) == [], (pre, keys(us))
+
+    def test_geometry_face_rules_keep_working(self, rs, st, ref):
+        """出界（横向偏差）与给油晚了（位置判据）都不吃速度面。
+
+        🔴 这是"分层"的全部价值：换了车，教练仍然能告诉你"出界了"和
+           "这个弯你没给油"，只是不再拿别人的速度来量你。
+        """
+        us = feed(rs, st, ref=ref, s=APEX_S + 80.0, ticks=8, throttle=0.1,
+                  speed_kph=110.0, lateral=60.0, ref_pace_ok=False)
+        got = "".join(keys(us))
+        for pre in GEOMETRY_FACE_KEYS:
+            assert pre in got, (pre, keys(us))
+
+    def test_same_car_is_never_silenced(self, rs, st, ref):
+        """默认 `ref_pace_ok=True` ⇒ 与加这个标志之前**完全一致**。"""
+        v = ref.v_at_s(APEX_S) or 90.0
+        assert by_prefix(feed(rs, st, ref=ref, s=APEX_S + 5.0, ticks=3,
+                              speed_kph=v - 12.0), "apex_slow@")
+
+    def test_lap_summary_keeps_the_time_drops_the_comparison(self, rs, st, ref):
+        """圈速是游戏给的实测值（与参考圈无关），"比参考圈快/慢"才是跨车比较。"""
+        c = Ctx(f=mk(last_lap_ms=71234.0), ref=ref, s=APEX_S, st=st)
+        assert "vs_ref_s" in (rs._lap_summary(c).evidence or {})
+        c2 = Ctx(f=mk(last_lap_ms=71234.0), ref=ref, s=APEX_S, st=st,
+                 ref_pace_ok=False)
+        ev = rs._lap_summary(c2).evidence
+        assert ev.get("lap_time_s") == pytest.approx(71.234, abs=0.001)
+        assert "vs_ref_s" not in ev
+
+    def test_every_speed_face_rule_is_covered(self):
+        """守：新增依赖速度面的规则时，必须同步登记到 SPEED_FACE_KEYS。
+
+        🔴 这是这个表存在的唯一理由 —— 否则有人加了一条"比参考圈慢多少"
+           的新规则却没加闸，跨车时它就会照着别人的速度说话，
+           而这个文件的其它测试**一条都不会红**。
+        """
+        assert len(SPEED_FACE_KEYS) >= 5
+
+
+class TestCarVerdict:
+    """同车判据：优先比数字车型码（`contract.car_verdict`）。
+
+    🔴 为什么值得单独测：车型名要过 `cars.csv` 查表，表没命中时**两边都拿到
+       空串** → 判不出差别 → 于是静默跨车采用，连条日志都没有。数字码没有
+       这道中间环节，所以判据必须优先用它。
+    """
+
+    def test_same_code_is_same_car(self):
+        from gt7coach.contract import car_verdict
+        assert car_verdict(805, "", 805, "") == "same_car"
+
+    def test_different_code_is_cross_car(self):
+        from gt7coach.contract import car_verdict
+        assert car_verdict(805, "A", 902, "B") == "cross_car"
+
+    def test_falls_back_to_name_when_code_missing(self):
+        """老版 Dash 不给 car_code → 退回比车型名（比"完全不判"强）。"""
+        from gt7coach.contract import car_verdict
+        assert car_verdict(0, "GT-R", 0, "GT-R") == "same_car"
+        assert car_verdict(0, "GT-R", 0, "Civic") == "cross_car"
+
+    def test_unknown_is_a_third_state(self):
+        """🔴 判不出就是判不出，**不能**当成同车 —— 由性能窗口兜底。"""
+        from gt7coach.contract import car_verdict
+        assert car_verdict(0, "", 0, "") == "unknown"
+        assert car_verdict(805, "", 0, "") == "unknown"
+
+    def test_sentinel_code_is_treated_as_unknown(self):
+        """65535 是 u16 哨兵，不是车型码。"""
+        from gt7coach.contract import car_verdict
+        assert car_verdict(65535, "", 65535, "") == "unknown"
+
+
+class TestRefPaceOk:
+    """速度面可比性判据（`RefLap.pace_ok`）。"""
+
+    @staticmethod
+    def _lap(t: float, code: int = 0, name: str = "") -> RefLap:
+        r = RefLap.from_profile(synth_profile(radius_m=R, step_m=5.0))
+        r.lap_time_s = t
+        r.car_code = code
+        r.car_name = name
+        return r
+
+    def test_same_car_always_ok(self):
+        """同车**不设**圈速上限：今天跑得烂也该拿历史最好当标杆。
+
+        这才是 history_best 的意义 —— 反过来（把同车的历史圈也禁掉）
+        会毁掉这个功能本身。
+        """
+        base = self._lap(70.0, 805, "GT-R")
+        ref = self._lap(55.0, 805, "GT-R")      # 快 21%
+        assert ref.pace_ok(base) is True
+
+    def test_cross_car_within_window_is_ok(self):
+        """不同车但性能接近（同类 BoP）→ 速度面仍可用。"""
+        base = self._lap(70.0, 805, "GT-R")
+        ref = self._lap(67.0, 902, "Civic")     # 快 4.3%
+        assert ref.car_match(base) == "cross_car"
+        assert ref.pace_ok(base) is True
+
+    def test_cross_car_beyond_window_is_rejected(self):
+        """🔴 快 30% 就是两辆车不是一个量级 —— delta 会退化成恒定 +20 秒。"""
+        base = self._lap(70.0, 805, "GT-R")
+        ref = self._lap(50.0, 902, "Civic")
+        assert ref.pace_ok(base) is False
+
+    def test_unknown_car_falls_to_pace_window(self):
+        """判不出车型（cars.csv 没命中）时靠圈速兜底，而不是无脑采用。"""
+        base = self._lap(70.0)
+        assert self._lap(68.0).pace_ok(base) is True
+        assert self._lap(50.0).pace_ok(base) is False
+
+    def test_missing_lap_time_is_rejected(self):
+        """圈速算不出来 → 不给用（不知道就是不知道）。"""
+        base = self._lap(0.0, 805, "GT-R")
+        ref = self._lap(60.0, 902, "Civic")
+        assert ref.pace_ok(base) is False
+
+    def test_tolerance_is_configurable(self):
+        base = self._lap(70.0, 805, "GT-R")
+        ref = self._lap(60.0, 902, "Civic")     # 快 14.3%
+        assert ref.pace_ok(base, tol=0.10) is False
+        assert ref.pace_ok(base, tol=0.20) is True
+
+
+class TestFasterSessionsCarCode:
+    """候选筛选改用数字车型码 —— 与 `car_verdict` 同一把尺。"""
+
+    @staticmethod
+    def _src(rows):
+        from gt7coach.source import HttpSource
+        s = HttpSource("http://127.0.0.1:1", timeout=0.01)
+        s.sessions = lambda: rows
+        return s
+
+    def test_filters_by_code_even_when_name_is_empty(self):
+        """🔴 这正是旧实现的洞：车型名都是空串 → 过滤被跳过 → 静默跨车采用。"""
+        rows = [
+            {"file": "s1.jsonl", "best_lap_s": 60.0, "car_code": 805},
+            {"file": "s2.jsonl", "best_lap_s": 61.0, "car_code": 902},  # 别的车
+        ]
+        out = self._src(rows).faster_sessions(
+            70.0, exclude="me.jsonl", car_code=805, car_name="")
+        assert [x["file"] for x in out] == ["s1.jsonl"]
+
+    def test_code_wins_over_matching_name(self):
+        """车型名撞了、码不同 → 以**码**为准（名字可能来自不可靠的查表）。"""
+        rows = [{"file": "s.jsonl", "best_lap_s": 60.0,
+                 "car_code": 902, "car_name": "GT-R"}]
+        assert self._src(rows).faster_sessions(
+            70.0, car_code=805, car_name="GT-R") == []
+
+    def test_same_car_off_still_returns_cross_car(self):
+        """`same_car=False` 是显式开关：允许跨车（性能窗口仍会兜底）。"""
+        rows = [{"file": "s.jsonl", "best_lap_s": 60.0, "car_code": 902}]
+        assert self._src(rows).faster_sessions(
+            70.0, car_code=805, same_car=False)
+
+
+# ===========================================================================
+# 名次与情绪向（R3.1）
+# ===========================================================================
+
+class TestMood:
+    """R3.1 名次 / 情绪向播报。
+
+    🔴 这一组守的核心是**克制**，不是"能报"。名次每圈都可能变、鼓励更是纯
+       情绪，所以每条规则都配了"什么时候不说"的断言；少一条就会在真车上变成
+       唠叨，而唠叨会让人开始忽略教练 —— 比不说还糟（见 `gate.py` 模块头）。
+    """
+
+    @staticmethod
+    def _ctx(st, *, position=13, num_cars=20, lap_no=5, warmup=False,
+             with_lap=True):
+        """一个默认的「20 车赛、P13、刚跑完第 5 圈」上下文。"""
+        return Ctx(f=mk(lap=lap_no, position=position, num_cars=num_cars),
+                   st=st, warmup=warmup,
+                   lap=_lap_result(lap_no) if with_lap else None)
+
+    # —— 16. 名次变化 ——————————————————————————————
+
+    def test_position_gain_reports(self, rs, st):
+        rs._position_now(self._ctx(st, position=12))     # 第一帧只记不报
+        u = rs._position_now(self._ctx(st, position=10))
+        assert u is not None
+        assert u.text == "P10，追回 2 位"
+        assert u.priority == 3
+        assert u.short == "P10"
+
+    def test_position_loss_reports(self, rs, st):
+        rs._position_now(self._ctx(st, position=10))
+        u = rs._position_now(self._ctx(st, position=13))
+        assert u is not None and u.text == "P13，掉了 3 位"
+
+    def test_first_sight_is_silent(self, rs, st):
+        """刚看到名次时不报 —— 光秃秃一个「P13」没有比较对象，等于没信息。"""
+        assert rs._position_now(self._ctx(st, position=13)) is None
+
+    def test_unchanged_position_is_silent(self, rs, st):
+        rs._position_now(self._ctx(st, position=13))
+        assert rs._position_now(self._ctx(st, position=13)) is None
+
+    def test_unknown_position_is_silent(self, rs, st):
+        """菜单态 / 时间赛：名次与车数都是 0 → 闭嘴。"""
+        assert rs._position_now(self._ctx(st, position=0)) is None
+        assert rs._position_now(self._ctx(st, num_cars=0)) is None
+
+    def test_too_few_cars_is_silent(self, rs, st):
+        """两人对跑时「你追回 1 位」毫无意义。"""
+        rs._position_now(self._ctx(st, position=2, num_cars=2))
+        assert rs._position_now(self._ctx(st, position=1, num_cars=2)) is None
+
+    def test_garbage_values_are_silent(self, rs, st):
+        """车数刷成垃圾值（31847）→ 不许念出「还在 P1203」。
+
+        🔴 这类"数字合法、语义荒唐"的错，白名单拦不住（数字都在 facts 里），
+           只能靠上界闸 —— 与 `MAX_PLAUSIBLE_LAPS` 同一类。
+        """
+        assert rs._position_now(
+            self._ctx(st, position=1203, num_cars=31847)) is None
+
+    def test_contradiction_is_silent(self, rs, st):
+        """名次不可能超过参赛车数 —— 自相矛盾的数据不照念。"""
+        rs._position_now(self._ctx(st, position=9))
+        assert rs._position_now(self._ctx(st, position=25)) is None
+
+    def test_warmup_is_silent(self, rs, st):
+        """发车那一团里名次每秒都在跳 —— 这时候报"追回 2 位"，播的是噪声。"""
+        assert rs._position_now(self._ctx(st, warmup=True)) is None
+
+    def test_derived_moved_is_in_evidence(self, rs, st):
+        """🔴 `moved` 是派生值：不写进 evidence 就会被数字白名单判成"编的"。
+
+        与 `brake_warn` 的 `over_kph` 是同一个坑（真机抓出来的）。
+        """
+        rs._position_now(self._ctx(st, position=12))
+        u = rs._position_now(self._ctx(st, position=10))
+        assert u is not None
+        assert u.evidence["moved"] == 2
+        assert phrases.invented_numbers(u.text, u.evidence) == []
+
+    # —— 17. 后半区鼓励 ————————————————————————————
+
+    def test_encourages_in_back_half(self, rs, st):
+        u = rs._encourage(self._ctx(st, position=13, num_cars=20))
+        assert u is not None
+        assert u.text.startswith("还在 P13，")
+        assert u.priority == 3
+        assert u.short == "稳住"
+
+    def test_silent_in_front_half(self, rs, st):
+        """上半区不需要鼓励 —— 在那里说"别急"听着像讽刺。"""
+        assert rs._encourage(self._ctx(st, position=8)) is None
+
+    def test_even_grid_boundary(self, rs):
+        """20 车第 10 名属上半区（2*10=20，不 > 20）；第 11 名才是后半区。
+
+        🔴 判据写成 `2*pos > num_cars` 而不是 `pos > num_cars/2`，正是为了
+           不引入"整除往哪取整"的争议。这个边界单独一条守着。
+        """
+        assert rs._encourage(self._ctx(RuleSet.fresh_state(),
+                                       position=10)) is None
+        assert rs._encourage(
+            self._ctx(RuleSet.fresh_state(), position=11)) is not None
+
+    def test_silent_with_too_few_cars(self, rs):
+        """4 车赛的第 3 名不算"后半区"。"""
+        assert rs._encourage(self._ctx(RuleSet.fresh_state(),
+                                       position=3, num_cars=4)) is None
+
+    def test_gap_between_encouragements(self, rs, st):
+        """隔 3 圈才再鼓励一次 —— 天天被鼓励的人会开始怀疑自己是不是很差。
+
+        🔴 每次"播出"都要显式调 `on_spoken` —— 规则只**产出候选**，
+           记账推迟到闸门确认放行之后（见 `RuleSet.on_spoken`）。
+        """
+        u = rs._encourage(self._ctx(st, lap_no=5))
+        assert u is not None
+        rs.on_spoken([u], st)
+        assert rs._encourage(self._ctx(st, lap_no=6)) is None
+        assert rs._encourage(self._ctx(st, lap_no=7)) is None
+        u = rs._encourage(self._ctx(st, lap_no=8))
+        assert u is not None
+        rs.on_spoken([u], st)
+
+    def test_unsaid_candidate_stays_pending(self, rs, st):
+        """🔴 没播出的候选必须**留着**，不能推进记账。
+
+        这是名次播报在真实比赛里颗粒无收的根因：以前规则一发现变化就当场
+        更新状态位，于是候选只活一个 tick，被闸门 `break` 跳过就永久消失。
+        现在的契约是：只要不调 `on_spoken`，同一条候选下一圈还会再来。
+        """
+        u = rs._encourage(self._ctx(st, lap_no=5))
+        assert u is not None
+        # 故意不调 on_spoken（模拟被闸门跳过）
+        assert rs._encourage(self._ctx(st, lap_no=6)) is not None
+        assert rs._encourage(self._ctx(st, lap_no=7)) is not None
+
+    def test_silent_without_a_completed_lap(self, rs, st):
+        """只在圈后说 —— 鼓励不该插在弯里。"""
+        assert rs._encourage(self._ctx(st, with_lap=False)) is None
+
+    def test_encouragement_is_deterministic(self, rs):
+        """🔴 回放可复现的底线：同一个 (lap, position, num_cars) 永远同一句。
+
+        教练是**确定性系统**，`FileSource` 回放是核心调试手段 —— 挑词一旦吃
+        全局 `random` 状态，回放就不可复现、测试也无从断言（见 `phrases._pick`）。
+        """
+        a = rs._encourage(self._ctx(RuleSet.fresh_state(), lap_no=7))
+        b = rs._encourage(self._ctx(RuleSet.fresh_state(), lap_no=7))
+        assert a is not None and b is not None
+        assert a.text == b.text
+
+    def test_encouragement_varies(self, rs):
+        """反证：同一个种子不能永远同一句 —— 否则"随机"是假的。"""
+        got = set()
+        for lap in range(1, 40):
+            u = rs._encourage(self._ctx(RuleSet.fresh_state(), lap_no=lap))
+            if u:
+                got.add(u.text)
+        assert len(got) >= 3, got
+
+    def test_no_prescription_words(self, rs):
+        """🔴 情绪向句子绝不能含处方词 —— 尤其**「加油」**。
+
+        它在中文里既是"come on"也是"加燃料"，而 `_ADVICE_RULES` 把「加油」
+        登记成了**燃油处方词**（需 `laps_left <= FUEL_CRIT_LAPS` 授权）。
+        一句"加油！"会被判成"编了个进站指令" → 整句丢掉。
+        """
+        bad: list[str] = []
+        for words, _field, _lim in phrases._ADVICE_RULES:
+            bad.extend(words)
+        for lap in range(1, 40):
+            u = rs._encourage(self._ctx(RuleSet.fresh_state(), lap_no=lap))
+            if u:
+                assert not [w for w in bad if w in u.text], (u.text, bad)
+
+    # —— 18. 领跑提醒 ——————————————————————————————
+
+    def test_leader_take_on_first(self, rs, st):
+        u = rs._leader(self._ctx(st, position=1))
+        assert u is not None
+        assert u.key == "leader@take"
+        assert u.text == "已经是 P1，做得很好，稳扎稳打"
+
+    def test_leader_hold_after_gap(self, rs, st):
+        """领跑后隔 5 圈才提醒一次"保持住"。
+
+        🔴 同 `test_gap_between_encouragements`：每次播出都要调 `on_spoken`。
+        """
+        u = rs._leader(self._ctx(st, lap_no=5, position=1))
+        assert u is not None
+        rs.on_spoken([u], st)
+        assert rs._leader(self._ctx(st, lap_no=6, position=1)) is None
+        assert rs._leader(self._ctx(st, lap_no=9, position=1)) is None
+        u = rs._leader(self._ctx(st, lap_no=10, position=1))
+        assert u is not None and u.key == "leader@hold"
+        assert u.text == "保持当前状态，稳扎稳打"
+
+    def test_leader_resets_when_lost(self, rs, st):
+        """掉出 P1 再夺回 → 重新"祝贺"，而不是接着说"保持住"。"""
+        assert rs._leader(self._ctx(st, lap_no=5, position=1)) is not None
+        assert rs._leader(self._ctx(st, lap_no=6, position=3)) is None
+        u = rs._leader(self._ctx(st, lap_no=7, position=1))
+        assert u is not None and u.key == "leader@take"
+
+    def test_silent_when_not_leading(self, rs, st):
+        assert rs._leader(self._ctx(st, position=2)) is None
+
+    def test_silent_when_alone(self, rs, st):
+        """一个人跑时间赛时不说"你是 P1"。"""
+        assert rs._leader(self._ctx(st, position=1, num_cars=1)) is None
+        assert rs._leader(self._ctx(st, position=1, num_cars=0)) is None
+
+    # —— 定位：这一类是唯一不依赖参考圈的 ————————————————
+
+    def test_mood_does_not_need_a_reference_lap(self, rs, st, ref):
+        """🔴 跨车型时**速度类规则全部闭嘴**，但名次 / 情绪照常。
+
+        这正是 R3.1 的定位：换了车、没有历史圈、甚至第一次跑这条赛道，
+        教练照样能陪你说话 —— 它不再需要拿别人的速度来量你。
+        """
+        # 名次变化：先在 P13 记一帧，再切到 P11
+        rs._position_now(self._ctx(st, position=13))
+        c = Ctx(f=mk(lap=5, position=11, num_cars=20), ref=ref, s=100.0,
+              st=st, lap=_lap_result(5), ref_pace_ok=False)
+        assert rs._encourage(c) is not None
+        assert rs._position_now(c) is not None
+
+    def test_mood_keys_are_in_their_own_panel_group(self, rs, st):
+        """情绪向要在面板上能单独关掉（有人就是不想被鼓励）。"""
+        from gt7coach import panel
+
+        for key in ("position", "encourage", "leader@take", "leader@hold"):
+            assert panel.group_of_key(key) == "mood"

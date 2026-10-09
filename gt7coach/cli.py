@@ -350,6 +350,10 @@ def _replay(args: argparse.Namespace) -> int:
         "said": rows,
         "said_by_key": say_by_key,
         "dropped_by_gate": eng._st_gate.get("dropped", 0),
+        # 排队没轮上（max_per_tick 用尽被 skip）与被冷却/配额判掉是两回事：
+        # 前者是"没轮上"，后者是"轮到了但不该说"。分开报，否则
+        # 「闸门丢掉 0 条」会让人以为闸门什么都没拦（踩过一次）。
+        "skipped_by_gate": eng._st_gate.get("skipped", 0),
     }
     if args.json:
         print(json.dumps(out, ensure_ascii=False, indent=2))
@@ -396,5 +400,6 @@ def _replay(args: argparse.Namespace) -> int:
         print("\n按 key：")
         for k, n in sorted(say_by_key.items(), key=lambda x: -x[1]):
             print(f"  {n:>3} × {k}")
-    print(f"\n闸门丢掉 {out['dropped_by_gate']} 条候选")
+    print(f"\n闸门丢掉 {out['dropped_by_gate']} 条候选"
+          f"（另有 {out['skipped_by_gate']} 条排队没轮上）")
     return 0

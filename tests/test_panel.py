@@ -46,6 +46,11 @@ class TestGrouping:
         ("lap_advice", "debrief"),
         ("corner_habit@T1", "debrief"),    # 旧行为（lap_advice=False）也认领
         ("lap_summary", "debrief"),        # 兼容旧键
+        # —— R3.1 名次 / 情绪向（独立分组，可单独关）——
+        ("position", "mood"),
+        ("encourage", "mood"),
+        ("leader@take", "mood"),
+        ("leader@hold", "mood"),
     ])
     def test_key_maps_to_group(self, key, gid):
         assert panel.group_of_key(key) == gid
@@ -56,8 +61,10 @@ class TestGrouping:
         assert panel.group_of_key("") is None
 
     def test_group_ids_stable(self):
+        # ⚠️ 加了 `mood`（R3.1 名次与情绪）之后要同步这里 —— 这条测试守的
+        #    正是"分组 id 不能悄悄变"，改 id 名会让面板上用户的开关失效。
         assert panel.known_ids() == {"safety", "driving", "tyres", "pace",
-                                     "debrief"}
+                                     "debrief", "mood"}
 
     def test_every_group_has_label_and_desc(self):
         for g in panel.GROUPS:
@@ -89,7 +96,8 @@ class TestPanelState:
     def test_shape(self):
         st = panel.panel_state(("tyres",), ["tyre_hot", "delta", "delta"])
         ids = [g["id"] for g in st["groups"]]
-        assert ids == ["safety", "driving", "tyres", "pace", "debrief"]
+        assert ids == ["safety", "driving", "tyres", "pace", "debrief",
+                       "mood"]
         assert st["muted"] == ["tyres"]
         by = {g["id"]: g for g in st["groups"]}
         assert by["tyres"]["muted"] is True and by["pace"]["muted"] is False

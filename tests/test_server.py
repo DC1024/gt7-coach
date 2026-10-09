@@ -156,7 +156,9 @@ class TestBroadcastPanel:
         code, d, _ = _get(server + "/api/v1/coach/panel")
         assert code == 200
         ids = [g["id"] for g in d["groups"]]
-        assert ids == ["safety", "driving", "tyres", "pace", "debrief"]
+        # ⚠️ `mood`（R3.1 名次与情绪）是后加的第六组；再加分组要同步这里。
+        assert ids == ["safety", "driving", "tyres", "pace", "debrief",
+                       "mood"]
         assert d["muted"] == []                 # 默认全开
         assert all("muted" in g and "label" in g for g in d["groups"])
 

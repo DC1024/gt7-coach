@@ -26,6 +26,10 @@
 | `fuel_range`            | P2 | 圈后：按本场油耗中位数算还能跑几圈（≤3 圈才报）|
 | `next_focus`            | P2 | 圈后：同一个弯连续 N 圈反复亏 → 提醒（隔 3 圈才提第二次）|
 | `lap_advice`            | P2 | **R2.4**：把上面四条事实合并成**一句**圈后综合建议（每圈一次）|
+| `position`              | P3 | **R3.1**：名次变了（追回 / 掉了 N 位）|
+| `encourage`             | P3 | **R3.1**：后半区 → 每 N 圈随机鼓励一次 |
+| `leader@take`           | P3 | **R3.1**：刚拿到 P1 |
+| `leader@hold`           | P3 | **R3.1**：持续领跑时隔 N 圈提醒"保持住" |
 
 > `lap_advice`（R2.4）：默认 `RuleConfig.lap_advice=True` 时，圈后**只发这一条**
 > 合并句（`lap_summary`/`sector_loss`/`fuel_range`/`next_focus` 的**判断**照跑、
@@ -60,8 +64,8 @@ if TYPE_CHECKING:      # 只为注解，避免 rules↔lapstats 循环 import
     from .lapstats import LapResult
 
 from . import phrases
-from .contract import (Frame, P_CRITICAL, P_HIGH, P_LOW, P_NORMAL,
-                       Utterance)
+from .contract import (MAX_PLAUSIBLE_CARS, Frame, P_CRITICAL, P_HIGH,
+                       P_LOW, P_NORMAL, Utterance)
 from .narrate import Narrator
 from .refindex import RefLap
 
@@ -136,6 +140,21 @@ class RuleConfig:
     # 隔 3 圈 = 提醒之后给你 3 圈去改，改不好再提。
     corner_repeat_laps: int = 3
 
+    # —— 名次 / 情绪向（R3.1）——
+    # 🔴 这些规则**不依赖参考圈**，所以跨车型/暖胎期之外它们照常工作。
+    #    风险不在"算错"，而在"太吵" —— 名次每圈都可能变，鼓励更是纯情绪。
+    #    所以下面每一条都有自己的**最小间隔**，宁可少说。
+    # 少于这么多辆车就不报名次变化：两人对跑时"你追回 1 位"毫无意义。
+    position_min_cars: int = 3
+    # 鼓励只在**后半区**发，且参赛车数至少这么多：3 车赛的第 2 名不算"后半区"。
+    encourage_min_cars: int = 6
+    # 两次鼓励之间至少隔几圈。天天被鼓励的人会开始怀疑自己是不是很差。
+    encourage_every_laps: int = 3
+    # 拿到 P1 才算"领跑"：一个人跑时间赛时不说"你是 P1"。
+    leader_min_cars: int = 2
+    # 持续领跑时，隔几圈提醒一次"保持住"。
+    leader_hold_every_laps: int = 5
+
     # —— R2.4 圈后综合建议 ——
     # True（默认）：把 lap_summary / sector_loss / fuel_range / next_focus 四条
     #   事实合并成**一句** `lap_advice`（每圈一条，云润色只调用一次）。
@@ -159,6 +178,21 @@ class Ctx:
     theory: dict[str, Any] | None = None   # 本场各段最好值 → 理论最快圈
     fuel: dict[str, Any] | None = None     # 每圈油耗 / 还能跑几圈
     corners: dict[str, Any] | None = None  # 每弯累积（含 habit：反复亏的那个弯）
+    # 🔴 参考圈的**速度面**与本场这辆车可比吗？（几何面永远可比）
+    #
+    #    False 只会出现在一种情况：手上这份参考圈是跨车型采用的历史圈，
+    #    且两车圈速差超过容差（默认 10%）。此时**依赖速度的规则必须全部闭嘴** ——
+    #    拿慢车的最快圈去量快车，delta 是一个恒定的 +8 秒，零信息量；
+    #    弯心速度、刹车入点速度同理，都是"车慢"而不是"你慢"。
+    #
+    #    而 **几何面**（赛车线形状、刹车点与弯心的**位置**）跨车依然成立：
+    #    T1 的刹车点还在那个地方，顶多差几米。所以 `off_track`（横向偏差）
+    #    与 `throttle_late`（过弯心后 40~120 m 还没给油，纯位置判据）
+    #    **不受这个标志影响**，照常工作。
+    #
+    #    判据在 `refindex.RefLap.pace_ok`，由引擎在"采用"那一刻算好传进来。
+    #    默认 True —— 不传就是"可比"，与加这个标志之前的行为一致。
+    ref_pace_ok: bool = True
     # 本场**还没跑完第一圈**（暖胎期）→ 一个字都别乱说。
     #
     # 🔴 依赖参考圈的规则不用自己判这个：引擎在暖胎期会把 `ref`/`s` 收回去，
@@ -230,7 +264,45 @@ class RuleSet:
                 u = fn(c)
                 if u is not None:
                     out.append(u)
+        # —— 名次 / 情绪向（R3.1）——
+        # 🔴 独立于上面的圈后合并句：情绪不该去挤成绩/习惯那些硬信息的
+        #    位置（合并句有长度预算，加鼓励就会把主体挤掉），而且要能
+        #    在面板上单独关掉（分组 `mood`）—— 有人就是不想被鼓励。
+        for fn in (self._position_now, self._encourage, self._leader):
+            u = fn(c)
+            if u is not None:
+                out.append(u)
         return out
+
+    def on_spoken(self, spoken: list[Utterance], st: dict) -> None:
+        """闸门放行后由引擎回调：**只有真念出口了**才推进规则状态位。
+
+        🔴 为什么规则不能当场自己记账：规则产出的只是**候选**，能不能出
+           闸门由闸门说了算（每 tick 只放 `max_per_tick` 条，且按优先级
+           升序取）。以前 `_position_now` 一发现名次变了就把 `pos_last`
+           更新成新值再返回候选，于是这条候选只在那一个 tick 里存在 ——
+           被闸门 `break` 跳过就永久消失。而名次变化恰恰总发生在刹车点 /
+           弯中（超车那一刻），那时驾驶指导必然同时在排队，P_LOW 必然被
+           跳过 → 实测一场 16 车 6 圈的 Spa：23 条候选播出 **0** 条，
+           功能等于不存在。
+
+           改成"播出了才记账"后，没播出的下一 tick 会再提一次，直到闸门
+           放行。等待期间名次若继续变化，`moved` 自动累计成净变化，所以
+           不会念出过时的数字。
+
+        🔴 为什么用 key 前缀而不是精确匹配：`leader@take` / `leader@hold`
+           是两个 key 但共享同一份状态位。
+        """
+        for u in spoken:
+            ev = u.evidence or {}
+            base = u.key.split("@", 1)[0]
+            if base == "position":
+                st["pos_last"] = int(ev.get("position") or 0)
+            elif base == "encourage":
+                st["encourage_lap"] = int(ev.get("lap") or 0)
+            elif base == "leader":
+                st["leader_was"] = True
+                st["leader_hold_lap"] = int(ev.get("lap") or 0)
 
     # —— 1. 出界 ———————————————————————————————————————
 
@@ -309,6 +381,13 @@ class RuleSet:
         cfg = self.cfg
         if c.ref is None or c.s is None or c.f.speed_kph < cfg.min_speed_kph:
             return None
+        # 🔴 跨车型时**整条**规则都停，不只是"快 N"那半句。理由不是保守，
+        #    是**方向性**：`history_best` 只会挑比本场最快圈**更快**的场次
+        #    （`b < best_s * 0.999`），所以跨车采用时参考车总是更快的那辆 ——
+        #    它的刹车点比你这辆车该刹车的位置**更晚**。按它预告，
+        #    "1.4 秒后重刹"会说到你早就该减速之后才响，是**反向的**误导。
+        if not c.ref_pace_ok:
+            return None
         z = c.ref.next_brake(c.s)
         if not z:
             return None
@@ -363,6 +442,12 @@ class RuleSet:
         cfg = self.cfg
         if c.ref is None or c.s is None:
             return None
+        # 🔴 跨车型静默：判据是 `speed_kph > z["speed_in_kph"] * 0.92`，
+        #    而 `speed_in_kph` 是**参考车**入弯时的速度 —— 慢车的入弯速度
+        #    比你这辆车能带的低，于是"没踩刹车而且速度高"会被判成"你晚了"，
+        #    可你只是车更快。
+        if not c.ref_pace_ok:
+            return None
         # 找**刚过去**的那个刹车入点
         zones = [z for z in c.ref.brake_in
                  if 0 <= c.s - z["s_in_m"] <= 200.0]
@@ -406,6 +491,10 @@ class RuleSet:
     def _apex_slow(self, c: Ctx) -> Utterance | None:
         cfg = self.cfg
         if c.ref is None or c.s is None:
+            return None
+        # 🔴 跨车型静默：这条是**纯速度差**（参考车弯心速度 − 你的速度）。
+        #    车慢 20 km/h 会让它恒为真，和"你弯心慢了"完全是两回事。
+        if not c.ref_pace_ok:
             return None
         near = [a for a in c.ref.apex
                 if 0 <= c.s - a["s_m"] <= 60.0]
@@ -494,6 +583,12 @@ class RuleSet:
     def _delta(self, c: Ctx) -> Utterance | None:
         if c.ref is None or c.s is None or c.f.lap_time_s <= 0:
             return None
+        # 🔴 跨车型静默 —— 这是**最要紧**的一条。delta 是教练的主输出，
+        #    跨车时它会退化成一个恒定的偏移量（"+8.00"），每天每圈都这么报，
+        #    既不随时间变化、也不随你开得好坏变化 —— 零信息量，而且会让人
+        #    误以为"我今天一直慢 8 秒"，进而去改一个根本不存在的毛病。
+        if not c.ref_pace_ok:
+            return None
         t_ref = c.ref.t_at_s(c.s)
         if t_ref is None:
             return None
@@ -522,7 +617,10 @@ class RuleSet:
         sec = ms / 1000.0
         ev: dict[str, Any] = {"last_lap_ms": round(ms, 1),
                               "lap_time_s": round(sec, 3)}
-        if c.ref is not None and c.ref.lap_time_s > 0:
+        # 🔴 跨车型时**只丢 `vs_ref_s`**，圈速本身照报 —— 圈速是游戏给的
+        #    实测值，与参考圈无关，换了车也照样成立。而"比参考圈快/慢多少"
+        #    是两辆车之间的比较，跨车没有意义。
+        if c.ref_pace_ok and c.ref is not None and c.ref.lap_time_s > 0:
             ev["vs_ref_s"] = round(sec - c.ref.lap_time_s, 3)
             ev["ref_lap_time_s"] = round(c.ref.lap_time_s, 3)
         txt = self.narrator.render("lap_summary", ev)
@@ -539,6 +637,10 @@ class RuleSet:
     def _projected_lap(self, c: Ctx) -> Utterance | None:
         cfg = self.cfg
         if c.ref is None or c.s is None or c.f.lap_time_s <= 0:
+            return None
+        # 🔴 跨车型静默：预测圈速 = 参考圈速 + 当前 delta，两项都建立在
+        #    "参考车和你的车一样快"这个前提上。前提不成立，这个数就是编的。
+        if not c.ref_pace_ok:
             return None
         # 跑得太早时 delta 还在抖（起步、暖胎、第一弯的噪声），报出来是误导
         if c.ref.length_m <= 0:
@@ -628,6 +730,17 @@ class RuleSet:
                               "per_lap": c.fuel.get("per_lap"),
                               "level": c.fuel.get("level"),
                               "powertrain": c.f.powertrain or None}
+        # —— 接上「还剩几圈到终点」——
+        # 只知道"油够跑 2.4 圈"是半个答案：够不够跑完**这一局**才是
+        # 车手真正要据以决策的数。`laps_to_go` 为 None（总圈数未知）时
+        # 保持旧说法，不猜。
+        to_go = c.f.laps_to_go
+        if to_go is not None:
+            ev["laps_to_go"] = int(to_go)
+            # 🔴 派生余量必须进 evidence：`fuel_range` 模板里"余/差 N 圈"
+            #    的 N 是这一句里唯一的数字，不在 facts 里就会被数字白名单
+            #    判成"编的数字"（与 `brake_warn` 的 `over_kph` 同一个坑）。
+            ev["margin_laps"] = round(float(left) - float(to_go), 2)
         txt = self.narrator.render("fuel_range", ev)
         return Utterance(
             key="fuel_range", text=txt,
@@ -704,8 +817,13 @@ class RuleSet:
 
         fu = self._fuel_range(c)           # 续航：只在"警告区"（≤fuel_warn_laps）才有
         if fu is not None:
-            facts["unit"] = fu.evidence.get("unit")
-            facts["laps_left"] = fu.evidence.get("laps_left")
+            # 🔴 连 `laps_to_go` / `margin_laps` 一起透传：圈后综合句要能说
+            #    "够不够到终点"，而余量是派生值，必须由这里带进 facts，
+            #    否则云句引用它就会被数字白名单判成"编的"。
+            for k in ("unit", "laps_left", "laps_to_go",
+                      "margin_laps"):
+                if k in fu.evidence:
+                    facts[k] = fu.evidence[k]
 
         se = self._sector_loss(c)          # 最慢段
         if se is not None:
@@ -732,3 +850,138 @@ class RuleSet:
             ttl_s=phrases.ttl_for(txt, P_NORMAL, "lap_advice"),
             short=txt.split("，")[0],
             evidence=facts)
+
+    # —— 16~18. 名次与情绪向（R3.1）—————————————————————————
+    #
+    # 这三条是**唯一不依赖参考圈**的播报，也是唯一带情绪的一类。数据来自
+    # `car.race.*`（当前名次 / 参赛车数），协议里本来就有 —— 只是此前
+    # `contract.Frame.from_v1_live` 从没读它（见 #21）。
+    #
+    # 🔴 这一类的风险不在"算错"而在**太吵**，所以立两条纪律：
+    #
+    #   ① **随机必须可复现**。鼓励是"随机挑一条"，可教练是**确定性系统** ——
+    #      `FileSource` 回放是核心调试手段（同一份 jsonl 必须产出同一串播报），
+    #      挑词一旦吃全局 `random` 状态，回放就不可复现、测试也无从断言。
+    #      所以挑哪条由 `(lap, position, num_cars)` 播种，见 `phrases._pick`。
+    #
+    #   ② **永不抢占驾驶指导**。三条一律 P_LOW（最低档）：名次变化再激动，
+    #      也不该把"刹车晚了"挤下去。闸门排序时它们永远排最后，
+    #      且受 `max_per_lap` 约束（一圈里挤不进去就不说）。
+    #
+    # ⚠️ 三条都**不走云润色**（不在 `phrases.RENDERERS` 里）：本地模板已经
+    #    够口语，而云会把"别急"扩写成「注意补油」这类 facts 里没有的处方 ——
+    #    `invented_advice` 能拦，但拦住的代价是白花一次钱和 0.5~2 s 延迟。
+
+    def _race_ok(self, c: Ctx, min_cars: int) -> bool:
+        """名次数据可用吗 —— 三条规则**共用**的这一道闸。
+
+        🔴 为什么要单独提出来：`position` / `num_cars` 都是 u16，菜单态、时间赛、
+           练习赛里 GT7 不给值（已被 `norm_u16` 归一成 0），此时**必须闭嘴**；
+           刷成垃圾值（如 31847）时也不能照念。三种情况合到一处，
+           免得将来新加第四条规则时漏判一种。
+        """
+        f = c.f
+        if f.position <= 0 or f.num_cars <= 0:
+            return False
+        if f.num_cars > MAX_PLAUSIBLE_CARS:
+            return False
+        # 名次不可能超过参赛车数 —— 出现了就是数据自相矛盾，别照着念
+        if f.position > f.num_cars:
+            return False
+        return f.num_cars >= min_cars
+
+    def _position_now(self, c: Ctx) -> Utterance | None:
+        cfg = self.cfg
+        f = c.f
+        # 🔴 暖胎期静默：发车那一团里名次每秒都在跳，这时候报"追回 2 位"
+        #    播的是随机噪声 —— 随机噪声比沉默更伤信任。
+        if c.warmup:
+            return None
+        if not self._race_ok(c, cfg.position_min_cars):
+            return None
+        last = c.st.get("pos_last")
+        if last is None:
+            # 首见只记不播：没有"从哪来"，就谈不上"追回 / 掉了"
+            c.st["pos_last"] = int(f.position)
+            return None
+        if int(last) == int(f.position):
+            return None
+        # 🔴 这里**故意不更新** `pos_last` —— 更新推迟到这句话真正播出
+        #    之后（见 `RuleSet.on_spoken`）。
+        #
+        #    为什么：名次变化总是发生在超车那一刻，而那一刻正是刹车点 /
+        #    弯中，驾驶指导必然同时在排队。闸门每 tick 只放一条
+        #    （`max_per_tick=1`）且按优先级升序取，P_LOW 会被 `break`
+        #    直接跳过。以前规则当场就推进了状态，于是这条话只活了一个
+        #    tick 就永久消失 —— 实测一场 16 车 6 圈的 Spa：23 条候选播出
+        #    0 条。不推进状态 = 下一 tick 再提一次，直到闸门放行；等待
+        #    期间名次若继续变，`moved` 会自动累计成净变化。
+        #
+        # 🔴 `moved` 是派生值，必须写进 evidence：它是这一句里唯一的数字，
+        #    不在 facts 里就会被数字白名单判成"编的"（与 `brake_warn`
+        #    的 `over_kph` 同一个坑）。
+        moved = int(last) - int(f.position)     # >0 = 前进了几位
+        ev: dict[str, Any] = {"position": int(f.position), "moved": moved,
+                              "num_cars": int(f.num_cars),
+                              "lap": int(f.lap)}
+        txt = phrases.position_now(ev)
+        return Utterance(key="position", text=txt, priority=P_LOW,
+                         ttl_s=phrases.ttl_for(txt, P_LOW, "position"),
+                         short=f"P{int(f.position)}", evidence=ev)
+
+    def _encourage(self, c: Ctx) -> Utterance | None:
+        cfg = self.cfg
+        f = c.f
+        # 只在**圈后**说：鼓励不该插在弯里。这也顺带保证了暖胎期静默 ——
+        # `c.lap` 要等本场跑完一圈才有值。
+        if c.warmup or c.lap is None:
+            return None
+        if not self._race_ok(c, cfg.encourage_min_cars):
+            return None
+        # 后半区判据写成 `2*pos > num_cars` 而不是 `pos > num_cars/2`：
+        # 都是整数比较，但这样不引入浮点、也不用纠结整除往哪取整
+        # （20 车第 10 名：20 > 20 为假 → 不算后半区；第 11 名：22 > 20 ✓）。
+        if int(f.position) * 2 <= int(f.num_cars):
+            return None
+        # 隔几圈才鼓励一次：天天被鼓励的人会开始怀疑自己是不是很差。
+        last = c.st.get("encourage_lap", -999)
+        if c.lap.lap - last < cfg.encourage_every_laps:
+            return None
+        # 🔴 同样**不在这里记账** —— 等 `on_spoken` 确认播出后再记。
+        #    否则一次竞争失败就把这次机会吃掉了，要再等 3 圈。
+        ev: dict[str, Any] = {"position": int(f.position),
+                              "num_cars": int(f.num_cars),
+                              "lap": int(c.lap.lap)}
+        txt = phrases.encourage(ev)
+        return Utterance(key="encourage", text=txt, priority=P_LOW,
+                         ttl_s=phrases.ttl_for(txt, P_LOW, "encourage"),
+                         short="稳住", evidence=ev)
+
+    def _leader(self, c: Ctx) -> Utterance | None:
+        cfg = self.cfg
+        f = c.f
+        if c.warmup or c.lap is None:
+            return None
+        if int(f.position) != 1:
+            # 🔴 掉出 P1 就把"已经在领跑"的记忆清掉。不清的话，重新夺回
+            #    P1 那一刻只会说"保持住"—— 而那一刻玩家想听的是"拿回来了"。
+            c.st["leader_was"] = False
+            return None
+        if not self._race_ok(c, cfg.leader_min_cars):
+            return None
+        if c.st.get("leader_was"):
+            # 已经领跑了 → 隔几圈提醒一次"保持住"，别每圈念
+            last = c.st.get("leader_hold_lap", -999)
+            if c.lap.lap - last < cfg.leader_hold_every_laps:
+                return None
+            mode = "hold"
+        else:
+            mode = "take"
+        # 🔴 同样推迟到 `on_spoken`：只有真念出口了才算"已经领跑"。
+        ev: dict[str, Any] = {"position": 1, "mode": mode,
+                              "num_cars": int(f.num_cars),
+                              "lap": int(c.lap.lap)}
+        txt = phrases.leader(ev)
+        return Utterance(key=f"leader@{mode}", text=txt, priority=P_LOW,
+                         ttl_s=phrases.ttl_for(txt, P_LOW, "leader"),
+                         short="P1", evidence=ev)

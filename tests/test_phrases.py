@@ -471,7 +471,71 @@ class TestFuelRange:
         assert not over_budget(t, 2, key="fuel_range")
 
 
-class TestNextFocus:
+class TestFuelRangeWithRaceDistance:
+    """接上「还剩几圈到终点」之后的续航说法。
+
+    🔴 有总圈数时优先回答"**够不够跑完这一局**"，而不是"还能跑几圈"——
+       后者是半个答案：车手要据以决策的是前者（要不要进站、要不要省油）。
+       总圈数未知（时间赛 / 练习赛 / 菜单态残留值）时退回旧说法，**不猜**。
+
+    ⚠️ 这里的"余/差 N 圈"是**派生值**，它不在原始 facts 里。
+       所以 `_fuel_range` 必须把它写进 evidence，否则数字白名单会
+       把这一句判成"编的数字"（与 `brake_warn` 的 `over_kph` 同一个坑）。
+    """
+
+    def test_enough_to_finish_reports_the_margin(self):
+        t = phrases.fuel_range({"unit": "油", "laps_left": 2.4,
+                                "laps_to_go": 2, "margin_laps": 0.4})
+        assert t == "油够到终点，余 0.4 圈"
+
+    def test_enough_is_factual_not_advisory(self):
+        """够的时候**不能**喊进站 —— 那就成了狼来了。"""
+        t = phrases.fuel_range({"unit": "油", "laps_left": 5.0,
+                                "laps_to_go": 2, "margin_laps": 3.0})
+        assert "进站" not in t
+
+    def test_short_of_the_finish_reports_the_gap(self):
+        t = phrases.fuel_range({"unit": "油", "laps_left": 1.5,
+                                "laps_to_go": 2, "margin_laps": -0.5})
+        assert t == "油差 0.5 圈"
+
+    def test_gap_without_advice(self):
+        """不够的时候也**不**给指令 —— 还没到 FUEL_CRIT_LAPS，进站与否是
+        车手自己的判断，本地只给事实（见 `fuel_range` 文档）。"""
+        t = phrases.fuel_range({"unit": "油", "laps_left": 1.5,
+                                "laps_to_go": 2, "margin_laps": -0.5})
+        assert "进站" not in t and "省" not in t
+
+    def test_crit_wins_over_race_distance(self):
+        """真的见底（≤1 圈）时说"这圈进站"，其余说法让位。"""
+        t = phrases.fuel_range({"unit": "油", "laps_left": 0.6,
+                                "laps_to_go": 5, "margin_laps": -4.4})
+        assert t == "油只够 0.6 圈，这圈进站"
+
+    def test_unknown_race_distance_falls_back(self):
+        """总圈数未知（时间赛 / 练习赛）→ 退回"还够 N 圈"。"""
+        t = phrases.fuel_range({"unit": "油", "laps_left": 2.4,
+                                "laps_to_go": None, "margin_laps": None})
+        assert t == "油还够 2.4 圈"
+
+    def test_missing_keys_fall_back(self):
+        t = phrases.fuel_range({"unit": "油", "laps_left": 2.4})
+        assert t == "油还够 2.4 圈"
+
+    def test_margin_is_whitelisted(self):
+        """派生余量在 facts 里 → 句子不该被数字白名单拦。"""
+        f = {"unit": "油", "laps_left": 1.5, "laps_to_go": 2,
+             "margin_laps": -0.5}
+        assert invented_numbers(phrases.fuel_range(f), f) == []
+
+    def test_margin_missing_from_facts_is_caught(self):
+        """反证：余量没进 facts → 白名单必须抓出来。"""
+        t = "油够到终点，余 0.4 圈"
+        assert invented_numbers(t, {"unit": "油", "laps_left": 2.4}) == ["0.4"]
+
+    def test_within_budget(self):
+        for t in ("油够到终点，余 0.4 圈", "油差 0.6 圈"):
+            assert not over_budget(t, 2, key="fuel_range")
     def test_basic_reports_sample_size(self):
         t = phrases.next_focus({"label": "T3", "laps": 3, "median_loss_s": 0.42})
         assert t == "T3 连续 3 圈慢 0.42"
@@ -700,3 +764,79 @@ class TestSpellDigits:
         # 字符数等价 → ttl 预算无需重算
         for t in ("刹车晚了 54 米", "慢 0.37", "1:32.412", "+0.37"):
             assert len(spell_digits(t)) == len(t), t
+
+# ===========================================================================
+# 名次 / 情绪向（R3.1）—— 本地专属模板
+# ===========================================================================
+#
+# 🔴 这三条**不在 `RENDERERS` 里**，所以 `test_every_renderer_*` 那三条硬门
+#    覆盖不到它们 —— 这里的用例是手动补的。新增情绪向文案时记得同步加。
+
+class TestMoodPhrases:
+    def test_position_text(self):
+        assert phrases.position_now({"position": 10, "moved": 2}) == \
+            "P10，追回 2 位"
+        assert phrases.position_now({"position": 13, "moved": -3}) == \
+            "P13，掉了 3 位"
+
+    def test_leader_text(self):
+        assert phrases.leader({"mode": "take"}) == \
+            "已经是 P1，做得很好，稳扎稳打"
+        assert phrases.leader({"mode": "hold"}) == "保持当前状态，稳扎稳打"
+
+    def test_every_pool_entry_is_reachable(self):
+        """词库里不能有"永远挑不到"的死词条 —— 那等于少写了一条。"""
+        seen = set()
+        for lap in range(1, 400):
+            for pos in (11, 13, 17, 20):
+                t = phrases.encourage({"position": pos, "num_cars": 20,
+                                       "lap": lap})
+                seen.add(t[len(f"还在 P{pos}，"):])
+        assert seen == set(phrases.ENCOURAGE_POOL), \
+            sorted(set(phrases.ENCOURAGE_POOL) - seen)
+
+    def test_pool_entries_respect_the_tail_budget(self):
+        """前缀「还在 P13，」是 7 字；尾句 ≤8 字才不超 `encourage` 的预算。"""
+        budget = phrases.char_budget(3, "encourage")
+        for tail in phrases.ENCOURAGE_POOL:
+            txt = f"还在 P13，{tail}"
+            assert len(txt) <= budget, (len(txt), budget, txt)
+
+    def test_no_invented_numbers(self):
+        for lap in range(1, 40):
+            for pos in (11, 13, 17):
+                ev = {"position": pos, "num_cars": 20, "lap": lap}
+                assert phrases.invented_numbers(
+                    phrases.encourage(ev), ev) == []
+        ev = {"position": 7, "moved": 1, "num_cars": 20, "lap": 5}
+        assert phrases.invented_numbers(phrases.position_now(ev), ev) == []
+
+    def test_no_prescription_words(self):
+        """🔴 尤其要挡住**「加油」**：它会撞上燃油处方闸（见 `ENCOURAGE_POOL` 注释）。"""
+        bad: list[str] = []
+        for words, _field, _lim in phrases._ADVICE_RULES:
+            bad.extend(words)
+        for tail in phrases.ENCOURAGE_POOL:
+            assert not [w for w in bad if w in tail], (tail, bad)
+
+    def test_pick_is_deterministic(self):
+        """同一组种子 → 同一条（教练是确定性系统，回放必须可复现）。"""
+        seeds = (7, 13, 20)
+        assert phrases._pick(phrases.ENCOURAGE_POOL, *seeds) == \
+            phrases._pick(phrases.ENCOURAGE_POOL, *seeds)
+
+    def test_pick_varies_with_seed(self):
+        got = {phrases._pick(phrases.ENCOURAGE_POOL, n) for n in range(50)}
+        assert len(got) >= 3, got
+
+    def test_mood_keys_have_a_budget_entry(self):
+        """预算表的唯一来源是 `TTL_CAP_S` —— 没登记就会掉进 8 字的兜底。"""
+        for key in ("position", "encourage", "leader"):
+            assert key in phrases.TTL_CAP_S
+            assert phrases.char_budget(3, key) == \
+                phrases.MAX_CHARS_OVERRIDE[key]
+
+    def test_mood_keys_are_local_only(self):
+        """走云润色的代价：把"别急"扩写成 facts 里没有的处方。这里明确不走。"""
+        for key in ("position", "encourage", "leader"):
+            assert key not in phrases.RENDERERS
