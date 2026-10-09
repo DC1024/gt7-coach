@@ -108,11 +108,19 @@ def deploy_coach(d: Deployer, coach_dir: str) -> None:
     d.run("cd /opt/gt7-coach && docker compose up -d --build 2>&1 | tail -6")
 
 
-def verify(d: Deployer, dash_dir: str, coach_dir: str) -> list[str]:
-    """硬门槛：容器里的代码 md5 == 本地。"""
+def verify(d: Deployer, dash_dir: str, coach_dir: str,
+           skip_dash: bool = False) -> list[str]:
+    """硬门槛：容器里的代码 md5 == 本地。
+
+    `skip_dash=True` 时跳过 dash 那三个文件 —— 否则会在 `--dash-dir` 没给
+    的时候去读 `./gt7-dashboard.py` 直接 FileNotFoundError 崩掉
+    （**这次就是这样**：部署其实成功了、体检也全绿，最后一步自己炸了）。
+    """
     print("\n[3/3] 硬校验：容器内代码 == 本地")
     bad = []
-    for name in DASH_FILES:
+    if skip_dash:
+        print("    （--skip-dash：跳过 Dash 三个文件）")
+    for name in ([] if skip_dash else DASH_FILES):
         lm = md5_file(os.path.join(dash_dir, name))
         rm = d.container_md5("gt7-dashboard", f"/app/{name}")
         ok = lm == rm
@@ -164,7 +172,8 @@ def main(argv=None) -> int:
     try:
         deploy_dash(d, args.dash_dir, args.skip_dash)
         deploy_coach(d, args.coach_dir)
-        bad = verify(d, args.dash_dir or ".", args.coach_dir)
+        bad = verify(d, args.dash_dir or ".", args.coach_dir,
+                     skip_dash=args.skip_dash)
     finally:
         d.close()
     if bad:
