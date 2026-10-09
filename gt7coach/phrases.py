@@ -62,6 +62,9 @@ CHAR_PER_S = 4.5
 # 每个 B 档 key 的 ttl 容量（秒）—— 预算表的**唯一来源**，也是 `ttl_for` 的输入。
 # 值本身是"这条信息在车上还有用多久"，与 `rules.py` 里各规则的语义一致。
 TTL_CAP_S: dict[str, float] = {
+    # R2.4 圈后**综合建议**：把成绩/最慢段/续航/习惯压成一句。它是最长的一句
+    # （可能要带 2~3 条事实），所以容量单独给，比单条 lap_summary 大。
+    "lap_advice": 7.0,
     "lap_summary": 5.0,     # 圈后成绩，撑到下一个 delta 播报
     "sector_loss": 5.0,     # 圈后分段，同上
     "next_focus": 6.0,      # 习惯类，最长（"连续 N 圈"值得听完）
@@ -99,6 +102,68 @@ def fmt_lap_time(seconds: float | None) -> str:
 
 
 # ===========================================================================
+# 数字逐位读音（无线电风格）—— 54 → 五四，去掉 十/百/千 等位值字
+# ===========================================================================
+#
+# 🔴 为什么单独做一层：真实赛道/战机无线电报数都是**逐位读**的——
+#    速度「54」念「五四」而不是「五十四」，圈速「1:32.412」念
+#    「一分三二秒四一二」。带位值字（十/百/千）的读法在高速口播里
+#    反而含糊、还慢半拍。这一层只服务于**语音**（TTS），
+#    屏幕上的 `text` 仍保留 54 / 1:32.412 等原样数字便于扫读。
+#
+# 设计约束（与项目其它硬门一致）：
+#   · 只改**独立数字**：前面是空白/标点/中文/句首，或被 +/- 修饰的数字；
+#     S2 / T3 这类「带字母的编号标签」里的数字**绝不**动（否则 "S2" 变 "S二"）。
+#   · 不改变字符数：五四=2 字、54=2 字；零点三七=4 字、0.37=4 字。
+#     所以 ttl 预算、长度审计全部按原 `text` 算就够，这层是「等价替换」。
+#   · 圈速单独处理（含冒号），且优先于普通数字，避免冒号被误拆。
+
+_DIGIT_CN = "零一二三四五六七八九"
+
+# 独立数字：前面不能是字母或数字（排除 S2/T3 等标签），可带正负号。
+_NUM_RE = re.compile(r"(?<![A-Za-z0-9])([+\-]?)(\d+(?:\.\d+)?)")
+# 圈速 M:SS.mmm：同样要求前面不是字母/数字。
+_LAPTIME_RE = re.compile(r"(?<![A-Za-z0-9])(\d+):(\d{1,2})\.(\d{1,3})")
+
+
+def _spell_num(sign: str, num: str) -> str:
+    """把一个普通数字（可带符号）转成逐位中文。"""
+    out = "正" if sign == "+" else ("负" if sign == "-" else "")
+    if "." in num:
+        intp, frac = num.split(".")
+        out += "".join(_DIGIT_CN[int(c)] for c in intp)
+        out += "点" + "".join(_DIGIT_CN[int(c)] for c in frac)
+    else:
+        out += "".join(_DIGIT_CN[int(c)] for c in num)
+    return out
+
+
+def _spell_lap(minutes: str, secs: str, millis: str) -> str:
+    """把圈速 M:SS.mmm 转成「M分SS秒mmm」（逐位，无十位值字）。"""
+    m = "".join(_DIGIT_CN[int(c)] for c in minutes)
+    s = "".join(_DIGIT_CN[int(c)] for c in secs)
+    ms = "".join(_DIGIT_CN[int(c)] for c in millis)
+    return f"{m}分{s}秒{ms}"
+
+
+def spell_digits(text: str) -> str:
+    """把播报文本里的阿拉伯数字改成逐位中文（无线电风格）。
+
+    54 → 五四；0.37 → 零点三七；1:32.412 → 一分三二秒四一二；
+    +0.37 → 正零点三七；-0.37 → 负零点三七。
+    S2 / T3 这类带字母的编号原样保留。
+
+    幂等：对已经没有阿拉伯数字的中文串调用返回原串。
+    """
+    # 先处理圈速（含冒号），再处理普通带符号数字。
+    text = _LAPTIME_RE.sub(
+        lambda m: _spell_lap(m.group(1), m.group(2), m.group(3)), text)
+    text = _NUM_RE.sub(
+        lambda m: _spell_num(m.group(1), m.group(2)), text)
+    return text
+
+
+# ===========================================================================
 # 数字白名单 —— 本地模板与云润色**共用**的唯一口径
 # ===========================================================================
 
@@ -131,6 +196,15 @@ def fact_allow(facts: Any) -> set[str]:
                 out.add(f"{m}:{rest:06.3f}")
                 out.add(str(m))
                 out.add(f"{rest:.3f}")
+                # 🔴 `1:09.700` 里的 `09.700` 是**零填充**形态，与 `9.700`
+                #    不是同一个 token（`NUM_RE` 会原样抓出前导零）。秒数 <10 的
+                #    圈速（1:09.700 / 1:00.000…）会因此被误判成"编数字"——
+                #    真车圈速大量落在这一档（真实圈速 60~119.999 s）。
+                out.add(f"{rest:06.3f}")
+                # 秒数常被写成**两位小数**（`1:23.45` 而不是 `1:23.450`）——
+                # 同一个值的另一种精度写法，不是"编数字"。不加这一条，
+                # 一句完全正确的云句会因为少打一个 0 被整句丢掉。
+                out.add(f"{rest:.2f}")
         elif isinstance(v, str):
             out.update(NUM_RE.findall(v))   # "T3" / "S2" 这类带编号的标签
         # 其余类型（dict/list 在 walk 里递归，其它原样忽略）
@@ -153,6 +227,122 @@ def invented_numbers(text: str, facts: Any) -> list[str]:
     """句子里**不在** facts 白名单中的数字 —— 非空即"编了数字"。"""
     allow = fact_allow(facts)
     return [n for n in numbers_in(text) if n not in allow]
+
+
+# ===========================================================================
+# 第二、三道闸 —— 白名单查不出的两种毛病
+# ===========================================================================
+#
+# 🔴 为什么白名单不够。真 key 冒烟（2026-10-09）抓到两个缺口，都不是"编数字"：
+#
+#   ① **丢了主体**。`invented_numbers` 问的是"句中出现但 facts 里没有的数字"，
+#      它对**少说了一个数**完全无感。而 `_KEY_HINTS["lap_advice"]` 明确让模型
+#      "只挑最要紧的两三件说"，实测两次都把圈速主体（`1:23.450`）丢了 ——
+#      本地模板却在 `lap_advice` 里把它标成「① 主体，永远保留」。
+#      丢掉的恰恰是圈后车手最想听的那一个数，而且丢得**毫无痕迹**：
+#      不记违规、不回落模板、句子读起来还很顺。
+#
+#   ② **编了建议**。模型输出「注意补油」，而 facts 里 `laps_left=2.3`。
+#      `phrases.fuel_range` 的文档写着「🔴 只有**真的不够**（≤1 圈）才给行动
+#      建议：不然每圈都在喊"进站"」—— 模型违反了这条，却**一个数字都没编**，
+#      白名单照样放行。这条比 ① 危险：它是**指令**，车手可能真去提前进站。
+#
+# 两条对策的共同思路：把本地模板里已经存在的隐含规则（哪些必须留、哪些不许说）
+# 显式化成**代码层可判定**的检查 —— prompt 只是第一道且不可靠的约束。
+
+# 「油见底」阈值。🔴 这里定义、`fuel_range` 与 `lap_advice` 两处模板都引用，
+#    下面的处方闸也引用 —— 三处必须同一个数，否则"模板允许但闸门拒绝"。
+FUEL_CRIT_LAPS = 1.0      # 真的不够：此时才允许给行动建议（"这圈进站"）
+FUEL_LOW_LAPS = 3.0       # 进入观察区：只陈述"油够 N 圈"，不含任何指令
+
+# facts 里有就**必须**在句子里出现的字段。
+# 不写 key 白名单，而用「facts 里有没有它」自动判定 —— 将来新增带圈速的 key
+# 不会漏。实测只有 `lap_summary` / `lap_advice` 会带上 `lap_time_s`
+# （`projected_lap` 用的是 `projected_s`，不在此列）。
+MANDATORY_WHEN_PRESENT = ("lap_time_s",)
+
+
+def lap_time_tokens(lap_time_s: float) -> set[str]:
+    """圈速「说出来就算数」的数字写法 —— 与 `fact_allow` 同口径。
+
+    🔴 必须与白名单一致：这边认、白名单不认 → 白名单先把它当"编数字"杀掉，
+       这条检查根本没机会跑；反过来则会放过一句白名单拒绝的句子。
+
+    🔴 但白名单里有一个**必须剔除**的成员：裸分位数（`1`）。
+       若把它也算成"说了圈速"，那么句子里任何一个 `1`（哪怕来自 `T1`）
+       都会让"丢了主体"的句子蒙混过关。真机云句
+       「这圈83.45，T1段慢了0.4秒」就同时含 `83.45` 与 `T1` 里的 `1` ——
+       有 `T1` 在，"分位在不在"这个判据等于永远为真。
+
+    🔴 真机实测的第二点：模型常把圈速写成**原始秒数**（`83.45`）而不是
+       `1:23.450`。白名单认它（那正是 facts 里的值），这里也**必须**认 ——
+       否则每一句都被判"丢了主体"，`fallback_ratio` 恒为 1.0，云在空烧钱。
+       实测就这样：改正之前 6 圈 6 句全部被丢。提示词可以让它偏好 M:SS.mmm
+       （见 prompts），但**闸门只管"在不在"，不管"写成什么形式"**。
+    """
+    allowed = fact_allow({"lap_time_s": lap_time_s})
+    m = int(lap_time_s // 60)
+    if m:                                  # 剔除裸分位（见上）
+        allowed.discard(str(m))
+    return allowed
+
+
+def missing_mandatory(text: str, facts: Any) -> list[str]:
+    """facts 里**必须在场**的内容，句子里却找不到 —— 非空即"丢了主体"。"""
+    if not isinstance(facts, dict):
+        return []
+    toks = set(numbers_in(text))
+    missing: list[str] = []
+    for name in MANDATORY_WHEN_PRESENT:
+        v = facts.get(name)
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
+            continue                      # facts 自己就没有 → 无从要求
+        # 目前表里只有 `lap_time_s`（圈速专用读法）。将来加别的字段时，
+        # 要按字段选对应的读法 —— 宁可在这里显式分支，也不要拿"圈速的
+        # 读法"去判一个速度值。
+        allowed = lap_time_tokens(v) if name == "lap_time_s" else {str(v)}
+        if not (toks & allowed):
+            missing.append(name)
+    return missing
+
+
+# 「处方性」词表：这些是**动作指令**，只有 facts 授权才算合法。
+# 每项 = (词, 授权字段, 阈值)：字段缺省或超过阈值 → 说了就是"编建议"。
+# 授权条件刻意与本地模板的 `FUEL_CRIT_LAPS` 对齐 —— 模板不敢说的话，
+# 云也不许说。
+#
+# ⚠️ 已知取舍：
+#   · 「省油 / 滑行」是这份表里最可能误伤的两项（2.3 圈时说"省着点油"，
+#     在人类教练看来不算离谱）。保留是因为它们与「进站」同属**燃油管理
+#     指令**，前置条件一样；真嫌误伤多，删掉这两个词即可 —— 判据全在这张表。
+#   · 「补油」在中英文赛车语境里有歧义（补油降档 / 补充燃油）。这里按
+#     燃油解（facts 里带 `unit=油`）。即便误判，代价也只是回落到本地模板。
+_ADVICE_RULES: list[tuple[tuple[str, ...], str, float]] = [
+    (("进站", "回站", "维修区", "换胎", "换新胎", "加燃料", "补给",
+      "补油", "加油", "省油", "滑行"),
+     "laps_left", FUEL_CRIT_LAPS),
+]
+
+
+def invented_advice(text: str, facts: Any) -> list[str]:
+    """句子里出现、但 facts **没有授权**的处方性指令 —— 非空即"编了建议"。
+
+    与 `invented_numbers` 的分工：那个管**数字**，这个管**动作**。
+    「注意补油」一个数字都没有，白名单永远拦不住它。
+    """
+    if not isinstance(facts, dict):
+        return []
+    hits: list[str] = []
+    for words, field, limit in _ADVICE_RULES:
+        found = [w for w in words if w in text]
+        if not found:
+            continue
+        v = facts.get(field)
+        allowed = (isinstance(v, (int, float)) and not isinstance(v, bool)
+                   and float(v) <= limit)
+        if not allowed:
+            hits.extend(found)
+    return hits
 
 
 def speech_s(text: str) -> float:
@@ -233,6 +423,8 @@ def ttl_for(text: str, priority: int, key: str = "", *,
 #
 # 🔴 输入 schema 就是**契约**（R2.2 的 prompt 也吃同一份），改动必须同步：
 #
+#   lap_advice     {lap_time_s?, vs_ref_s?, unit?, laps_left?, sector?,
+#                   loss_s?, focus_label?, focus_laps?, focus_loss_s?}
 #   lap_summary    {lap_time_s, vs_ref_s?}
 #   sector_loss    {sector, loss_s, gain_s?}
 #   projected_lap  {projected_s}
@@ -297,12 +489,13 @@ def fuel_range(f: dict[str, Any]) -> str:
     """续航：「油还够 2.4 圈」/「油只够 0.8 圈，这圈进站」。
 
     `unit` 由规则判定（电车说"电量"、油车说"油"）—— 说错一次就没人信了。
-    🔴 只有**真的不够**（≤1 圈）才给行动建议：不然每圈都在喊"进站"，
-       那是狼来了。
+    🔴 只有**真的不够**（≤ `FUEL_CRIT_LAPS`）才给行动建议：不然每圈都在喊
+       "进站"，那是狼来了。`invented_advice` 把这个阈值也用在云句上 ——
+       模板不敢说的话，云也不许说。
     """
     unit = f.get("unit") or "油"
     left = float(f.get("laps_left") or 0.0)
-    if left <= 1.0:
+    if left <= FUEL_CRIT_LAPS:
         return f"{unit}只够 {left:.1f} 圈，这圈进站"
     return f"{unit}还够 {left:.1f} 圈"
 
@@ -329,11 +522,74 @@ def next_focus(f: dict[str, Any]) -> str:
     return txt
 
 
+def lap_advice(f: dict[str, Any]) -> str:
+    """圈后**综合建议**（R2.4）：把 成绩 / 最慢段 / 续航 / 习惯 压成**一句**。
+
+    🔴 为什么合并落在这一句、而不是让四条各说各的：
+       `lap_summary` 的文档里记着"**故意不合并**"—— 四合一 26 字超 P_LOW 预算、
+       嘈杂环境听不全。R2.4 的解法是把合并交给这一条**更长预算**的综合句
+       （`TTL_CAP_S["lap_advice"] = 7.0`），并按优先级**贪心装填**：
+       超预算就从队尾丢**整条**事实，而不是把数字截断（截断=编数字，见模块头）。
+
+    优先级（安全 > 可执行 > 参考）：
+      ① 圈速主体  ② 油见底（≤`FUEL_CRIT_LAPS`，含"进站"）  ③ 习惯弯
+      ④ vs_ref 差  ⑤ 最慢段  ⑥ 一般续航（`FUEL_CRIT_LAPS` < left ≤ `FUEL_LOW_LAPS`）
+
+    🔴 ①「永远保留」这条**不是只靠这里的顺序实现的** —— 顺序只在超预算时
+       决定谁先让位，而云润色根本不看这个函数。真正让它在云端也成立的是
+       `missing_mandatory()`：facts 里有 `lap_time_s` 而云句里没提 → 整句丢弃。
+       两处必须一起改，改一处等于没改。
+
+    🔴 圈速**主体**与 **vs_ref 差**拆成两段（`1:32.412` 与 `慢 0.37`）：
+       否则"主体+差"（15 字）会先把预算吃满，把更值钱的习惯弯挤掉。
+       拆开后习惯弯能和主体并排（8+15=23 ≤ 预算），差值反而先让位。
+
+    数字全部来自 facts —— 与本地模板、云润色**共用同一份白名单**。
+    """
+    budget = char_budget(P_NORMAL, "lap_advice") or 28
+    slots: list[str] = []
+
+    t = f.get("lap_time_s")
+    if t:
+        slots.append(fmt_lap_time(t))          # ① 主体，永远保留
+
+    left = f.get("laps_left")
+    unit = f.get("unit") or "油"
+    fuel_crit = left is not None and float(left) <= FUEL_CRIT_LAPS
+    if fuel_crit:
+        # 见底是安全信息：占高优先级，绝不被后面的低优先级挤掉。
+        slots.append(f"{unit}只够 {float(left):.1f} 圈，这圈进站")
+
+    lab = f.get("focus_label")
+    if lab:
+        slots.append(f"{lab} 连续 {f['focus_laps']} 圈慢 "
+                     f"{float(f['focus_loss_s']):.2f}")
+
+    d = f.get("vs_ref_s")
+    if d is not None and abs(d) >= 0.05 and t:
+        slots.append(f"{'慢' if d > 0 else '快'} {abs(d):.2f}")
+
+    sec, loss = f.get("sector"), f.get("loss_s")
+    if sec is not None and loss is not None:
+        slots.append(f"S{sec} 慢 {float(loss):.2f}")
+
+    if left is not None and not fuel_crit and float(left) <= FUEL_LOW_LAPS:
+        slots.append(f"{unit}够 {float(left):.1f} 圈")
+
+    out: list[str] = []
+    for p in slots:
+        if out and len("，".join(out + [p])) > budget:
+            continue
+        out.append(p)
+    return "，".join(out)
+
+
 # 🔴 有措辞层的 key（= R2.2 里"值得花一次云调用"的候选集）。
 #    不在表里的 key 保持原样：A 档短句、以及本身已经够口语的几句
 #    （"出界了，回到赛道" / "四轮打滑" / "换挡" / "给油晚了" …）。
 #    这张表是 R2.2 的唯一入口 —— 云润色只走这里列出的 key。
 RENDERERS = {
+    "lap_advice": lap_advice,
     "lap_summary": lap_summary,
     "sector_loss": sector_loss,
     "projected_lap": projected_lap,

@@ -122,6 +122,46 @@ class TestRoutes:
             html = r.read().decode("utf-8")
         assert "赛道工程师" in html
         assert "/api/v1/coach/state" in html
+        # 面板内嵌在自检页里（用户自选播报内容）
+        assert "/api/v1/coach/panel" in html
+
+
+class TestBroadcastPanel:
+    """播报开关面板：用户自选"什么内容播报、什么不播报"。"""
+
+    def test_panel_lists_groups(self, server):
+        code, d, _ = _get(server + "/api/v1/coach/panel")
+        assert code == 200
+        ids = [g["id"] for g in d["groups"]]
+        assert ids == ["safety", "driving", "tyres", "pace", "debrief"]
+        assert d["muted"] == []                 # 默认全开
+        assert all("muted" in g and "label" in g for g in d["groups"])
+
+    def test_panel_set_and_readback(self, server):
+        code, d = _post(server + "/api/v1/coach/panel",
+                        {"muted": ["tyres", "pace"]})
+        assert code == 200 and d["ok"] is True
+        assert d["muted"] == ["pace", "tyres"]  # 归一化：排序
+        _c, d2, _ = _get(server + "/api/v1/coach/panel")
+        assert d2["muted"] == ["pace", "tyres"]
+        # 生效：闸门配置同步更新
+        _c, cfg, _ = _get(server + "/api/v1/coach/config")
+        assert sorted(cfg["gate"]["muted"]) == ["pace", "tyres"]
+
+    def test_panel_rejects_unknown_group(self, server):
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            _post(server + "/api/v1/coach/panel", {"muted": ["nope"]})
+        assert ei.value.code == 400
+
+    def test_panel_rejects_non_list(self, server):
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            _post(server + "/api/v1/coach/panel", {"muted": "tyres"})
+        assert ei.value.code == 400
+
+    def test_panel_can_reopen_all(self, server):
+        _post(server + "/api/v1/coach/panel", {"muted": ["tyres"]})
+        _c, d = _post(server + "/api/v1/coach/panel", {"muted": []})
+        assert d["muted"] == []
 
 
 class TestServiceRobustness:
@@ -188,4 +228,7 @@ class TestVoicePreemption:
         assert "speechSynthesis.cancel()" in html
         assert "prio === 0" in html, "只有 P0 才抢占，否则会互相打断"
         # 播报时必须把优先级传进去（不传就等于永远不抢占）
-        assert "d.say[0].priority" in html
+        assert "say(u.speech || u.text, u.priority)" in html
+        # 🔴 R3 回归：A 档不得进"等云 TTS"分支 —— 云合成要 0.5~2 s，
+        #    让「出界了」等 0.9 s 就完全失去意义了。
+        assert "u.priority < P_NORMAL" in html

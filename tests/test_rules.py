@@ -327,28 +327,103 @@ class TestDelta:
 # —— 10. 圈后小结 ————————————————————————————————————
 
 class TestLapSummary:
+    """R2.4 起，圈后成绩并进 `lap_advice`（四条事实合成一句）；
+    `RuleConfig.lap_advice=False` 才退回单独的 `lap_summary`。默认 `feed()` 走合并。"""
+
     def test_reports_last_lap(self, rs, st, ref):
         us = feed(rs, st, ref=ref, last_lap_ms=92412.0)
-        ls = [u for u in us if u.key == "lap_summary"]
+        ls = [u for u in us if u.key == "lap_advice"]
         assert ls and ls[0].text.startswith("1:32.412")
 
     def test_compares_to_reference(self, rs, st, ref):
-        """R2.1 措辞：去掉了"比参考"（工程词），差值保留两位小数。
+        """成绩措辞：去掉了"比参考"（工程词），差值保留两位小数。
 
         "参考"对开车的人没有意义 —— 快慢是相对**自己**的，
-        所以文案只剩「1:32.412，慢 0.37」。数字一个没少。
+        所以文案里是「1:32.412，慢 0.37」。数字一个没少。
         """
         slower = (ref.lap_time_s + 0.37) * 1000.0
         ls = [u for u in feed(rs, st, ref=ref, last_lap_ms=slower)
-              if u.key == "lap_summary"]
+              if u.key == "lap_advice"]
         assert "慢 0.37" in ls[0].text and "参考" not in ls[0].text
         assert ls[0].evidence["vs_ref_s"] == pytest.approx(0.37, abs=0.02)
-        # 超预算的字一律不加 —— 长度是 R2.1 的验收口径（见 test_phrases）
+        # 闭合单条成绩时句子很短，远在预算内（见 test_phrases 的长度断言）
         assert len(ls[0].text) <= 24
 
     def test_no_last_lap_silent(self, rs, st, ref):
         assert [u for u in feed(rs, st, ref=ref, last_lap_ms=None)
-                if u.key == "lap_summary"] == []
+                if u.key == "lap_advice"] == []
+
+    def test_legacy_four_sentences_when_disabled(self, rs, st, ref):
+        """`lap_advice=False` → 退回旧行为：四条各自单说（成绩单独出现）。"""
+        rs.cfg.lap_advice = False
+        us = feed(rs, st, ref=ref, last_lap_ms=92412.0)
+        assert [u for u in us if u.key == "lap_summary"]
+        assert not [u for u in us if u.key == "lap_advice"]
+
+
+class TestLapAdvice:
+    """R2.4：圈后四条事实（成绩 / 最慢段 / 续航 / 习惯）合成**一句** `lap_advice`。
+
+    关键不是"信息更多"，而是"每圈恰好一条建议"—— 四条各说各的会撑爆
+    gate 的每圈额度，也让云润色每圈要打好几次。
+    """
+
+    @staticmethod
+    def _debrief(**kw):
+        c = Ctx(f=mk(last_lap_ms=92412.0), st=RuleSet.fresh_state(), **kw)
+        return [u for u in RuleSet(RuleConfig()).evaluate(c)
+                if u.key == "lap_advice"]
+
+    def test_merges_lap_time_and_worst_sector(self):
+        lap = _lap_result(5)
+        lap.sectors = [31.0, 41.0, 25.0]        # 最亏在 S2（40 → 41）
+        u = self._debrief(lap=lap,
+                          theory=_theory([30.0, 40.0, 25.0], [3, 3, 3],
+                                         gain=0.8))
+        assert u, "有成绩 + 分段就该有一条综合建议"
+        t = u[0].text
+        assert t.startswith("1:32.412")         # 成绩打头
+        assert "S2 慢 1.00" in t, t
+        # 四条的事实都要带上（云润色吃这同一份 facts）
+        assert "lap_time_s" in u[0].evidence and "sector" in u[0].evidence
+
+    def test_habit_beats_delta_and_sector_when_budget_tight(self):
+        """预算装不下全部时，跨圈的**习惯弯**优先于 delta / 单圈最慢段。"""
+        lap = _lap_result(5)
+        lap.sectors = [31.0, 41.0, 25.0]
+        u = self._debrief(lap=lap,
+                          corners={"habit": {"label": "T1", "laps": 3,
+                                             "median_loss_s": 0.40,
+                                             "metric": 0.40, "ls_share": 0.0}},
+                          theory=_theory([30.0, 40.0, 25.0], [3, 3, 3],
+                                         gain=0.8))
+        t = u[0].text
+        assert "T1 连续 3 圈慢 0.40" in t, t
+        assert not phrases.over_budget(t, 2, "lap_advice"), t
+
+    def test_fuel_critical_gets_pit_advice(self):
+        u = self._debrief(fuel={"per_lap": 8.0, "level": 8.0,
+                                "laps_left": 0.8, "samples": 3})
+        assert u and "进站" in u[0].text, u
+
+    def test_silent_when_nothing_to_report(self, rs, st, ref):
+        """无成绩、无油量、无分段、无习惯 → 静默（不硬凑一句话）。"""
+        assert [u for u in RuleSet(RuleConfig()).evaluate(
+            Ctx(f=mk(), ref=ref, st=st)) if u.key == "lap_advice"] == []
+
+    def test_every_number_is_in_evidence(self):
+        """合并句里出现的每个数字都要能在它自己的 evidence 里找到。"""
+        lap = _lap_result(5)
+        lap.sectors = [31.0, 41.0, 25.0]
+        u = self._debrief(lap=lap,
+                          fuel={"per_lap": 8.0, "level": 8.0,
+                                "laps_left": 0.8, "samples": 3},
+                          corners={"habit": {"label": "T1", "laps": 3,
+                                             "median_loss_s": 0.40,
+                                             "metric": 0.40, "ls_share": 0.0}},
+                          theory=_theory([30.0, 40.0, 25.0], [3, 3, 3],
+                                         gain=0.8))
+        assert not phrases.invented_numbers(u[0].text, u[0].evidence)
 
 
 def test_fmt_lap_time():
@@ -626,10 +701,25 @@ class TestTtlFitsSpeech:
     所以"不超预算"和"不超 ttl"两件事不会各说各话。
     """
 
-    def test_lap_summary_fits(self, rs, st, ref):
+    def test_lap_advice_fits(self, rs, st, ref):
         u = [x for x in feed(rs, st, ref=ref, last_lap_ms=(ref.lap_time_s + 0.37) * 1000)
-             if x.key == "lap_summary"][0]
+             if x.key == "lap_advice"][0]
         assert phrases.speech_s(u.text) <= u.ttl_s, (u.text, u.ttl_s)
+
+    def test_lap_advice_worst_case_fits(self, rs, st, ref):
+        """最坏输入：成绩 + 油见底 + 习惯弯 + 最慢段**全都在**，
+        合并句仍必须念得完（贪心装填保证不超预算 → 不超 ttl）。"""
+        c = Ctx(f=mk(last_lap_ms=92412.0), lap=_lap_result(5), st=st, ref=ref,
+                fuel={"per_lap": 8.0, "level": 8.0, "laps_left": 0.8,
+                      "samples": 3},
+                corners={"habit": {"label": "T12", "laps": 12,
+                                   "median_loss_s": 1.234,
+                                   "metric": 1.234, "ls_share": 0.9}},
+                theory=_theory([30.0, 40.0, 25.0], [3, 3, 3], gain=0.8))
+        u = [x for x in RuleSet(RuleConfig()).evaluate(c)
+             if x.key == "lap_advice"][0]
+        assert phrases.speech_s(u.text) <= u.ttl_s, (u.text, u.ttl_s)
+        assert not phrases.over_budget(u.text, 2, "lap_advice"), u.text
 
     def test_sector_loss_fits(self, rs, st):
         lap = _lap_result(5)
@@ -637,7 +727,7 @@ class TestTtlFitsSpeech:
         c = Ctx(f=mk(), lap=lap, theory=_theory([30.0, 40.0, 25.0],
                                                 [3, 3, 3], gain=0.8), st=st)
         u = [x for x in RuleSet(RuleConfig()).evaluate(c)
-             if x.key == "sector_loss"][0]
+             if x.key == "lap_advice"][0]
         assert phrases.speech_s(u.text) <= u.ttl_s, (u.text, u.ttl_s)
 
     def test_projected_lap_fits(self, rs, st, ref):

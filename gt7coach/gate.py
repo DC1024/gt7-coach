@@ -15,6 +15,10 @@
 
 外加一条**弯中禁言**：|G| 大时只念 `short`（≤ 4 字），长句憋着不说 ——
 因为玩家那时手上没空听句子，只来得及处理一个词。
+
+再加一道**面板开关**（用户自选）：`GateConfig.muted` 里的内容分组整类拦下，
+对应"面板上关掉某个开关"。它在四道闸**之前**生效（先过滤用户不想听的，
+再在剩下的里做冷却/限量竞争），单独计进 `st["muted"]`。分组口径见 `panel.py`。
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from .contract import P_CRITICAL, Utterance
+from .panel import group_of_key
 
 
 @dataclass
@@ -36,9 +41,17 @@ class GateConfig:
     max_critical_per_lap: int = 12    # 紧急播报单独计数，不占上面那个额度
     g_loud: float = 0.8               # |G| 超过它 → 只念 short
     max_per_tick: int = 1             # 一次 tick 最多说几句（默认 1）
+    # 面板上被用户**关掉**的内容分组（见 panel.GROUPS）。
+    # 空 = 全开（默认，与加这个功能之前完全一致）。
+    muted: tuple[str, ...] = ()
 
-    def enabled(self, u: Utterance) -> bool:  # pragma: no cover - 便于将来扩展
-        return True
+    def enabled(self, u: Utterance) -> bool:
+        """这条该不该放行 —— 面板开关的落点。
+
+        关掉一个分组 = 整类不出闸门；**没被任何分组认领的 key 永远放行**
+        （见 panel 模块头：宁可多播，也不要被一个没登记的开关悄悄吞掉）。
+        """
+        return not self.muted or group_of_key(u.key) not in self.muted
 
 
 class Gate:
@@ -60,6 +73,7 @@ class Gate:
             "spoken_critical_lap": 0,
             "keys_lap": set(),
             "dropped": 0,
+            "muted": 0,        # 被面板开关关掉（与"闸门竞争掉"分开计数）
         }
 
     def _roll_lap(self, st: dict, lap: int) -> None:
@@ -76,6 +90,17 @@ class Gate:
         """从候选里挑出真正要说的话（已按优先级排序、已应用弯中禁言）。"""
         self._roll_lap(st, lap)
         cfg = self.cfg
+        # —— 面板开关：被用户关掉的分组，整类在出口拦下 ——
+        # 放在最前面（排序/冷却之前）：这些不是"竞争失败"，而是"用户不想听"，
+        # 单独计进 st["muted"]，别和 dropped 混在一起（排障时两者含义不同）。
+        if cfg.muted:
+            kept: list[Utterance] = []
+            for u in cands:
+                if cfg.enabled(u):
+                    kept.append(u)
+                else:
+                    st["muted"] += 1
+            cands = kept
         out: list[Utterance] = []
         # 排序：优先级升序（0 最急）；同级按 key 稳定排序，
         # 避免 dict/集合迭代顺序让"这次说哪句"变得不可复现。

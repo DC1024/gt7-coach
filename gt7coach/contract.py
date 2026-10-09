@@ -164,6 +164,15 @@ class Utterance:
     ttl_s: float = 4.0
     short: str = ""
     evidence: dict[str, Any] = field(default_factory=dict)
+    # 语音专用串：把 `text` 里的阿拉伯数字逐位中文化（54→五四，更贴近真实
+    # 无线电播报）。屏幕显示仍用 `text`（保留原样数字便于扫读）；旧版教练/
+    # 未开启时该字段为 None，消费方应退回 `text`。见 `phrases.spell_digits`。
+    speech: str | None = None
+    # R3 云 TTS：这句的合成音频地址（相对路径，如 /api/v1/coach/tts/<hash>.mp3）。
+    # 🔴 None = **还没有**，不是错误 —— 云合成要 0.5~2 s 的后台时间，消费方
+    #    应当先用浏览器 `speechSynthesis` 顶上（或短暂等待后再取），
+    #    绝不要因为它是 None 就不播。A 档（出界/打滑/刹车点/换挡）永远为 None。
+    tts_url: str | None = None
 
     def __post_init__(self) -> None:
         if not self.short:
@@ -177,6 +186,8 @@ class Utterance:
             "priority": self.priority,
             "ttl_s": round(self.ttl_s, 2),
             "evidence": self.evidence,
+            "speech": self.speech,
+            "tts_url": self.tts_url,
         }
 
 

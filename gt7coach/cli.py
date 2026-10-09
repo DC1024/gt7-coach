@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 
@@ -28,8 +29,82 @@ def _fix_console() -> None:
             pass
 
 
-def _build(args) -> CoachEngine:
-    cfg = CoachConfig(poll_interval_s=args.interval)
+def _resolve_ref_cache_dir(args) -> str | None:
+    """参考圈本地缓存目录：CLI > 环境变量 > 禁用。
+
+    这是「根治前几圈瞎播报」的第二条杠杆。生产容器里挂一个持久卷
+    （如 /opt/gt7-coach/data/refcache）并设好这个目录，下次同赛道就能
+    跳过服务端历史搜索的冷启动，教练从第 1 圈起就有靠谱参考。
+    """
+    d = getattr(args, "ref_cache_dir", None)
+    if not d:
+        d = os.environ.get("GT7_COACH_REF_CACHE_DIR")
+    return d or None
+
+
+def _resolve_tts(args, *, auto: bool = True) -> dict[str, object]:
+    """R3 云 TTS 的开关与参数：CLI > 环境变量 > 禁用。
+
+    与参考圈缓存同构，但多一个「自动开」的语义 —— 凑齐两样就开：
+      ① 业务空间 ID：--tts-workspace / GT7_COACH_TTS_WORKSPACE
+      ② 本地缓存目录：--tts-cache-dir / GT7_COACH_TTS_CACHE_DIR
+    key 不在这里传，复用 R2.2 那一把 GT7_COACH_LLM_KEY（百炼的 key 是业务
+    空间级的，语音和语言模型不分开授权）。
+
+    `auto=False` 用于 `replay`：离线调参不该偷偷联网、更不该白花钱。
+    那时只有显式 `--tts` 才开（`--tts` 与 `--no-tts` 都是三态：
+    不写 = None = 交给这里的自动判断）。
+
+    🔴 这里只解析意图，不保证一定生效 —— 缓存目录是否可写由 TtsEngine
+       再查一遍。所以「配了却没声音」时不能只看这里，要看 `disabled_reason`。
+    """
+    ws = (getattr(args, "tts_workspace", None)
+          or os.environ.get("GT7_COACH_TTS_WORKSPACE") or "").strip()
+    cache = (getattr(args, "tts_cache_dir", None)
+             or os.environ.get("GT7_COACH_TTS_CACHE_DIR"))
+    flag = getattr(args, "tts", None)          # True / False / None(没写)
+    if flag is None:
+        # 🔴 判据是 `ws or cache` 而不是 `ws and cache`。
+        #    只给了 workspace（忘了缓存目录）时，如果判成"没打算开"，启动横幅会
+        #    说"未开启（cfg.enabled=false）"—— 用户明明想开，却被告知没开，
+        #    真正的缺失项（cache_dir）反而看不见。这里放行成 enabled=True，
+        #    让引擎去说**准确**的原因（"未配置 cache_dir"）。
+        #    引擎那边 enabled 仍为 False → 不起 worker、一次网络都不会有。
+        intent = bool(ws or cache)
+        enabled = intent if auto else False
+    else:
+        enabled = bool(flag)
+    return {
+        "tts_enabled": enabled,
+        "tts_workspace_id": ws,
+        "tts_cache_dir": cache or None,
+        "tts_voice": getattr(args, "tts_voice", None) or "",
+        "tts_model": getattr(args, "tts_model", None) or "",
+    }
+
+
+def _print_tts_state(engine: CoachEngine) -> None:
+    """把云 TTS 的落地状态打出来。缺一样就静默降级是设计如此，但**必须
+    说一声**：否则"配置明明写了却没声音"会变成一场排查噩梦。"""
+    st = engine.tts.status()
+    if st["enabled"]:
+        print(f"[gt7coach] 云 TTS 已启用  {st['provider']}/{st['model']}"
+              f"  音色 {st['voice']}  {st['format']}/{st['sample_rate']}Hz"
+              f"  缓存已存 {st['cache_files']} 条"
+              f"  {st['price_yuan_per_kchar']} 元/千字符"
+              f"  key={'有' if st['has_key'] else '缺'}")
+    elif engine.cfg.tts_enabled or st["workspace_id"] or st["has_key"]:
+        # 只要"碰过"这件事就出声：显式开了、给了 workspace、或环境里有 key。
+        # 全都空 = 从没打算用，那就别在启动日志里制造噪音。
+        print(f"[gt7coach] 云 TTS 未启用：{st['disabled_reason']}"
+              f"（B 档句回落浏览器 TTS，不影响 A 档）")
+
+
+def _build(args, *, tts_auto: bool = True) -> CoachEngine:
+    cfg = CoachConfig(poll_interval_s=args.interval,
+                      cloud_path=getattr(args, "cloud", None),
+                      ref_cache_dir=_resolve_ref_cache_dir(args),
+                      **_resolve_tts(args, auto=tts_auto))
     if args.demo:
         from .synth import synth_lap_frames, synth_profile
         frames = synth_lap_frames(laps=3)
@@ -60,6 +135,29 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--interval", type=float, default=0.1,
                        help="tick 间隔秒数，缺省 0.1（10Hz）")
         p.add_argument("--timeout", type=float, default=3.0)
+        p.add_argument("--cloud", default=None,
+                       help="cloud.json 路径（R2.2 云润色；不填=纯本地模板）")
+        p.add_argument("--ref-cache-dir", default=None,
+                       help="参考圈本地缓存目录（根治前几圈瞎播报的第二条杠杆）；"
+                            "不填则读 GT7_COACH_REF_CACHE_DIR，都没有=禁用")
+        # —— R3 云 TTS：给 B 档句合成真人嗓子 ——
+        # A 档（刹车晚/打滑/出界）永远走浏览器 TTS，**任何参数都不会改变
+        # 这一点**：云合成要 0.5~2s，来不及抢麦。
+        p.add_argument("--tts", action="store_true", default=None,
+                       help="开启云 TTS（B 档句）。不写=看下面两项是否配齐")
+        p.add_argument("--no-tts", action="store_false", dest="tts",
+                       help="强制关闭云 TTS（优先级最高，用于临时排查）")
+        p.add_argument("--tts-workspace", default=None, metavar="WS_ID",
+                       help="百炼业务空间 ID（ws- 开头，不是密钥）；"
+                            "不填则读 GT7_COACH_TTS_WORKSPACE")
+        p.add_argument("--tts-cache-dir", default=None,
+                       help="合成音频缓存目录（必填才会启用 —— 没缓存=每句都"
+                            "真花钱）；不填则读 GT7_COACH_TTS_CACHE_DIR")
+        p.add_argument("--tts-voice", default=None,
+                       help="音色（缺省 longanyang/龙安洋）")
+        p.add_argument("--tts-model", default=None,
+                       help="模型（缺省 cosyvoice-v3-flash；注意 v3.5 系列"
+                            "不支持系统音色）")
         p.add_argument("--verbose", action="store_true")
         if name == "demo":
             p.set_defaults(demo=True)
@@ -88,6 +186,7 @@ def main(argv: list[str] | None = None) -> int:
         return _replay(args)
 
     engine = _build(args)
+    _print_tts_state(engine)
 
     if args.cmd == "once":
         for _ in range(5):            # 多跑几次让参考圈有机会到位
@@ -164,8 +263,22 @@ def _replay(args: argparse.Namespace) -> int:
     if not src._frames:
         print(f"[replay] {args.session} 里没有可回放的帧", file=sys.stderr)
         return 2
-    cfg = CoachConfig(poll_interval_s=0.0)
+    tts = _resolve_tts(args, auto=False)
+    cfg = CoachConfig(poll_interval_s=0.0,
+                      cloud_path=getattr(args, "cloud", None),
+                      ref_cache_dir=_resolve_ref_cache_dir(args),
+                      # auto=False：replay 是离线调参，不联网、不花钱。
+                      # 想顺便验云 TTS 就显式加 --tts（下面会警告一次）。
+                      **tts)
     eng = CoachEngine(src, cfg, clock=src.clock)
+    if eng.tts.enabled:
+        print("[replay] ⚠ 云 TTS 已开启：下面会真的调百炼合成"
+              f"（按 {eng.cfg.tts_config().price_yuan_per_kchar} 元/千字符计费）。"
+              "只想看文本的话去掉 --tts。")
+    elif tts["tts_workspace_id"] or tts["tts_cache_dir"]:
+        # 配了却没说一句，用户会以为配置被忽略了 —— 明说这是 replay 的有意行为
+        print("[replay] 云 TTS 默认关闭（离线调参不联网、不花钱）。"
+              "要顺带验合成再加 --tts。")
     if args.sectors:
         eng.rules.cfg.sectors_n = int(args.sectors)
         eng._sectors.n_sectors = int(args.sectors)

@@ -44,6 +44,19 @@ def drive(eng, n, sleep=0.0):
     return st
 
 
+def drive_until_lap(eng, lap_n, max_iter=4000):
+    """一直 tick 到「第 lap_n 圈已结算」为止（_prev_lap.lap >= lap_n）。
+
+    比数帧数稳健：合成一圈的帧数不固定，靠「圈号」判定才不会因为
+    多跑/少跑几十帧而误判。
+    """
+    for _ in range(max_iter):
+        eng.tick()
+        if eng._prev_lap is not None and eng._prev_lap.lap >= lap_n:
+            return True
+    return False
+
+
 def wait_ref(eng, source="profile", timeout=4.0):
     """等到参考圈就位。
 
@@ -76,24 +89,34 @@ class TestRefAcquisition:
         assert wait_for(lambda: src.profile_calls >= 1)
         assert src.profile_calls == 1, src.profile_calls
 
-    def test_falls_back_to_self_built_after_one_lap(self):
-        """Dash 没有 /profile（或取失败）→ 第一圈纯记录，第二圈起自攒可用。"""
+    def test_falls_back_to_self_built_after_two_laps(self):
+        """Dash 没有 /profile（或取失败）→ 前两圈（含出场圈）纯记录，
+        第 2 圈跑完才开始自攒可用。
+
+        🔴 这正是「前几圈瞎播报」的根治点：`self_ref_min_lap=2` 让第 1 圈
+        （出场 / 暖胎圈，慢且不具代表性）不参与自攒参考圈的标定，
+        否则第 2~3 圈的刹车点 / 弯心速度全建在慢圈上 → 用户感知的瞎播报。
+        """
         eng, _src = make_engine(with_profile=False)
         drive(eng, 5)
         # 第一圈内：还没有任何参考
         assert eng._current_ref() is None
         assert not drive(eng, 1).ref_ready
-        # 跑过一整圈（10Hz × 约 70 s ≈ 700 帧）
-        for _ in range(750):
-            st = eng.tick()
-        assert st.ref_ready, "第二圈开始应当有自攒参考圈"
+        # 跑过第 1 圈：它刚结算，但按 self_ref_min_lap=2 它**不能**成为参考圈
+        assert drive_until_lap(eng, 1)
+        assert eng._self_ref is None, "第 1 圈不应进入自攒参考圈"
+        # 再跑过第 2 圈：自攒参考圈就位
+        assert drive_until_lap(eng, 2)
+        st = eng.tick()
+        assert st.ref_ready, "第 2 圈跑完应当有自攒参考圈"
         assert st.stats["ref_source"] == "self"
         assert st.stats["ref_state"] == "failed", "取不到 profile 要如实说明"
 
     def test_self_built_ref_comes_with_warning(self):
         eng, _src = make_engine(with_profile=False)
-        for _ in range(760):
-            eng.tick()
+        # 自攒参考圈最早在第 2 圈跑完才建（self_ref_min_lap=2）
+        assert drive_until_lap(eng, 2)
+        eng.tick()
         ref = eng._current_ref()
         assert ref is not None and ref.source == "self"
         assert any("10Hz" in w for w in ref.warnings)
@@ -117,8 +140,9 @@ class TestSessionChange:
     def test_self_ref_invalidated_on_new_session(self):
         """换场次必须丢掉自攒参考圈 —— 留着它 = 拿上一条赛道的折线定位。"""
         eng, src = make_engine(with_profile=False)
-        for _ in range(760):
-            eng.tick()
+        # 自攒参考圈最早在第 2 圈跑完才建（self_ref_min_lap=2）
+        assert drive_until_lap(eng, 2)
+        eng.tick()
         assert eng._self_ref is not None
         src._session = {"file": "another.jsonl", "live": True,
                         "best_lap_s": 88.0}
@@ -597,7 +621,9 @@ class TestCornerHabitEndToEnd:
         for _ in range(2900):
             st = eng.tick()
             for u in st.say:
-                if u.key.startswith("corner_habit"):
+                # R2.4 起习惯弯并进 `lap_advice`（不再单独发 corner_habit@）；
+                # 用"文本点名 T1"识别含习惯的那条合并句。
+                if u.key == "lap_advice" and "T1" in u.text:
                     fired.append((st.lap, u.text))
             if eng._corners.habit():
                 habit = eng._corners.habit()
@@ -621,7 +647,8 @@ class TestCornerHabitEndToEnd:
         for _ in range(2900):
             st = eng.tick()
             for u in st.say:
-                if u.key.startswith("corner_habit"):
+                # 习惯弯并进 lap_advice（见上一条）；按"点名 T1"识别。
+                if u.key == "lap_advice" and "T1" in u.text:
                     laps_spoken.append(st.lap)
         assert laps_spoken, "应当至少播报一次"
         if len(laps_spoken) > 1:
@@ -684,11 +711,12 @@ class TestCornerAccountingOncePerLap:
         for _ in range(len(frames) + 50):
             st = eng.tick()
             for u in st.say:
-                if u.key.startswith("corner_habit"):
+                # 习惯弯并进 lap_advice；含习惯的合并句 evidence 里带 focus_*。
+                if u.key == "lap_advice" and "focus_label" in u.evidence:
                     spoken.append(u)
         assert spoken, "6 圈之后应当播报过"
         for u in spoken:
-            n = u.evidence["laps"]
+            n = u.evidence["focus_laps"]
             # 🔴 只能校验「文本自洽」与「当时至少够门槛」，**不能**拿
             #    `eng._corners.losses` 的**当前长度**去比 —— 那是"事后状态"，
             #    而播报是第 3 圈那一刻发生的（之后样本还在继续增长）。
@@ -696,4 +724,37 @@ class TestCornerAccountingOncePerLap:
             #    「用活的、会继续增长的状态去校验过去的事件」是个通用陷阱。
             assert n >= 3, f"样本不足就不该播报：{u.evidence}"
             assert f"连续 {n} 圈" in u.text, u.text
-            assert u.evidence["label"] in u.text
+            assert u.evidence["focus_label"] in u.text
+
+
+class TestSpeechDigits:
+    """🔴 语音串（speech）必须随 utterance 一起产出，且是逐位中文。
+
+    这是「语音报数字 54→五四」的端到端落点：引擎在闸门之后给每条要说的话贴
+    上 `speech`（屏幕用的 `text` 仍是原样 54 / 115，便于扫读）。用不依赖参考圈的
+    胎温过热规则触发，它产出带数字的话「左前胎过热 115」。
+    """
+
+    def test_engine_attaches_digit_by_digit_speech(self):
+        frames = [Frame(t=i * 0.1, lap_time_s=i * 0.1, lap=1,
+                        tyre_temp=(115.0, 100.0, 100.0, 100.0),
+                        speed_kph=30.0) for i in range(40)]
+        # session=None → 后台不去取参考圈，测试完全确定性、不依赖异步线程。
+        src = ReplaySource(frames, profile=None, session=None, loop=False)
+        eng = CoachEngine(src, CoachConfig(poll_interval_s=0.1,
+                                           sess_poll_boot_s=999,
+                                           sess_poll_idle_s=999))
+        got = None
+        for _ in range(50):
+            st = eng.tick()
+            if st.say:
+                got = st.say[0]
+                break
+        assert got is not None, "应触发胎温过热播报"
+        assert got.text == "左前胎过热 115"
+        # 语音走逐位中文，屏幕 text 保持原样
+        assert got.speech == "左前胎过热 一一五"
+        # 序列化到 /api/v1/coach/state 时也带 speech，仪表盘据此播报
+        assert got.to_dict()["speech"] == "左前胎过热 一一五"
+        # 字符数等价 → ttl 预算无需因这一层重算
+        assert len(got.speech) == len(got.text)

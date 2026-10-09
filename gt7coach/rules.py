@@ -24,6 +24,12 @@
 | `lap_summary`           | P3 | 每圈结束时报上一圈成绩 |
 | `sector_loss`           | P2 | 圈后：指出相对「各段最好值」最慢的那一段（差 >0.15s）|
 | `fuel_range`            | P2 | 圈后：按本场油耗中位数算还能跑几圈（≤3 圈才报）|
+| `next_focus`            | P2 | 圈后：同一个弯连续 N 圈反复亏 → 提醒（隔 3 圈才提第二次）|
+| `lap_advice`            | P2 | **R2.4**：把上面四条事实合并成**一句**圈后综合建议（每圈一次）|
+
+> `lap_advice`（R2.4）：默认 `RuleConfig.lap_advice=True` 时，圈后**只发这一条**
+> 合并句（`lap_summary`/`sector_loss`/`fuel_range`/`next_focus` 的**判断**照跑、
+> 事实照收，只是不再各自单独播报）；设 `False` 退回旧的四条各自单说。
 
 🔴 `brake_late` 是 P0 而不是 P1，两个理由：
    ① 它是「现在就得动作」的话，和出界/打滑同一性质；
@@ -56,6 +62,7 @@ if TYPE_CHECKING:      # 只为注解，避免 rules↔lapstats 循环 import
 from . import phrases
 from .contract import (Frame, P_CRITICAL, P_HIGH, P_LOW, P_NORMAL,
                        Utterance)
+from .narrate import Narrator
 from .refindex import RefLap
 
 # 🔴 措辞（怎么说）已经搬到 `phrases.py`，判断（什么时候说）留在这里。
@@ -129,6 +136,12 @@ class RuleConfig:
     # 隔 3 圈 = 提醒之后给你 3 圈去改，改不好再提。
     corner_repeat_laps: int = 3
 
+    # —— R2.4 圈后综合建议 ——
+    # True（默认）：把 lap_summary / sector_loss / fuel_range / next_focus 四条
+    #   事实合并成**一句** `lap_advice`（每圈一条，云润色只调用一次）。
+    # False：退回旧行为 —— 四条各自单说（保留给逐条调试 / A-B 对比用）。
+    lap_advice: bool = True
+
 
 @dataclass
 class Ctx:
@@ -151,8 +164,13 @@ class Ctx:
 class RuleSet:
     """无状态规则 + 有状态累积器（累积器都放在 ctx.st 里）。"""
 
-    def __init__(self, cfg: RuleConfig | None = None):
+    def __init__(self, cfg: RuleConfig | None = None,
+                 narrator: "Narrator | None" = None):
         self.cfg = cfg or RuleConfig()
+        # 措辞层：规则只产出 facts，最终句子交给 narrator 渲染。
+        # 不传 narrator 时退化为「禁用态 narrator」→ 直接出本地模板，
+        # 判断逻辑与输出都与 R2.1 完全一致（既有测试零改动）。
+        self.narrator = narrator or Narrator()
 
     @staticmethod
     def fresh_state() -> dict[str, Any]:
@@ -186,11 +204,23 @@ class RuleSet:
         for fn in (self._off_track, self._wheel_slip, self._brake_warn,
                    self._brake_late, self._apex_slow, self._throttle_late,
                    self._shift, self._tyre_temp, self._delta,
-                   self._lap_summary, self._projected_lap,
-                   self._sector_loss, self._fuel_range, self._next_focus):
+                   self._projected_lap):
             u = fn(c)
             if u is not None:
                 out.append(u)
+        # —— 圈后播报（R2.4）——
+        # 默认把四条事实合并成**一句** `lap_advice`（每圈一条；云润色因此
+        # 每圈最多花一次）。`lap_advice=False` 时退回旧的四条各自单说。
+        if self.cfg.lap_advice:
+            u = self._lap_debrief(c)
+            if u is not None:
+                out.append(u)
+        else:
+            for fn in (self._lap_summary, self._sector_loss,
+                       self._fuel_range, self._next_focus):
+                u = fn(c)
+                if u is not None:
+                    out.append(u)
         return out
 
     # —— 1. 出界 ———————————————————————————————————————
@@ -481,7 +511,7 @@ class RuleSet:
         if c.ref is not None and c.ref.lap_time_s > 0:
             ev["vs_ref_s"] = round(sec - c.ref.lap_time_s, 3)
             ev["ref_lap_time_s"] = round(c.ref.lap_time_s, 3)
-        txt = phrases.render("lap_summary", ev)
+        txt = self.narrator.render("lap_summary", ev)
         return Utterance(key="lap_summary", text=txt, priority=P_LOW,
                          ttl_s=phrases.ttl_for(txt, P_LOW, "lap_summary"),
                          short=txt, evidence=ev)
@@ -521,7 +551,7 @@ class RuleSet:
         # 🔴 ttl 2.0 s 与句子长度是绑在一起的：R2.1 定为「预计 1:11.010」
         #    （11 字 ≈ 2.4 s 语音）。要加长这句，ttl 必须同时加长 ——
         #    tests/test_rules.py::TestTtlFitsSpeech 守着这个等式。
-        txt = phrases.render("projected_lap", ev)
+        txt = self.narrator.render("projected_lap", ev)
         return Utterance(key="projected_lap", text=txt,
                          priority=P_LOW,
                          ttl_s=phrases.ttl_for(txt, P_LOW, "projected_lap"),
@@ -564,7 +594,7 @@ class RuleSet:
         gain = c.theory.get("gain_s")
         if gain and gain >= cfg.sector_loss_min_s:
             ev["gain_s"] = round(gain, 3)
-        txt = phrases.render("sector_loss", ev)
+        txt = self.narrator.render("sector_loss", ev)
         return Utterance(key="sector_loss", text=txt, priority=P_NORMAL,
                          ttl_s=phrases.ttl_for(txt, P_NORMAL, "sector_loss"),
                          short=f"S{idx + 1} 慢 {loss:.1f}",
@@ -584,7 +614,7 @@ class RuleSet:
                               "per_lap": c.fuel.get("per_lap"),
                               "level": c.fuel.get("level"),
                               "powertrain": c.f.powertrain or None}
-        txt = phrases.render("fuel_range", ev)
+        txt = self.narrator.render("fuel_range", ev)
         return Utterance(
             key="fuel_range", text=txt,
             priority=P_NORMAL,
@@ -626,7 +656,7 @@ class RuleSet:
         if c.lap.lap - last < self.cfg.corner_repeat_laps:
             return None
         seen[h["label"]] = c.lap.lap
-        txt = phrases.render("next_focus", h)
+        txt = self.narrator.render("next_focus", h)
         return Utterance(
             key=f"corner_habit@{h['label']}",
             text=txt,
@@ -634,3 +664,57 @@ class RuleSet:
             ttl_s=phrases.ttl_for(txt, P_NORMAL, "next_focus"),
             short=f"重点 {h['label']}",
             evidence=h)
+
+    # —— 15. 圈后综合建议（R2.4）————————————————————————————
+    #
+    # 把上面四条（成绩 / 最慢段 / 续航 / 习惯）的事实**合并成一句**播报。
+    #
+    # 🔴 判断逻辑一行没搬：`_lap_summary` / `_sector_loss` / `_fuel_range` /
+    #    `_next_focus` 仍是各自负责"什么时候该说、事实是什么"的地方，本方法
+    #    只是把它们**已经产出的** `evidence` 收上来、按优先级拼成一句。
+    #    这样"哪个弯算习惯""油够不够"这些判断不会在这里被复制成第二份
+    #    （复制 = 迟早分叉）。合并只做一件事：把四条缩短成一条。
+    #
+    # 🔴 为什么是"合并"而不是"再加一条"：方案 §4 的验收口径是「每圈恰 1 条
+    #    建议」。四条各说各的再加一条综合 = 每圈 5 句，既超出 gate 的每圈额度，
+    #    也让云润色每圈要打 4~5 次。合并后每圈恰好一次云调用（`limits.per_lap`）。
+
+    def _lap_debrief(self, c: Ctx) -> Utterance | None:
+        facts: dict[str, Any] = {}
+
+        ls = self._lap_summary(c)          # 成绩：lap_time_s（可能还有 vs_ref_s）
+        if ls is not None:
+            for k in ("lap_time_s", "vs_ref_s", "ref_lap_time_s"):
+                if k in ls.evidence:
+                    facts[k] = ls.evidence[k]
+
+        fu = self._fuel_range(c)           # 续航：只在"警告区"（≤fuel_warn_laps）才有
+        if fu is not None:
+            facts["unit"] = fu.evidence.get("unit")
+            facts["laps_left"] = fu.evidence.get("laps_left")
+
+        se = self._sector_loss(c)          # 最慢段
+        if se is not None:
+            facts["sector"] = se.evidence.get("sector")
+            facts["loss_s"] = se.evidence.get("loss_s")
+
+        nf = self._next_focus(c)           # 习惯弯（含"隔几圈提醒一次"的副作用）
+        if nf is not None:
+            h = nf.evidence
+            facts["focus_label"] = h.get("label")
+            facts["focus_laps"] = h.get("laps")
+            facts["focus_loss_s"] = h.get("median_loss_s")
+
+        # 四条都空 = 这一圈没什么可说的（如第 1 圈残圈、且无油量/习惯）→ 静默
+        if not any(k in facts for k in
+                   ("lap_time_s", "laps_left", "sector", "focus_label")):
+            return None
+
+        txt = self.narrator.render("lap_advice", facts)
+        if not txt:
+            return None
+        return Utterance(
+            key="lap_advice", text=txt, priority=P_NORMAL,
+            ttl_s=phrases.ttl_for(txt, P_NORMAL, "lap_advice"),
+            short=txt.split("，")[0],
+            evidence=facts)

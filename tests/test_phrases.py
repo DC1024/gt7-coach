@@ -15,8 +15,10 @@ import pytest
 
 from gt7coach import phrases
 from gt7coach.phrases import (MAX_CHARS_DEFAULT, MAX_CHARS_OVERRIDE,
-                              fact_allow, fmt_lap_time, invented_numbers,
-                              numbers_in, over_budget, render)
+                              fact_allow, fmt_lap_time, invented_advice,
+                              invented_numbers, lap_time_tokens,
+                              missing_mandatory, numbers_in, over_budget,
+                              render, spell_digits)
 
 
 # ===========================================================================
@@ -49,6 +51,17 @@ class TestFactAllow:
         a = fact_allow({"ok": True})
         assert "1" not in a and "True" not in a
 
+    def test_two_decimal_lap_time_form_allowed(self):
+        """`1:23.45`（两位小数）是同一个值的另一种精度写法，不是"编数字"。
+
+        🔴 真机教训：不加这一条，一句完全正确的云句会**因为少打一个 0**
+           被白名单整句丢掉 —— 症状是"回落率高得莫名其妙"。
+           注意 `83.45` 的两位小数形是 `23.45`（秒数），不是 `83.45`。
+        """
+        f = {"lap_time_s": 83.45}
+        assert invented_numbers("1:23.45", f) == []
+        assert "23.45" in fact_allow(f)
+
     def test_none_ignored(self):
         a = fact_allow({"vs_ref_s": None, "lap_time_s": 92.412})
         assert "0" not in a or "92.412" in a
@@ -71,6 +84,175 @@ class TestInventedNumbers:
 
     def test_numbers_in_lists(self):
         assert numbers_in("T3 连续 3 圈慢 0.42") == ["3", "3", "0.42"]
+
+
+# ===========================================================================
+# 第二、三道闸 —— 白名单**查不出**的两种毛病
+# ===========================================================================
+#
+# 🔴 为什么白名单不够（真 key 冒烟 2026-10-09 抓到的两个缺口，都不是"编数字"）：
+#
+#   ① 丢了主体：`invented_numbers` 问的是"句中出现、但 facts 里没有的数字"，
+#      对**少说了一个数**完全无感。实测云句两次都把圈速主体丢了，而且丢得
+#      毫无痕迹 —— 不记违规、不回落、读起来还很顺。
+#   ② 编了建议：模型改用**不带数字的指令**绕过白名单（实测「注意补油」，
+#      而 facts 里 `laps_left=2.3`）。这条更危险：它是**指令**，
+#      车手可能真去提前进站。
+#
+# 下面这两组用例就是"云句该被丢"的验收标准 —— 喂进去的都是模型返回的句子。
+
+class TestLapTimeTokens:
+    """圈速「说出来就算数」的写法 —— `fact_allow` 的子集，**减掉裸分位数**。
+
+    🔴 两个真机教训，各错一个方向（都进过生产）：
+       · **少了"原始秒数"形式** → 模型写「这圈83.45」被判"丢了主体"，
+         6 圈 6 句全丢、`fallback_ratio` 恒为 1.0（云在 100% 空烧钱）；
+       · **多了"裸分位数 1"** → 句子里任何 `1`（比如 `T1` 里的）都能
+         让"丢了主体"的句子蒙混过关。
+    """
+
+    def test_minutes_form_accepted_via_seconds_part(self):
+        assert "32.412" in lap_time_tokens(92.412)
+
+    def test_raw_seconds_form_accepted(self):
+        """真机同款：`83.45`（原始秒数）必须算"说了圈速"。"""
+        toks = lap_time_tokens(83.45)
+        assert "83.45" in toks and "83.450" in toks
+
+    def test_bare_minute_token_is_excluded(self):
+        """`1`（裸分位）**不算**说了圈速 —— 否则 `T1` 里的 `1` 成了万能通行证。"""
+        assert "1" not in lap_time_tokens(92.412)
+
+    def test_below_one_minute_has_no_minute_token(self):
+        """不到 1 分钟的圈（卡丁车/短道）没有"分"位，不能强求一个 "0"。"""
+        toks = lap_time_tokens(58.412)
+        assert "0" not in toks and "58.412" in toks
+
+    @pytest.mark.parametrize("v", [92.412, 69.7, 58.412, 101.5, 83.45])
+    def test_is_subset_of_fact_allow(self, v):
+        """逐项必须能在白名单里找到 —— 否则白名单先把它当"编数字"杀掉，
+        这条检查根本没机会跑。"""
+        allow = fact_allow({"lap_time_s": v})
+        for tok in lap_time_tokens(v):
+            assert tok in allow, f"{v} 的写法 {tok!r} 不在白名单里"
+
+
+class TestMissingMandatory:
+    """闸①：facts 里有圈速，云句里却没说 → 整句丢弃。
+
+    🔴 这条才是「圈速主体永远保留」在**云端**的保证 —— `lap_advice` 的
+       槽位顺序只在超预算时决定谁先让位，云润色根本不看那个函数。
+    """
+
+    F = {"lap_time_s": 92.412, "vs_ref_s": 0.37}
+
+    def test_sentence_that_says_it_is_kept(self):
+        assert missing_mandatory("1:32.412，慢 0.37", self.F) == []
+
+    def test_two_decimal_form_counts_as_said(self):
+        """`1:32.41` 也是"说了"—— 不能因为少一个 0 就把整句丢掉。"""
+        assert missing_mandatory("1:32.41，慢 0.37", self.F) == []
+
+    def test_sentence_omitting_it_is_dropped(self):
+        """实测缺口①的复现：句子只给了 delta，主体不见了。"""
+        assert missing_mandatory("慢 0.37", self.F) == ["lap_time_s"]
+
+    def test_no_demand_when_facts_lacks_it(self):
+        """facts 自己就没有圈速 → 无从要求（否则续航句会被误杀）。"""
+        assert missing_mandatory("油还够 2.4 圈", {"laps_left": 2.4}) == []
+
+    def test_sub_minute_lap_needs_no_minute_token(self):
+        """不到 1 分钟的圈：不能因为句子里没有 "0" 就判它丢了主体。"""
+        assert missing_mandatory("58.412，慢 0.37", {"lap_time_s": 58.412}) == []
+
+    def test_only_minutes_without_seconds_is_dropped(self):
+        """只说了 "1" 分（小数部分丢了）也算丢主体 —— 光报分钟没用。"""
+        assert missing_mandatory("第 1 圈", self.F) == ["lap_time_s"]
+
+    def test_bare_minute_from_a_label_is_not_enough(self):
+        """`T1` 里的 `1` 不算圈速 —— 否则没报圈速的句子会靠这个 `1` 蒙混过关。"""
+        f = {"lap_time_s": 92.412, "focus_label": "T1"}
+        assert missing_mandatory("T1 这段慢 0.4", f) == ["lap_time_s"]
+
+    def test_raw_seconds_reply_from_real_smoke_is_kept(self):
+        """🔴 真机原始回归：3 号提示词下模型输出「这圈83.45，T1段慢了0.4秒」。
+
+        它**说了圈速**、白名单也认 `83.45`（就是 facts 里那个值），
+        却曾因"不是 M:SS.mmm 形式"被判丢主体 —— 结果 6 圈 6 句全丢。
+        闸门只管"在不在"，不管"写成什么形式"。
+        """
+        f = {"lap_time_s": 83.45, "vs_ref_s": 0.42, "focus_label": "T1",
+             "focus_laps": 3, "focus_loss_s": 0.40}
+        sent = "这圈83.45，T1段慢了0.4秒"
+        assert invented_numbers(sent, f) == []      # 白名单本来就放行
+        assert missing_mandatory(sent, f) == []     # 不能说它丢了主体
+
+    def test_known_limitation_chinese_numerals(self):
+        """⚠️ 已知取舍：云句若用**中文数字**写圈速，会被误判成"丢了主体"。
+
+        代价只是回落到本地模板（模板一定带阿拉伯数字圈速），且
+        `_KEY_HINTS["lap_advice"]` 明确要求写成 M:SS.mmm，实测未出现。
+        记在此处，免得将来当 bug 查。
+        """
+        assert missing_mandatory("一分三二秒四一二，慢 0.37",
+                                 self.F) == ["lap_time_s"]
+
+    def test_non_dict_facts_is_safe(self):
+        assert missing_mandatory("随便一句话", None) == []
+
+
+class TestInventedAdvice:
+    """闸②：给出 facts **没有授权**的处方性指令 → 整句丢弃。
+
+    授权阈值与 `fuel_range` 模板的 `FUEL_CRIT_LAPS` 对齐 ——
+    模板不敢说的话（每圈都喊"进站"就是狼来了），云也不许说。
+    """
+
+    def test_unauthorized_advice_is_caught(self):
+        """实测缺口②的复现：2.3 圈（不紧张）却说「注意补油」。"""
+        f = {"lap_time_s": 92.412, "laps_left": 2.3}
+        assert invented_advice("1:32.412，注意补油", f) == ["补油"]
+
+    def test_all_offending_words_are_reported(self):
+        hits = invented_advice("该进站换胎了", {"laps_left": 2.3})
+        assert "进站" in hits and "换胎" in hits
+
+    def test_no_laps_left_at_all_is_not_authorized(self):
+        """facts 里根本没有续航信息 → 任何进站/补油指令都算编。"""
+        assert invented_advice("注意补油", {"vs_ref_s": 0.3}) == ["补油"]
+
+    def test_authorized_when_actually_critical(self):
+        """真的只剩不到 1 圈 → 「这圈进站」是模板自己也会说的话，放行。"""
+        f = {"lap_time_s": 92.412, "laps_left": 0.8, "unit": "油"}
+        assert invented_advice("1:32.412，油只够 0.8 圈，这圈进站", f) == []
+
+    def test_boundary_is_fuel_crit_laps(self):
+        f = {"laps_left": phrases.FUEL_CRIT_LAPS}
+        assert invented_advice("这圈进站", f) == []
+
+    def test_just_above_boundary_is_not_authorized(self):
+        f = {"laps_left": phrases.FUEL_CRIT_LAPS + 0.1}
+        assert invented_advice("这圈进站", f) == ["进站"]
+
+    def test_describing_is_not_advising(self):
+        """只描述、不给指令的句子必须放行 —— 否则闸门会把好东西一起杀掉。"""
+        f = {"label": "T3", "laps": 3, "median_loss_s": 0.42, "laps_left": 2.4}
+        assert invented_advice("T3 连续 3 圈慢 0.42，注意刹车点", f) == []
+        assert invented_advice("轮胎可以再撑两圈", f) == []
+
+    def test_non_dict_facts_is_safe(self):
+        assert invented_advice("注意补油", None) == []
+
+    def test_threshold_is_single_sourced_with_template(self):
+        """模板与闸门共用 `FUEL_CRIT_LAPS`：模板说"进站"的那一刻，闸门也必须放行。
+
+        两处各写一个数 → 会出现"模板允许、闸门拒绝"，于是回落的模板句
+        本身就是违规句。
+        """
+        assert phrases.fuel_range(
+            {"unit": "油", "laps_left": phrases.FUEL_CRIT_LAPS}).endswith("这圈进站")
+        assert invented_advice(
+            "这圈进站", {"laps_left": phrases.FUEL_CRIT_LAPS}) == []
 
 
 # ===========================================================================
@@ -229,6 +411,10 @@ class TestNextFocus:
 # 🔴 新增 key 必须在这个表里加一行，否则 test_every_renderer_* 会因为
 #    "RENDERERS 里有没被覆盖的 key"而失败（这正是我们要的提醒）。
 RICH_CASES: dict[str, dict] = {
+    "lap_advice": {"lap_time_s": 92.782, "vs_ref_s": 0.37, "unit": "油",
+                   "laps_left": 2.4, "sector": 3, "loss_s": 0.31,
+                   "focus_label": "T12", "focus_laps": 12,
+                   "focus_loss_s": 1.234},
     "lap_summary": {"lap_time_s": 92.782, "vs_ref_s": 0.37,
                     "ref_lap_time_s": 92.412},
     "sector_loss": {"sector": 3, "loss_s": 0.31, "gain_s": 0.8,
@@ -239,7 +425,7 @@ RICH_CASES: dict[str, dict] = {
                    "ls_share": 0.9, "recent": [1.2, 1.3]},
 }
 
-PRIO = {"lap_summary": 3, "sector_loss": 2, "projected_lap": 3,
+PRIO = {"lap_advice": 2, "lap_summary": 3, "sector_loss": 2, "projected_lap": 3,
         "fuel_range": 2, "next_focus": 2}
 
 
@@ -361,3 +547,64 @@ def test_numbers_shared_between_local_and_cloud():
             assert bad, f"该抓到的没抓到：{txt}"
         else:
             assert not bad, f"误杀：{txt} → {bad}"
+
+
+@pytest.mark.parametrize("key", sorted(RICH_CASES))
+def test_local_templates_pass_their_own_guards(key):
+    """🔴 **本地模板不能踩自己的闸** —— 否则"回落模板"的那句本身就该被丢。
+
+    云句被闸掉之后回落的正是这个模板句。模板若也过不了 `missing_mandatory`
+    （比如将来有人把 lap_advice 的圈速槽位挪到后面被预算挤掉），
+    就会出现"丢了云句、换回一句同样丢掉主体的模板" —— 白改。
+    这条把两类闸与全部模板一次锁在一起。
+    """
+    facts = RICH_CASES[key]
+    txt = render(key, facts)
+    assert missing_mandatory(txt, facts) == [], f"{key} 模板丢了主体：{txt}"
+    assert invented_advice(txt, facts) == [], f"{key} 模板编了建议：{txt}"
+
+
+# ===========================================================================
+# 数字逐位读音（无线电风格）—— 54 → 五四
+# ===========================================================================
+
+class TestSpellDigits:
+    def test_plain_integer(self):
+        assert spell_digits("刹车晚了 54 米") == "刹车晚了 五四 米"
+
+    def test_two_digit_strips_place_value(self):
+        # 正是用户点名要的：54 → 五四，不要「五十四」
+        assert spell_digits("54") == "五四"
+        assert spell_digits("12") == "一二"
+        assert spell_digits("155") == "一五五"
+
+    def test_decimal_reads_digit_by_digit(self):
+        assert spell_digits("慢 0.37") == "慢 零点三七"
+        assert spell_digits("还差 0.80") == "还差 零点八零"
+
+    def test_signed_delta_keeps_direction(self):
+        assert spell_digits("+0.37") == "正零点三七"
+        assert spell_digits("-0.37") == "负零点三七"
+
+    def test_lap_time_spoken_form(self):
+        assert spell_digits("1:32.412") == "一分三二秒四一二"
+        assert spell_digits("预计 1:22.800") == "预计 一分二二秒八零零"
+
+    def test_labels_are_preserved(self):
+        # S2 / T3 这类带字母的编号不动，只有独立数字被逐位读
+        assert spell_digits("S2 慢 0.31，还差 0.80") == "S2 慢 零点三一，还差 零点八零"
+        assert spell_digits("T3 连续 3 圈慢 0.40") == "T3 连续 三 圈慢 零点四零"
+
+    def test_corner_short_form(self):
+        assert spell_digits("晚 12") == "晚 一二"
+        assert spell_digits("慢 54") == "慢 五四"
+
+    def test_idempotent_on_chinese(self):
+        # 已经没有阿拉伯数字的中文串，原样返回
+        assert spell_digits("出界了，回到赛道") == "出界了，回到赛道"
+        assert spell_digits("一分三二秒四一二") == "一分三二秒四一二"
+
+    def test_char_count_is_preserved(self):
+        # 字符数等价 → ttl 预算无需重算
+        for t in ("刹车晚了 54 米", "慢 0.37", "1:32.412", "+0.37"):
+            assert len(spell_digits(t)) == len(t), t

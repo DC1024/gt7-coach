@@ -24,13 +24,18 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .contract import CoachState, Frame, Utterance
+from . import phrases
+from .refcache import RefCache
 from .gate import Gate, GateConfig
+from .contract import P_NORMAL, CoachState, Frame, Utterance
 from .lapstats import (CornerTracker, FuelTracker, LapResult,
                        SectorTracker, corner_loss_split, corner_losses,
                        lap_result)
+from .narrate import Narrator
 from .refindex import RefLap
 from .rules import Ctx, RuleConfig, RuleSet
 from .source import HttpSource, ReplaySource
+from .tts import TtsConfig, TtsEngine
 
 
 @dataclass
@@ -61,10 +66,59 @@ class CoachConfig:
     ref_policy: str = "history_best"
     history_max_tries: int = 3          # 最多试几个候选（每个要一次 /profile）
     history_shape_tol_m: float = 60.0   # 形状中位距离超过它就判为不同赛道
+    # 自攒参考圈最早从第几圈开始建。默认 2 = **跳过第 1 圈（出场 / 暖胎圈）**：
+    # 第 1 圈通常慢且不具代表性，拿它当参考会让第 2~3 圈的刹车点 / 弯心速度全建在
+    # 慢圈上 → 用户感知的"前几圈瞎播报"。时间赛里第 1 圈就是飞行圈时改成 1 即可。
+    self_ref_min_lap: int = 2
+    # —— 参考圈本地缓存（根治「前几圈瞎播报」的第二条杠杆）——
+    # 把跑过的最好一圈按「赛道指纹 + 车型」存盘，下次同赛道直接复用，
+    # 省掉 history_best 去服务端翻历史的冷启动延迟。设为 None → 禁用（纯内存）。
+    ref_cache_dir: str | None = None
     # 🔴 场次列表的轮询间隔。绝**不能**每 tick（10Hz）问一次 —— 那个接口要
     #    遍历目录、stat 每个文件、查车型表，10Hz 打上去是自己给自己造负载。
     sess_poll_boot_s: float = 2.0      # 还没拿到参考圈时：勤问
     sess_poll_idle_s: float = 15.0     # 已有参考圈时：偶尔问一次换没换场
+    # —— R2.2 云接入 ——
+    # cloud.json 的挂载路径（容器内 /opt/gt7-coach/data/cloud.json）。
+    # 设为 None → narrator 全程禁用态（纯本地模板，零网络），降级到 R2.1 行为。
+    cloud_path: str | None = None
+    # —— R3 云 TTS（只给 **B 档**句子；A 档永远走浏览器 TTS）——
+    # 默认**全禁**：不配就是纯浏览器 `speechSynthesis`（= R2.2 的行为）。
+    # 要开启得凑齐三样：tts_enabled + tts_workspace_id + 可写的 tts_cache_dir；
+    # 缺任何一样都静默降级 —— 云挂了不该把教练搞哑。
+    # key 复用 R2.2 那一把（百炼的 key 是业务空间级的，语音与语言模型不分开授权）。
+    tts_enabled: bool = False
+    tts_provider: str = "bailian"
+    tts_workspace_id: str = ""               # 百炼业务空间 ID（ws- 开头），非密钥
+    tts_api_key_env: str = "GT7_COACH_LLM_KEY"   # 🔴 只存变量名
+    tts_model: str = ""        # 空 → provider 默认（cosyvoice-v3-flash）
+    tts_voice: str = ""        # 空 → provider 默认（longanyang / 龙安洋）
+    tts_format: str = "mp3"
+    tts_sample_rate: int = 24000
+    tts_timeout_s: float = 8.0     # B 档不抢麦，可比 chat 的 2s 宽松
+    tts_cache_dir: str | None = None
+    tts_max_chars: int = 60        # 单句最长字符（防呆：超长句既不合理也烧钱）
+
+    def tts_config(self) -> TtsConfig:
+        """把散在 CoachConfig 上的 tts_* 收成一个 TtsConfig。
+
+        用扁平字段而不是嵌套 dataclass，是为了让 `POST /config` 的白名单
+        照常工作（它只认数值字段，字符串/布尔一律拒绝 —— 嵌套对象会把
+        那个校验绕过去，一次笔误就能把整块配置换成字符串）。
+        """
+        return TtsConfig(
+            enabled=self.tts_enabled,
+            provider=self.tts_provider,
+            workspace_id=self.tts_workspace_id,
+            api_key_env=self.tts_api_key_env,
+            model=self.tts_model,
+            voice=self.tts_voice,
+            audio_format=self.tts_format,
+            sample_rate=self.tts_sample_rate,
+            timeout_s=self.tts_timeout_s,
+            max_chars=self.tts_max_chars,
+            cache_dir=self.tts_cache_dir,
+        )
 
 
 class RefProvider:
@@ -83,7 +137,8 @@ class RefProvider:
                  boot_gap_s: float = 2.0, idle_gap_s: float = 15.0,
                  policy: str = "history_best", history_max_tries: int = 3,
                  history_shape_tol_m: float = 60.0,
-                 history_same_car: bool = True):
+                 history_same_car: bool = True,
+                 cache: "RefCache | None" = None):
         self.src = source
         self.step_m = step_m
         self.retry_s = retry_s
@@ -91,6 +146,9 @@ class RefProvider:
         self.history_max_tries = max(0, int(history_max_tries))
         self.history_shape_tol_m = float(history_shape_tol_m)
         self.history_same_car = bool(history_same_car)
+        # 参考圈本地缓存：把跑过的最好一圈按「赛道指纹 + 车型」存盘，下次同赛道
+        # 直接复用，省掉 history_best 去服务端翻历史的冷启动延迟。None = 禁用。
+        self._cache = cache
         # 还没拿到参考圈时勤问（尽快能用）；有了之后偶尔问一次（换场要能发现）
         self.boot_gap_s = boot_gap_s
         self.idle_gap_s = idle_gap_s
@@ -103,6 +161,8 @@ class RefProvider:
         # —— 历史参考圈（跨场次）的尝试结果，供排障 ——
         self._hist: dict[str, Any] = {"candidates": [], "rejected": [],
                                       "adopted": None}
+        # 本轮是否采用了本地缓存参考圈（先于服务端历史搜索命中）
+        self._cached = False
         # —— 场次发现（独立于参考圈）——
         self._sess: dict | None = None
         self._sess_state = "idle"      # idle | loading | ok | empty | failed
@@ -185,11 +245,23 @@ class RefProvider:
             return None
 
     def _load(self, sess: dict, key: tuple) -> None:
-        """后台一次搞完：先发本场剖面（保证马上能用），再找历史更快的。
+        """后台一次搞完：先让教练**马上**有参考圈，再悄悄找更好的。
 
-        先发本场剖面很关键：历史搜索要额外几次 `/profile`，可能慢好几秒，
-        而在那期间教练必须**已经有参考圈能用** —— 不能为了"找更好的"
-        让用户干等。
+        顺序很关键（否则本地缓存这条杠杆等于摆设）：
+
+          1. 取本场剖面 `base`。
+          2. **先查本地缓存**（用 `base` 的几何算指纹，找同赛道更快的）。
+             命中就**立刻发布**它 —— 教练从第一帧起就有靠谱参考，
+             不必等服务端历史搜索（那要额外几次 `/profile`，慢好几秒）。
+          3. 没命中/不更快才发布 `base`。
+          4. 把本次参考圈存盘（供以后复用）。注意 **存盘在"读缓存"之后**，
+             否则上一轮存进去的 `base` 会把磁盘上的更快缓存覆盖掉，
+             读缓存永远读到自己 → 缓存永远不生效。
+          5. 再找服务端历史更快的（跨场次）：可能比缓存更好，找到就升级。
+
+        缓存采用的安全底线与 history_best 同一把尺：必须与 `base` 做
+        `shape_distance` 比对，形状吻合（< history_shape_tol_m）才采用，
+        否则换条赛道误用旧参考圈 = 静默定位错误。
         """
         try:
             base = self._fetch_ref(sess["file"], "profile")
@@ -200,14 +272,45 @@ class RefProvider:
                     self._err = (f"/profile 不可用"
                                  f"（{getattr(self.src, 'last_error', None)}）")
                 return
+            car = sess.get("car_name", "") or ""
+            fp = base.track_fingerprint()
+            # ② 先查本地缓存：同赛道、更快 → 立刻发布（毫秒级，无需等服务端）
+            cached = None
+            used_cache = False
+            self._cached = False
+            if self._cache is not None:
+                cached = self._cache.load(car, fp)
+                if (cached is not None and cached.lap_time_s > 0
+                        and cached.lap_time_s < base.lap_time_s):
+                    sd = cached.shape_distance(base)
+                    if sd is not None and sd <= self.history_shape_tol_m:
+                        with self._lock:
+                            self._ref = cached
+                            self._state = "ready"
+                            self._err = None
+                            self._cached = True
+                        used_cache = True
+            # ① 没命中缓存才发布本场剖面：教练立刻有参考圈可用
+            if not used_cache:
+                with self._lock:
+                    self._ref = base
+                    self._state = "ready"
+                    self._err = None
+            # ④ 存盘（在"读缓存"之后，避免把磁盘上的更快缓存覆盖掉）
+            if self._cache is not None:
+                self._cache.save(base, car)
+                if cached is not None:
+                    self._cache.save(cached, car)
+            # ⑤ 再找服务端历史更快的（跨场次）：可能比缓存更好
+            better = self._find_history_ref(sess, base)
+            adopted = better if better is not None else (cached if used_cache else base)
+            if better is not None and self._cache is not None:
+                self._cache.save(better, car)
+            # ⑥ 落定最终参考圈（历史/缓存更快就升级，否则保持已发布的）
             with self._lock:
-                self._ref = base
+                self._ref = adopted
                 self._state = "ready"
                 self._err = None
-            better = self._find_history_ref(sess, base)
-            if better is not None:
-                with self._lock:
-                    self._ref = better
         except Exception as e:               # noqa: BLE001 —— 解析/网络都可能炸
             with self._lock:
                 self._state = "failed"
@@ -266,7 +369,7 @@ class RefProvider:
 
     def history_status(self) -> dict[str, Any]:
         with self._lock:
-            return dict(self._hist)
+            return {**self._hist, "cached_adopted": self._cached}
 
     def get(self) -> tuple[RefLap | None, str, str | None]:
         with self._lock:
@@ -289,7 +392,12 @@ class CoachEngine:
                  clock: Callable[[], float] | None = None):
         self.src = source
         self.cfg = cfg or CoachConfig()
-        self.rules = RuleSet(rule_cfg)
+        # R2.2：措辞编排层。cloud_path 为 None → 禁用态（纯本地模板）。
+        self.narrator = Narrator(self.cfg.cloud_path)
+        # R3：云 TTS（只给 B 档句）。禁用态下 request() 恒返回 None，
+        # 前端回落浏览器 TTS —— 与"完全没配"表现一致。
+        self.tts = TtsEngine(self.cfg.tts_config())
+        self.rules = RuleSet(rule_cfg, self.narrator)
         self.gate = Gate(gate_cfg)
         # 时钟可注入：回放用比赛时钟，真机用墙上时钟（两者本就相等）
         self._clock = clock or time.monotonic
@@ -299,7 +407,8 @@ class CoachEngine:
                                 idle_gap_s=self.cfg.sess_poll_idle_s,
                                 policy=self.cfg.ref_policy,
                                 history_max_tries=self.cfg.history_max_tries,
-                                history_shape_tol_m=self.cfg.history_shape_tol_m)
+                                history_shape_tol_m=self.cfg.history_shape_tol_m,
+                                cache=RefCache(self.cfg.ref_cache_dir))
 
         self._st_rules = RuleSet.fresh_state()
         self._st_gate = Gate.fresh_state()
@@ -337,7 +446,9 @@ class CoachEngine:
                 ref_ready=self._current_ref() is not None,
                 lap=self._lap or 0,
                 stats={"ticks": self._ticks,
-                       "source_error": err or "no frame"})
+                       "source_error": err or "no frame",
+                       "cloud": self.narrator.status(),
+                       "tts": self.tts.status()})
         return self._tick_frame(f, now)
 
     def run(self, on_state: Callable[[CoachState], None] | None = None,
@@ -375,6 +486,10 @@ class CoachEngine:
             self._lap_buf = []
             self._fuel.start_lap(f.fuel_pct)
         self.rules.roll_lap(self._st_rules, f.lap)
+        # R2.2：每圈预算计数（圈变化时才重置；幂等，可每 tick 调）
+        self.narrator.note_lap(f.lap)
+        # R3：TTS 的预算与 LLM 分开计（两件事、两笔钱、两个额度）
+        self.tts.note_lap(f.lap)
 
         self._lap_buf.append(f)
         self._trim_lap_buffer(f)
@@ -402,6 +517,18 @@ class CoachEngine:
         cands = self.rules.evaluate(ctx)
         say = self.gate.filter(cands, now=now, lap=f.lap,
                                g_mag=f.g_mag, st=self._st_gate)
+        # 语音专用串：把 `text` 里的阿拉伯数字逐位中文化（54→五四），
+        # 屏幕显示仍用原样 `text`。幂等且字符数等价，不影响 ttl 预算。
+        # 放在闸门之后：此时 `u.text` 已是最终要念的那句（含弯中禁言的短句替换）。
+        for u in say:
+            u.speech = phrases.spell_digits(u.text)
+            # R3：B 档句子进云 TTS 队列。🔴 这里**只丢任务、绝不等待** ——
+            # `request()` 是 O(1) 的内存操作（缓存命中则顺带给回 URL），
+            # 真正的合成在 tts 的后台线程里跑。把合成写进这一行，10Hz 主循环
+            # 会当场掉到 0.5Hz，整个教练连带仪表盘一起废掉。
+            # A 档（P_CRITICAL / P_HIGH）在这里就被 `>= P_NORMAL` 挡在外面。
+            if u.priority >= P_NORMAL:
+                u.tts_url = self.tts.request(u.speech)
         self._record_spoken(say, now, f)
 
         delta = None
@@ -479,6 +606,8 @@ class CoachEngine:
                 "lateral_m": round(lateral_m, 1) if lateral_m is not None else None,
                 "lap_frames": len(self._lap_buf),
                 "dropped_by_gate": self._st_gate.get("dropped", 0),
+                # 被面板开关关掉的分组条数（与"闸门竞争掉"分开，见 gate.py）
+                "muted_by_gate": self._st_gate.get("muted", 0),
                 "sector_len_m": (round(self._sector_len_m, 1)
                                  if self._sector_len_m else None),
                 "lap_samples": len(self._sectors.lap_totals),
@@ -488,6 +617,11 @@ class CoachEngine:
                 "corners": self._corners.to_dict(),
                 "corner_habit": self._corners.habit(),
                 "source_error": getattr(self.src, "last_error", None),
+                # R2.2 云状态：degraded 等 Observability 进 state，仪表盘可显示
+                "cloud": self.narrator.status(),
+                # R3 云 TTS 状态：enabled / 缓存命中 / 队列深度 / 费用。
+                # 前端靠 `enabled` 决定"要不要等 tts_url 一会儿再决定用哪条嗓子"。
+                "tts": self.tts.status(),
                 "wheel_radius_m": {
                     "front": round(self._st_rules["radius"]["front"], 4)
                     if self._st_rules["radius"]["front"] else None,
@@ -613,11 +747,11 @@ class CoachEngine:
         只在**更快**时才替换参考圈 —— 参考圈的定义是「跑到最好的那一圈」。
         """
         # 🔴 `lap <= 0` 是菜单/维修区/出场状态（GT7 用 0 表示"还没进入计时圈"）。
-        #    拿这些帧自攒参考圈会得到一条几百米的垃圾折线，而它一旦当上参考，
-        #    后面所有定位、delta、刹车点全部错乱 —— 实测正是这样：菜单帧攒出
-        #    390m 的"参考圈"，然后吐了 11 条假出界。
+        #    这种圈啥都不算（分段、油耗、每弯损失、自攒参考圈全跳过）。
         if lap <= 0:
             return
+        # 🔴 本圈本地统计照常进行：分段用时、油耗、每弯损失累积都依赖全圈帧，
+        #    第 1 圈的习惯该记还得记（next_focus 那套跨圈累积不能断）。
         self._local_lap_stats(lap)
         buf = [x for x in self._lap_buf if x.coords_ok]
         if len(buf) < self.cfg.self_ref_min_frames:
@@ -629,6 +763,13 @@ class CoachEngine:
             return
         if cand.lap_time_s < self.cfg.min_lap_s:
             return                    # 残圈（出场/被切断），不配当参考
+        # 🔴 `lap < self_ref_min_lap` 的圈**只跳过自攒参考圈**，不影响上面的统计：
+        #    第 1 圈通常是出场/暖胎圈，慢且不具代表性，拿它当参考会让第 2~3 圈的
+        #    「刹车点 / 弯心速度」全建在慢圈上 → 用户感知的"前几圈瞎播报"。
+        #    默认 `self_ref_min_lap = 2` 跳过第 1 圈（时间赛第 1 圈就是飞行圈时
+        #    改成 1 即可）。自攒参考圈最早从第 2 圈跑完才开始建。
+        if lap < self.cfg.self_ref_min_lap:
+            return
         cur = self._self_ref
         if cur is None or cand.lap_time_s < cur.lap_time_s:
             self._self_ref = cand

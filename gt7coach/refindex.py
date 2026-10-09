@@ -412,6 +412,43 @@ class RefLap:
         n = len(ds)
         return ds[n // 2] if n % 2 else (ds[n // 2 - 1] + ds[n // 2]) / 2.0
 
+    def track_fingerprint(self, n_points: int = 64, decimals: int = 2) -> str:
+        """稳定的赛道形状指纹（同赛道跨场次一致，不同赛道不同）。
+
+        用几何弧长把折线重采样到固定点数 → 去质心 → 按首末点弦长归一化 →
+        粗量化 → 哈希。只依赖折线**形状**，与圈速、跑的方向无关
+        （反向布局会得到不同指纹，符合预期：不同线路变体本就该区分）。
+
+        用途：给参考圈做本地缓存的 key（见 `refcache`）。同一个赛道你跑一百次，
+        指纹都不变；换条赛道立刻不同。重采样保证不同采样密度的 profile 也能
+        对齐到同一个指纹。
+        """
+        import hashlib
+        if len(self.xs) < 4:
+            return ""
+        arc, _ = arc_lengths(self.xs, self.zs)
+        total = arc[-1]
+        if total <= 0:
+            return ""
+        pts: list[tuple[float, float]] = []
+        for i in range(n_points):
+            d = total * i / (n_points - 1)
+            pts.append((interp_at(arc, self.xs, d),
+                        interp_at(arc, self.zs, d)))
+        # 去质心
+        cx = sum(p[0] for p in pts) / n_points
+        cz = sum(p[1] for p in pts) / n_points
+        pts = [(p[0] - cx, p[1] - cz) for p in pts]
+        # 按圈长归一化（用首末点弦长当尺度，闭环也 nonzero）
+        norm = math.hypot(pts[0][0] - pts[-1][0],
+                          pts[0][1] - pts[-1][1]) or 1.0
+        blob: list[str] = []
+        fmt = f"{{:.{decimals}f}}"
+        for x, z in pts:
+            blob.append(fmt.format(x / norm))
+            blob.append(fmt.format(z / norm))
+        return hashlib.sha1("|".join(blob).encode("utf-8")).hexdigest()[:16]
+
     def to_profile(self) -> dict[str, Any]:
         """导出成 GT7 Dash `/profile` 的形状。
 
