@@ -83,6 +83,36 @@ def _resolve_tts(args, *, auto: bool = True) -> dict[str, object]:
     }
 
 
+def _print_cloud_state(engine: CoachEngine) -> None:
+    """把「云措辞」的落地状态打出来（对应 R2.2，此前**一行都不打**）。
+
+    🔴 为什么必须打：`/api/v1/coach/cloud` 是给程序看的，而启动横幅是给
+       **人**看的。用户最需要一眼确认的两件事在这里：
+         ① 现在到底用哪个模型（是不是自己填的那个）；
+         ② 这个模型在不在免费额度里 —— 不在就是"可能被计费"。
+       这两件事原来都看不见，用户只能靠猜。
+    """
+    st = engine.narrator.status()
+    if not st["enabled"]:
+        # 只在"碰过这件事"时出声（配了 cloud.json / 环境里有 key），
+        # 否则纯本地模板的用户会平白多一行噪音。
+        if engine.cfg.cloud_path:
+            print(f"[gt7coach] 云措辞未启用（配置在 {engine.cfg.cloud_path}）"
+                  " —— 全部走本地模板，零外呼")
+        return
+    src = "用户填的" if st.get("model_from_user") else "厂商预设"
+    line = (f"[gt7coach] 云措辞已启用  {st['provider']}/{st['model']}"
+            f"（{src}）  key={'有' if st['has_key'] else '缺'}"
+            f"  {st['price_yuan_per_mtok'].get('in', '?')}/"
+            f"{st['price_yuan_per_mtok'].get('out', '?')} 元/百万 token")
+    print(line)
+    if st.get("model_warning"):
+        # ⚠ 只警告不拦（按用户要求）。但必须显眼 —— 这条是防"静默扣费"的。
+        print(f"[gt7coach] ⚠ {st['model_warning']}")
+        print("[gt7coach]   想换模型：编辑 cloud.json 的 model 字段，"
+              "或在仪表盘「赛道工程师」卡片里直接填（改完立即生效，不用重启）")
+
+
 def _print_tts_state(engine: CoachEngine) -> None:
     """把云 TTS 的落地状态打出来。缺一样就静默降级是设计如此，但**必须
     说一声**：否则"配置明明写了却没声音"会变成一场排查噩梦。"""
@@ -186,6 +216,7 @@ def main(argv: list[str] | None = None) -> int:
         return _replay(args)
 
     engine = _build(args)
+    _print_cloud_state(engine)
     _print_tts_state(engine)
 
     if args.cmd == "once":

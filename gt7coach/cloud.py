@@ -66,7 +66,14 @@ class CloudReply:
 PROVIDERS: dict[str, dict[str, str]] = {
     "dashscope": {           # 百炼（默认）
         "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "model": "qwen-flash",
+        # 🔴 默认模型必须是**免费额度名单里**的（见下面的 FREE_MODELS）。
+        #    原先这里是 `qwen-flash` —— 它**不在**免费名单里，用户只要填了
+        #    key 就会静默按量计费。教练是"玩家自己电脑上的小工具"，
+        #    不该在用户不知情的时候花钱。
+        #    qwen3.8-flash 是名单里 runway 最长的 flash 档（见 FREE_MODELS.until）。
+        #    用户可在 cloud.json / 仪表盘卡片的输入框里改成任意模型名；
+        #    改成非免费模型**不拦**，但状态里会一直红字提示可能计费。
+        "model": "qwen3.8-flash",
     },
     "ark": {                 # 方舟（火山）
         "base_url": "https://ark.cn-beijing.volces.com/api/v3",
@@ -111,6 +118,107 @@ PROVIDERS: dict[str, dict[str, str]] = {
 }
 
 DEFAULT_PROVIDER = "dashscope"
+
+
+# —— 百炼「免费额度」模型名单 ——————————————————————————————————
+#
+# 🔴 为什么把这份名单写进代码：
+#    百炼的免费额度是**按模型**发的，超出额度就按量计费。`PROVIDERS` 里的
+#    默认模型曾经是 `qwen-flash`（不在免费名单里）→ 用户填了 key 就会
+#    **静默扣费**。教练的定位是玩家自己电脑上的小工具，不该悄悄花钱。
+#    所以：① 默认值挑名单里的；② 用户改成名单外的模型**只警告不拦**
+#    （用户明确要求），状态里 `free_info()` 会一直给出提示。
+#
+# 数据来源：用户 2026-10-09 从百炼控制台「免费额度」页导出的表格。
+#   ⚠️ 额度与到期日**随活动变化，以控制台为准** —— 这里只用于提醒，
+#      不参与任何拦截判断，过期了也只是提示不再准确，不会让功能失效。
+#   ⚠️ 只收录本项目**真会用到**的两类：大语言模型（云措辞）与语音合成
+#      （云 TTS）。控制台里还有视觉/多模态/向量/ASR/sambert 音色等
+#      几十项，与本项目无关，不收。
+#
+# 字段：model -> {kind 类型, quota 额度说明, until 到期日 or None=每月重置}
+FREE_MODELS: dict[str, dict[str, Any]] = {
+    # —— 大语言模型：云措辞（narrate）走这一类 ——
+    "qwen3.8-flash":        {"kind": "大语言模型", "quota": "1M tokens", "until": "2026-11-25"},
+    "qwen3.7-flash":        {"kind": "大语言模型", "quota": "1M tokens", "until": "2026-10-23"},
+    "qwen3.7-flash-2026-07-15": {"kind": "大语言模型", "quota": "1M tokens", "until": "2026-10-23"},
+    "qwen3.8-27b":          {"kind": "大语言模型", "quota": "1M tokens", "until": "2026-11-17"},
+    "qwen3.8-max":          {"kind": "大语言模型", "quota": "1M tokens", "until": "2026-11-01"},
+    "qwen3.8-max-0902":     {"kind": "大语言模型", "quota": "1M tokens", "until": "2026-12-01"},
+    "qwen3.8-2.4t-a95b":    {"kind": "大语言模型", "quota": "1M tokens", "until": "2026-11-12"},
+    "deepseek-v4.1-flash":  {"kind": "大语言模型", "quota": "1M tokens", "until": "2026-12-13"},
+    "deepseek-v4-flash-0731": {"kind": "大语言模型", "quota": "1M tokens", "until": "2026-10-31"},
+    "deepseek-v4-pro-0813": {"kind": "大语言模型", "quota": "1M tokens", "until": "2026-11-13"},
+    "glm-5.3":              {"kind": "大语言模型", "quota": "1M tokens", "until": "2026-11-23"},
+    "kimi-k3":              {"kind": "大语言模型", "quota": "1M tokens", "until": "2026-11-17"},
+    # —— 语音合成：云 TTS（tts.py）走这一类 ——
+    #    ⚠️ 当前 TTS 默认模型 `cosyvoice-v3-flash` **不在**名单里（名单里只有
+    #       v1）。v1 不支持 `longanyang` 这类 v2/v3 音色，换过去要连音色一起改，
+    #       没实测过不敢当默认值 —— 所以 TTS 这边**只警告、不换默认值**。
+    #       真要省，把 tts_model 填成 cosyvoice-v1 并换一个 v1 音色（见 README）。
+    "cosyvoice-v1":         {"kind": "语音合成", "quota": "10K 字符/月", "until": None},
+    "cosyvoice-clone-v1":   {"kind": "语音合成", "quota": "10K 字符/月", "until": None},
+    "qwen-audio-3.1-tts-flash": {"kind": "语音合成", "quota": "1M tokens", "until": "2026-12-21"},
+    "qwen-audio-3.1-tts-next":  {"kind": "语音合成", "quota": "1M tokens", "until": "2026-12-21"},
+    "qwen-audio-3.0-tts-flash": {"kind": "语音合成", "quota": "10K 字符", "until": "2026-10-12"},
+    "qwen-audio-3.0-tts-plus":  {"kind": "语音合成", "quota": "10K 字符", "until": "2026-10-12"},
+}
+
+
+def _days_left(until: str | None) -> int | None:
+    """距到期还有几天（None = 每月重置/长期有效，不给天数）。"""
+    if not until:
+        return None
+    try:
+        import datetime as _dt
+        d = _dt.date.fromisoformat(until)
+    except (TypeError, ValueError):
+        return None
+    return (d - _dt.date.today()).days
+
+
+def free_info(model: str) -> dict[str, Any] | None:
+    """这个模型在不在免费名单里？是 → 返回详情（含剩余天数），否 → None。
+
+    🔴 只用于**提示**，不参与拦截：用户明确要求"非免费模型只警告不拦"。
+    """
+    if not model:
+        return None
+    info = FREE_MODELS.get(model)
+    if info is None:
+        return None
+    out = dict(info)
+    left = _days_left(info.get("until"))
+    out["days_left"] = left
+    out["expired"] = left is not None and left < 0
+    return out
+
+
+def is_free_model(model: str) -> bool:
+    """是否在免费名单内且**没过期**。"""
+    info = free_info(model)
+    return bool(info) and not info.get("expired")
+
+
+def model_warning(model: str, *, provider: str = "") -> str | None:
+    """非免费模型 → 一句中文提示；免费/没填 → None。
+
+    措辞刻意不写"会扣钱"这种绝对话（额度/单价随时会变），只说"可能计费"。
+    """
+    if not model:
+        return None
+    info = free_info(model)
+    if info is None:
+        return (f"模型 {model} 不在内置免费名单里，可能按量计费。"
+                f"（名单只覆盖百炼免费额度，且以控制台为准）")
+    if info.get("expired"):
+        return (f"模型 {model} 的免费额度已于 {info['until']} 到期，"
+                f"继续使用可能按量计费。")
+    left = info.get("days_left")
+    if left is not None and left <= 7:
+        return (f"模型 {model} 的免费额度 {info['until']} 到期，"
+                f"还剩 {left} 天。")
+    return None
 
 
 def _no_proxy_opener() -> urllib.request.OpenerDirector:

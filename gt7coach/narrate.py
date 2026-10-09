@@ -147,6 +147,31 @@ class Narrator:
             self._cfg = fresh
         return self._cfg
 
+    @property
+    def config_path(self) -> str | None:
+        """cloud.json 的路径（None = 启动时没配 --cloud → 全程禁用态）。
+
+        给写接口用：模型名要落到**唯一真值源**上，不能只存内存（重启就丢，
+        用户会觉得"我明明设过"）。
+        """
+        return self._path
+
+    def reload(self) -> bool:
+        """强制重读 cloud.json。写完文件后立刻见效，不用等下一次 render。
+
+        返回是否读到了一份合法配置。与 `_reload_if_changed` 的区别：
+        那个靠 mtime 比大小，而**写完文件立刻读**时 mtime 可能没变
+        （同秒内写入 + 文件系统 mtime 精度只有 1s 的场景），所以这里 force。
+        """
+        if not self._path:
+            return False
+        fresh = self._load_file(force=True)
+        if fresh is None:
+            return False
+        with self._lock:
+            self._cfg = fresh
+        return True
+
     # —— 预算 / 熔断 状态 ——————————————————————————————————
 
     @staticmethod
@@ -282,11 +307,21 @@ class Narrator:
         last_err_kind = "error"
         for i, prov in enumerate(providers):
             p = cloud.resolve_provider(prov)
-            # 🔴 预设厂商自带 base_url/model；cloud.json 里的全局 base_url/model
-            #     只作兜底（自定义厂商没预设时才用）。顺序写反会让主备切换时
-            #     备用厂商仍打主家的 URL —— 实测抓出来的。
-            base_url = p.get("base_url") or cfg.base_url
-            model = p.get("model") or cfg.model
+            if i == 0:
+                # 🔴 主家：**用户在 cloud.json 里显式填的 model/base_url 优先**。
+                #    这是"让用户自己选模型"的唯一通道。原先是 `p.get("model")
+                #    or cfg.model`，后果是用户在 cloud.json 把 model 改成 kimi-k3
+                #    却**完全无效** —— 预设厂商永远用自己的 model，用户以为换了、
+                #    实际还在用默认那个（实测抓出来的）。之所以长期没暴露：
+                #    测试全用未知厂商 provider="test"，那条路本来就只能落到
+                #    cfg.model，正好绕开了这个分支。
+                base_url = cfg.base_url or p.get("base_url")
+                model = cfg.model or p.get("model")
+            else:
+                # 🔴 备用厂商：必须用**它自己**的预设，不能沿用主家的 ——
+                #    顺序写反会让主家熔断后备用仍打主家的 URL（实测抓出来的）。
+                base_url = p.get("base_url") or cfg.base_url
+                model = p.get("model") or cfg.model
             if not base_url or not model:
                 # 未知厂商又没在 cloud.json 显式给 base_url/model → 跳过
                 continue
@@ -361,12 +396,40 @@ class Narrator:
 
     # —— 可观测 ————————————————————————————————————————
 
+    def model_info(self) -> dict[str, Any]:
+        """当前**实际会发出去**的模型名 + 它是否在免费名单里。
+
+        🔴 为什么要单独抽出来：**"配置里填的"和"真发出去的"可能不是一回事** ——
+           主家用 `cfg.model`（用户填的），备用家各自用自己的预设（见 _polish）。
+           界面/状态要显示的是**真发出去的那个**，否则用户改完看不到变化，
+           会以为"改了没生效"——那正是这次修掉的那个 bug 的表现。
+        """
+        cfg = self._cfg
+        if cfg is None:
+            return {"model": "", "provider": None, "from_user": False,
+                    "is_free": False, "free": None, "warning": None,
+                    "api_key_env": "", "has_key": False}
+        preset = cloud.resolve_provider(cfg.provider).get("model") or ""
+        model = cfg.model or preset
+        return {
+            "model": model,
+            "provider": cfg.provider,
+            "from_user": bool(cfg.model),       # True=用户填的，False=厂商预设
+            "is_free": cloud.is_free_model(model),
+            "free": cloud.free_info(model),
+            "warning": cloud.model_warning(model, provider=cfg.provider),
+            # 🔴 只报**变量名**与"有没有设"，绝不回显 key 本身
+            "api_key_env": cfg.api_key_env,
+            "has_key": bool(os.environ.get(cfg.api_key_env, "")),
+        }
+
     def status(self) -> dict[str, Any]:
         """给 GET /api/v1/coach/cloud 用：enabled / provider / 今日调用 /
         token / 估算费用 / 降级状态 / 违规计数 + 其它运维指标。"""
         with self._lock:
             st = dict(self._st)
             cfg = self._cfg
+            mi = self.model_info()
         # 估算费用：输入/输出**分档计价**（云 API 就是两档单价），单价取自
         # cfg.price_*_yuan_per_mtok，随 cloud.json 可改。usage 缺失时 narration
         # 层已按字符估算并标 estimated，这里照算 —— 量级正确即可，不当账用。
@@ -414,4 +477,15 @@ class Narrator:
             "last_latency_s": st["last_latency"],
             "limits": dict(cfg.limits) if cfg else {},
             "prompt_version": prompts.PROMPT_VERSION,
+            # —— 模型（"用户填了什么 / 真发出去的是哪个 / 是否在免费额度内"）——
+            #    model_warning 非空 = 这个模型不在免费名单里或快到期了。
+            #    🔴 只提示、**不拦截**（用户明确要求：非免费模型只警告不拦）。
+            "model": mi["model"],
+            "model_from_user": mi["from_user"],
+            "model_is_free": mi["is_free"],
+            "model_free": mi["free"],
+            "model_warning": mi["warning"],
+            # 只报变量名与"有没有设"，绝不回显 key
+            "api_key_env": mi["api_key_env"],
+            "has_key": mi["has_key"],
         }

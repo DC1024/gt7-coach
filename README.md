@@ -382,6 +382,90 @@ R4 优先级最低：双手在方向盘上时，几个预设问题按钮（「�
 
 MIT
 
+## 云措辞怎么配（key 放哪 / 用哪个模型）
+
+**默认是关闭的**：不配 `--cloud` 就是纯本地模板，零外呼、零费用。
+开了云润色才有下面这些事。
+
+### 一、API key：只放环境变量，绝不进配置文件
+
+```bash
+export GT7_COACH_LLM_KEY=sk-xxxxxxxx
+```
+
+明文 key **永远不写进任何文件** —— 配置文件可以随手拷给朋友，key 留在环境里。
+所以 `cloud.json` 里只写**变量名**（`api_key_env`），不写 key 本身。
+
+百炼的语言模型和语音合成**共用同一把 key**（key 是业务空间级的，不分开授权），
+所以云措辞（R2.2）和云 TTS（R3）默认都读 `GT7_COACH_LLM_KEY`。
+
+> key 从哪来：百炼控制台 → 右上角 **API-KEY** → 创建（只显示一次，存好）。
+> ⚠️ 控制台里 `ws-` 开头的那串是**业务空间 ID，不是密钥** —— 云 TTS 要它，
+> 云措辞不需要，别把它当 key 填进环境变量。
+
+### 二、模型：挑一个在「免费额度」里的
+
+```jsonc
+// cloud.json（仓库根目录有一份 cloud.example.json 可直接抄）
+{
+  "enabled": true,
+  "provider": "dashscope",              // 百炼
+  "model": "qwen3.8-flash",             // ← 想用哪个就填哪个
+  "api_key_env": "GT7_COACH_LLM_KEY",   // 🔴 只写变量名
+  "timeout_s": 2.0,
+  "limits": { "per_lap": 1, "per_session": 30, "per_day": 300 }
+}
+```
+
+告诉教练这个文件在哪，然后就不用管了：
+
+```bash
+python -m gt7coach serve --cloud /opt/gt7-coach/data/cloud.json
+# 或 export GT7_COACH_CLOUD_CONFIG=/opt/gt7-coach/data/cloud.json
+```
+
+**改完不用重启**：教练每次调用前 `stat` 一次这个文件，变了就重读。
+也可以在**仪表盘「赛道工程师」卡片 →「播报设置」→ 云措辞模型**里直接填
+（写回同一个文件，立即生效）。
+
+#### 填哪个？百炼的免费额度模型（2026-10 控制台）
+
+教练的云润色用的就是 `.1` 那类**大语言模型**：
+
+| 模型 | 免费额度 | 到期 |
+|---|---|---|
+| `deepseek-v4.1-flash` | 1M tokens | 2026-12-13 |
+| `qwen3.8-max-0902` | 1M tokens | 2026-12-01 |
+| `qwen3.8-flash` ← **默认** | 1M tokens | 2026-11-25 |
+| `glm-5.3` | 1M tokens | 2026-11-23 |
+| `qwen3.8-27b` / `kimi-k3` | 1M tokens | 2026-11-17 |
+| `deepseek-v4-pro-0813` | 1M tokens | 2026-11-13 |
+| `qwen3.8-2.4t-a95b` | 1M tokens | 2026-11-12 |
+| `qwen3.8-max` | 1M tokens | 2026-11-01 |
+| `deepseek-v4-flash-0731` | 1M tokens | 2026-10-31 |
+| `qwen3.7-flash` / `-2026-07-15` | 1M tokens | 2026-10-23 |
+
+⚠️ **额度与到期日以控制台为准**，上表只是帮你选；活动一变它就会过期。
+教练内置了这份名单（`cloud.py:FREE_MODELS`），用于**提示**。
+
+### 三、防静默扣费：默认挑免费的，配了别的会警告
+
+- **默认模型在免费名单内** —— 不填 `model` 时用的是 `qwen3.8-flash`，
+  不会因为你填了 key 就悄悄按量计费。
+- **填了名单外的模型不拦，但会一直警告**：`GET /api/v1/coach/cloud` 的
+  `model_warning`、以及启动横幅都会给出「可能按量计费」。仪表盘卡片里
+  这条警告显示为黄字。
+- 快到期（≤7 天）也会提前提醒，别等开始扣费才发现。
+- 想完全确认当前状态：`curl http://127.0.0.1:8788/api/v1/coach/cloud`
+  看 `model` / `model_from_user` / `model_is_free` / `model_warning` 四个字段。
+
+> 云 TTS 的模型是**另一件事**（`--tts-model`，默认 `cosyvoice-v3-flash`）。
+> 它**不在**免费名单里，`/api/v1/coach/tts` 同样会给出 `model_warning`。
+> 名单里只有 `cosyvoice-v1`（10K 字符/月），但它不支持 `longanyang` 这类
+> v2/v3 音色，换过去要连音色一起改 —— 没实测过，所以没动默认值。
+
+---
+
 ## 部署（Docker）
 
 ```bash

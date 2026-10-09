@@ -42,6 +42,10 @@ from datetime import date
 from typing import Any
 from urllib.parse import urlparse
 
+# 免费额度名单复用 cloud.py 那一份（LLM 与 TTS 同一套口径，不各写一份）。
+# cloud.py 只 import 标准库，不存在循环依赖。
+from . import cloud
+
 # HTTP 路径前缀：state 里给出的 tts_url 指向这里，前端直接 GET 拿 mp3。
 # 放在本模块是为了让 engine / server 用同一个常量，不至于两处各写一遍。
 TTS_HANDLE_PATH = "/api/v1/coach/tts"
@@ -547,6 +551,13 @@ class TtsEngine:
             "provider": self.cfg.provider,
             "model": self.cfg.resolved_model,
             "voice": self.cfg.resolved_voice,
+            # —— 免费额度提示（与 cloud.narrate 同一口径，只提示不拦截）——
+            # 当前默认 cosyvoice-v3-flash **不在**名单里（名单只有 v1），
+            # 所以这里大概率会持续给出提示：这是事实，不该藏起来。
+            "model_is_free": cloud.is_free_model(self.cfg.resolved_model),
+            "model_free": cloud.free_info(self.cfg.resolved_model),
+            "model_warning": cloud.model_warning(self.cfg.resolved_model,
+                                                 provider=self.cfg.provider),
             "format": self.cfg.audio_format,
             "sample_rate": self.cfg.sample_rate,
             # 🔴 这三个是 `POST /config` 唯一能改的 tts_* 项，必须回显 ——

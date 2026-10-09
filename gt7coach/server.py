@@ -18,7 +18,8 @@
 | GET  | `/api/v1/coach/panel`   | 播报开关面板：各内容分组的开/关状态 + 最近计数 |
 | POST | `/api/v1/coach/panel`   | 设置关掉的分组，body 形如 `{"muted": ["tyres","pace"]}` |
 | GET  | `/api/v1/coach/health`  | 存活与 tick 计数 |
-| GET  | `/api/v1/coach/cloud`   | R2.2 云接入状态：enabled/provider/今日调用/token/估算费用/降级/违规计数 |
+| GET  | `/api/v1/coach/cloud`   | R2.2 云接入状态：enabled/provider/**当前模型**/是否免费额度内/今日调用/token/估算费用/降级/违规计数 |
+| POST | `/api/v1/coach/cloud`   | 写云措辞的**模型名**，body 形如 `{"model": "qwen3.8-flash"}`（写进 cloud.json，立即热加载生效） |
 | GET  | `/api/v1/coach/tts`     | R3 云 TTS 状态：enabled/model/voice/缓存命中/队列深度/字符数/估算费用 |
 | GET  | `/api/v1/coach/tts/<id>`| 取某句已合成的音频字节（mp3）。`state` 里 `say[].tts_url` 就指向这里 |
 | POST | `/api/v1/coach/tts`     | **同步**合成一句并返回音频字节，body `{"text": "..."}`。慢（0.5~2 s），只给调试/显式合成用 |
@@ -39,6 +40,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from dataclasses import asdict
@@ -148,8 +150,70 @@ class CoachService:
 
     def cloud_status(self) -> dict[str, Any]:
         """R2.2 云接入状态：enabled / provider / 今日调用 / token /
-        估算费用 / 降级状态 / 违规计数。"""
+        估算费用 / 降级状态 / 违规计数。**外加当前模型名与是否在免费额度内**。"""
         return self.engine.narrator.status()
+
+    # —— 云措辞的「模型名」写入（用户自行填写模型名的入口之一）———————
+
+    # 🔴 只开放这两项。**不开放 api_key / api_key_env**：明文 key 绝不进
+    #    配置文件（全仓库的一条红线），而"顺手改 key 却把环境变量名改错"
+    #    的排查成本远高于收益。
+    CLOUD_WRITABLE = ("model", "enabled")
+
+    def set_cloud(self, body: dict[str, Any]) -> dict[str, Any]:
+        """把用户填的模型名写进 cloud.json（另一个入口是直接编辑这个文件）。
+
+        为什么写**文件**而不是只存内存：cloud.json 是唯一真值源，Narrator
+        靠 mtime 热加载。只改内存的话重启就丢，用户会以为"我明明设过"。
+
+        校验白名单式（与 update_config 同规矩）：不认识的键直接报错，
+        不静默忽略 —— 用户把 `model` 拼成 `modal` 却以为设上了，是最坏的结果。
+        """
+        path = self.engine.narrator.config_path
+        if not path:
+            raise ValueError(
+                "未配置 cloud.json 路径 —— 启动时加 `--cloud <路径>`，"
+                "否则云措辞整条链路是禁用态，写了也不会生效")
+        bad = [k for k in body if k not in self.CLOUD_WRITABLE]
+        if bad:
+            raise ValueError(
+                f"不支持的字段 {bad}（只允许 {list(self.CLOUD_WRITABLE)}）")
+        if "model" in body and not isinstance(body["model"], str):
+            raise ValueError("model 必须是字符串")
+        model = str(body.get("model") or "").strip()
+        if len(model) > 128:
+            raise ValueError("model 名过长（>128 字符）")
+
+        # 读旧文件：不存在 / 坏了都当空对象，**不因此拒绝写入**
+        # （用户第一次用就是没有这个文件）。
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                cur = json.load(f)
+            if not isinstance(cur, dict):
+                cur = {}
+        except (OSError, json.JSONDecodeError):
+            cur = {}
+
+        cur["model"] = model
+        if "enabled" in body:
+            cur["enabled"] = bool(body["enabled"])
+        elif model:
+            # 只填了模型名 = 想用云。不顺手打开的话，用户会看到"填了却没反应"，
+            # 而真值（enabled=false）藏在文件里，界面上看不见。
+            cur["enabled"] = True
+
+        # 原子写（tmp + replace）：别让热加载读到半个文件
+        d = os.path.dirname(os.path.abspath(path))
+        if d:
+            os.makedirs(d, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cur, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+
+        self.engine.narrator.reload()      # 立刻生效，不等下一次 render
+        return {"ok": True, "cloud": self.cloud_status()}
+
 
     # —— R3 云 TTS（只给 B 档句子）———————————————————————
 
@@ -334,7 +398,7 @@ class _Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         p = u.path.rstrip("/")
         if p not in ("/api/v1/coach/config", "/api/v1/coach/panel",
-                     "/api/v1/coach/tts"):
+                     "/api/v1/coach/tts", "/api/v1/coach/cloud"):
             self._send({"error": "not found", "path": p}, 404)
             return
         try:
@@ -344,6 +408,8 @@ class _Handler(BaseHTTPRequestHandler):
                 raise ValueError("body 必须是 JSON 对象")
             if p == "/api/v1/coach/panel":
                 self._send(self._svc().set_panel(body))
+            elif p == "/api/v1/coach/cloud":
+                self._send(self._svc().set_cloud(body))
             elif p == "/api/v1/coach/tts":
                 from .tts import TtsError
                 try:

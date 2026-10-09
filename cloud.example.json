@@ -1,0 +1,13 @@
+{
+  "enabled": true,
+  "provider": "dashscope",
+  "base_url": "",
+  "model": "qwen3.8-flash",
+  "api_key_env": "GT7_COACH_LLM_KEY",
+  "timeout_s": 2.0,
+  "fallbacks": [],
+  "limits": { "per_lap": 1, "per_session": 30, "per_day": 300 },
+  "keys": [],
+  "price_in_yuan_per_mtok": 0.15,
+  "price_out_yuan_per_mtok": 1.5
+}
