@@ -82,9 +82,15 @@ class FuelTracker:
         self.mark = level
 
     def end_lap(self, level: float) -> float | None:
-        """在圈尾调用，返回本圈消耗；数据不可信时返回 None。
+        """在圈尾调用：**推进标记**并返回本圈消耗；数据不可信时返回 None。
 
-        🔴 三个不可信的来源都要挡住：
+        **不记统计** —— 记不记由调用方在这圈被判定有效之后调 `record()`。
+        两段式是必需的：圈统计会因为"中途接入 / 残缺圈"被整体拒绝，而那一圈
+        仍然**真实消耗了油**。如果标记不推进，下一个有效圈量到的就是**两圈**的
+        消耗 —— 8 变 16，而且刚好落在合法区间（0.05~50）里，
+        **没有任何护栏会挡住它**。这类"错得刚好合法"的 bug 最难查。
+
+        三个不可信的来源都要挡住：
           · 没记过圈首（中途接入）
           · 剩余量**上升** → 中途加过油/换过胎（或者读到菜单态的重置值）
           · 变化量离谱（>50 或 <0.1）→ 多半是菜单/结算画面把读数刷成别的
@@ -92,12 +98,15 @@ class FuelTracker:
         if self.mark is None:
             return None
         used = self.mark - level
-        self.mark = level
+        self.mark = level          # ← 无论可不可信都要推进，这是关键
         if not (0.05 <= used <= 50.0):
             return None
+        return used
+
+    def record(self, used: float) -> None:
+        """把一圈的消耗记进统计（调用方已确认这圈有效）。"""
         self.values.append(used)
         del self.values[:-self.window]
-        return used
 
     @property
     def per_lap(self) -> float | None:
@@ -156,6 +165,10 @@ def lap_result(frames: Iterable[Any], *, lap: int, n_sectors: int,
         res.why = "帧太少"
         return res
 
+    # 先结算油量（推进标记），但**暂时不记进统计** —— 这一圈可能被下面的
+    # 检查判为无效。标记必须推进，否则无效圈会把它的消耗累到下一圈头上。
+    pending_fuel = fuel.end_lap(fs[-1].fuel_pct) if fuel is not None else None
+
     # 只有「从圈首开始记」的这一圈才算得准：中途接入时弧长起点不是起跑线，
     # 分段边界全错。圈首那一帧的圈内用时应当接近 0。
     if (fs[0].lap_time_s or 0.0) > FRESH_LAP_S:
@@ -199,9 +212,9 @@ def lap_result(frames: Iterable[Any], *, lap: int, n_sectors: int,
     #    权威圈速另有其人：`lap_summary` 用的是游戏上报的 `last_lap_ms`。
     res.lap_time_s = float(sum(sec))
 
-    if fuel is not None:
-        res.fuel_used = fuel.end_lap(fs[-1].fuel_pct)
-
+    if fuel is not None and pending_fuel is not None:
+        fuel.record(pending_fuel)      # 确认有效了才记进统计
+        res.fuel_used = pending_fuel
     res.ok = True
     return res
 

@@ -502,3 +502,76 @@ class TestLocalLapStats:
         # 若最后一条是残圈，它必须带着可读的原因而不是静默算错
         if not eng._prev_lap.ok:
             assert eng._prev_lap.why
+
+
+class TestBestLapRefreshDoesNotWipeLapBuffer:
+    """🔴 直播场次里「最快圈刷新」不等于「换场次」。
+
+    每跑完一圈，场次列表里的 `best_lap_s` 就会变；而参考圈的 key 里含
+    `best_lap_s`（刷新了要重取剖面，这是对的）。但如果把这个 key 变化
+    当成"换场次"去处理，就会**清空帧缓冲与自攒参考圈** ——
+    直播时每圈跑到 ~15 秒（下一次轮询）缓冲就被清，于是：
+      · 分段统计永远是 0 圈
+      · 自攒参考圈永远建不起来
+    而表面上一切正常（指令照回、状态照出）—— 最坏的那种 bug。
+    """
+
+    @staticmethod
+    def _engine():
+        frames = synth_lap_frames(radius_m=R, hz=10.0, laps=3)
+        src = ReplaySource(frames, profile=None, loop=True)
+        src._session = {"file": "live.jsonl", "live": True, "best_lap_s": 69.7,
+                        "car_name": "X"}
+        eng = CoachEngine(src, CoachConfig(sess_poll_boot_s=0.02,
+                                           sess_poll_idle_s=0.02,
+                                           ref_policy="session_best"),
+                          clock=src.clock)
+        return eng, src
+
+    def test_buffer_survives_best_lap_change(self):
+        eng, src = self._engine()
+        for _ in range(40):
+            eng.tick()
+        assert eng._lap_buf, "先得有帧"
+        # 同一场次、只是最快圈刷新了
+        src._session = {"file": "live.jsonl", "live": True,
+                        "best_lap_s": 68.9, "car_name": "X"}
+        for _ in range(20):
+            eng.tick()
+        assert eng._lap_buf, "最快圈刷新不该清空帧缓冲"
+        assert eng._ref_sess_key[0] == "live.jsonl"
+        # 但参考圈该被重取（key 变了）
+        assert eng._ref_sess_key[1] == 68.9
+
+    def test_real_session_change_still_wipes(self):
+        """真的换场次（换文件）时，缓冲与自攒参考圈仍然必须作废。"""
+        eng, src = self._engine()
+        for _ in range(40):
+            eng.tick()
+        before = len(eng._lap_buf)
+        assert before >= 30, before
+        # 假装已经攒了一份自攒参考圈（要是个真 RefLap —— 引擎会拿它去定位）
+        from gt7coach.refindex import RefLap
+        eng._self_ref = RefLap(lap=99, source="self", grid_m=[0.0, 1.0],
+                               speed_kph=[0.0, 0.0], throttle=[0.0, 0.0],
+                               brake=[0.0, 0.0], t_rel_s=[0.0, 0.0],
+                               xs=[0.0, 0.0], zs=[0.0, 0.0],
+                               length_m=1.0, lap_time_s=1.0)
+        src._session = {"file": "other.jsonl", "live": True,
+                        "best_lap_s": 70.0, "car_name": "X"}
+        for _ in range(20):
+            eng.tick()
+        # 🔴 清空之后**后续 tick 又会攒新帧**，所以判据是"缓冲变回新场次的长度"
+        #    而不是"空数组"（第一版就是拿 `== []` 断的，必假）。
+        assert len(eng._lap_buf) <= 21, f"{before} → {len(eng._lap_buf)}"
+        assert eng._self_ref is None, "换文件必须作废自攒参考圈"
+        assert eng._sector_len_m is None, "换赛道分段基准要重来"
+
+    def test_lap_stats_accumulate_across_laps(self):
+        """连跑三圈，分段统计必须真的累起来（这是上面那个 bug 的可见症状）。"""
+        eng, _ = self._engine()
+        for _ in range(2400):
+            eng.tick()
+        assert len(eng._sectors.lap_totals) >= 1, \
+            f"分段统计没累起来（lap_samples={len(eng._sectors.lap_totals)}）"
+        assert eng._sector_len_m is not None

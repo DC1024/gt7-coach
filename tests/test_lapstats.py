@@ -73,20 +73,22 @@ class TestSectorTimes:
 
 
 class TestFuelTracker:
+    def _feed(self, ft, used_values):
+        """按引擎的用法喂：先 end_lap 观察，再 record 记进统计。"""
+        for used in used_values:
+            ft.start_lap(100.0)
+            ft.record(ft.end_lap(100.0 - used))
+
     def test_per_lap_is_median(self):
         ft = FuelTracker()
-        for used in (8.0, 8.1, 40.0, 8.2, 8.05):     # 40 是异常值
-            ft.start_lap(100.0)
-            ft.end_lap(100.0 - used)
+        self._feed(ft, (8.0, 8.1, 40.0, 8.2, 8.05))   # 40 是异常值
         # 中位数应当是 8.1（排序后 8.0/8.05/8.1/8.2/40 —— 奇数个取中间）
         assert ft.per_lap == pytest.approx(8.1)
 
     def test_median_ignores_one_outlier(self):
         """单圈油耗会被慢车/暖胎圈带偏，"还能跑几圈"要稳到能据以决策。"""
         ft = FuelTracker()
-        for used in (8.0, 8.0, 8.0, 8.0, 30.0):
-            ft.start_lap(100.0)
-            ft.end_lap(100.0 - used)
+        self._feed(ft, (8.0, 8.0, 8.0, 8.0, 30.0))
         assert ft.per_lap == pytest.approx(8.0)
 
     def test_rejects_refuel(self):
@@ -108,9 +110,7 @@ class TestFuelTracker:
 
     def test_laps_left(self):
         ft = FuelTracker()
-        for _ in range(3):
-            ft.start_lap(100.0)
-            ft.end_lap(92.0)
+        self._feed(ft, (8.0, 8.0, 8.0))
         assert ft.laps_left(30.0) == pytest.approx(3.75)
         assert ft.laps_left(0.0) is None
         assert ft.to_dict()["per_lap"] == pytest.approx(8.0)
@@ -225,3 +225,105 @@ class TestSectorTracker:
         for i in range(100):
             st.add([10.0 + i], 10.0 + i)
         assert len(st.lap_totals) <= 30
+
+
+class TestFuelMarkAlwaysAdvances:
+    """被拒的圈也必须推进油量标记。
+
+    圈统计会因为"中途接入 / 残缺圈"被整体拒绝，但那一圈**真实消耗了油**。
+    标记不推进的话，下一个有效圈量到的是**两圈**的消耗 —— 8 变 16，
+    而且刚好落在合法区间（0.05~50）里，**没有任何护栏会挡住它**。
+    这类"错得刚好合法"的 bug 最难查。
+    """
+
+    def test_end_lap_only_observes(self):
+        """`end_lap` 只推进标记并返回消耗，不记统计 ——
+        记不记由调用方在确认这一圈有效后决定。"""
+        ft = FuelTracker()
+        ft.start_lap(100.0)
+        assert ft.end_lap(92.0) == pytest.approx(8.0)
+        assert ft.per_lap is None, "还没 record，不该进统计"
+        assert ft.mark == pytest.approx(92.0), "但标记必须推进"
+        ft.record(8.0)
+        assert ft.per_lap == pytest.approx(8.0)
+
+    def test_next_lap_measures_one_lap_only(self):
+        ft = FuelTracker()
+        ft.start_lap(100.0)
+        ft.end_lap(92.0)                        # 这一圈被拒（比如中途接入）
+        ft.start_lap(92.0)
+        used = ft.end_lap(84.0)                 # 这一圈有效
+        assert used == pytest.approx(8.0), "不该量成两圈的 16"
+        ft.record(used)
+        assert ft.per_lap == pytest.approx(8.0)
+
+    def test_rejected_lap_does_not_feed_stats(self):
+        """`lap_result` 拒绝的圈不能把油耗喂进中位数。"""
+        fs = [f for f in synth_lap_frames(hz=10.0, laps=1)]
+        ft = FuelTracker()
+        ft.start_lap(fs[0].fuel_pct)
+        res = lap_result(fs[200:], lap=1, n_sectors=3, expected_len_m=L,
+                         fuel=ft)          # 中途接入 → 被拒
+        assert not res.ok
+        assert ft.values == [], "被拒的圈不该进统计"
+        assert ft.mark is not None, "但标记要推进到本圈末"
+
+    def test_accepted_lap_feeds_stats(self):
+        fs = [f for f in synth_lap_frames(hz=10.0, laps=1)]
+        ft = FuelTracker()
+        ft.start_lap(fs[0].fuel_pct)
+        res = lap_result(fs, lap=1, n_sectors=3, expected_len_m=L, fuel=ft)
+        assert res.ok
+        assert ft.values, "有效圈要进统计"
+        assert res.fuel_used == pytest.approx(8.0, abs=0.05)
+
+
+class TestFuelMarkAlwaysAdvances:
+    """被拒的圈也必须推进油量标记。
+
+    圈统计会因为"中途接入 / 残缺圈"被整体拒绝，但那一圈**真实消耗了油**。
+    标记不推进的话，下一个有效圈量到的是**两圈**的消耗 —— 8 变 16，
+    而且刚好落在合法区间（0.05~50）里，**没有任何护栏会挡住它**。
+    这类"错得刚好合法"的 bug 最难查。
+    """
+
+    def test_end_lap_only_observes(self):
+        """`end_lap` 只推进标记并返回消耗，不记统计 ——
+        记不记由调用方在确认这一圈有效后决定。"""
+        ft = FuelTracker()
+        ft.start_lap(100.0)
+        assert ft.end_lap(92.0) == pytest.approx(8.0)
+        assert ft.per_lap is None, "还没 record，不该进统计"
+        assert ft.mark == pytest.approx(92.0), "但标记必须推进"
+        ft.record(8.0)
+        assert ft.per_lap == pytest.approx(8.0)
+
+    def test_next_lap_measures_one_lap_only(self):
+        ft = FuelTracker()
+        ft.start_lap(100.0)
+        ft.end_lap(92.0)                        # 这一圈被拒（比如中途接入）
+        ft.start_lap(92.0)
+        used = ft.end_lap(84.0)                 # 这一圈有效
+        assert used == pytest.approx(8.0), "不该量成两圈的 16"
+        ft.record(used)
+        assert ft.per_lap == pytest.approx(8.0)
+
+    def test_rejected_lap_does_not_feed_stats(self):
+        """`lap_result` 拒绝的圈不能把油耗喂进中位数。"""
+        fs = [f for f in synth_lap_frames(hz=10.0, laps=1)]
+        ft = FuelTracker()
+        ft.start_lap(fs[0].fuel_pct)
+        res = lap_result(fs[200:], lap=1, n_sectors=3, expected_len_m=L,
+                         fuel=ft)          # 中途接入 → 被拒
+        assert not res.ok
+        assert ft.values == [], "被拒的圈不该进统计"
+        assert ft.mark is not None, "但标记要推进到本圈末"
+
+    def test_accepted_lap_feeds_stats(self):
+        fs = [f for f in synth_lap_frames(hz=10.0, laps=1)]
+        ft = FuelTracker()
+        ft.start_lap(fs[0].fuel_pct)
+        res = lap_result(fs, lap=1, n_sectors=3, expected_len_m=L, fuel=ft)
+        assert res.ok
+        assert ft.values, "有效圈要进统计"
+        assert res.fuel_used == pytest.approx(8.0, abs=0.05)

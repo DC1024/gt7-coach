@@ -112,12 +112,31 @@ def main(argv=None) -> int:
         print("    ⚠ source=session → 接收器尚未写过 lap_started_at；"
               "PS5 一连上、跑起来后应变成 lap")
 
-    print("\n=== 4. 仪表盘页面里有工程师卡片 ===")
+    print("\n=== 4. R1.5 本地统计字段已暴露 ===")
+    st = get(args.coach + "/api/v1/coach/state")
+    for k in ("projected_lap_s", "last_lap", "theory_best_s",
+              "potential_gain_s", "fuel_per_lap", "fuel_laps_left"):
+        ck(f"state 有 {k}", k in st)
+    for k in ("sess_state", "ref_state", "ref_history", "sector_len_m",
+              "lap_samples", "fuel_samples"):
+        ck(f"stats 有 {k}", k in (st.get("stats") or {}))
+    h = st.get("stats", {}).get("ref_history") or {}
+    ck("ref_history 结构完整",
+       all(k in h for k in ("candidates", "rejected", "adopted")), str(h)[:80])
+
+    print("\n=== 5. 仪表盘页面里有工程师卡片 ===")
     with OPENER.open(args.dash + "/", timeout=30) as r:
         html = r.read().decode("utf-8", "replace")
     for needle in ('id="c-coach"', "coachMute", "coSay", "coHist",
-                   "function pollCoach", ".then(renderCoach, renderCoachOff)"):
+                   "function pollCoach", ".then(renderCoach, renderCoachOff)",
+                   "speechSynthesis.cancel()"):
         ck(f"页面含 {needle}", needle in html)
+
+    print("\n=== 6. Coach 自检页含语音抢占 ===")
+    with OPENER.open(args.coach + "/", timeout=30) as r:
+        demo = r.read().decode("utf-8", "replace")
+    ck("自检页 P0 抢占", "speechSynthesis.cancel()" in demo)
+    ck("自检页传优先级", "d.say[0].priority" in demo)
 
     print()
     if failures:

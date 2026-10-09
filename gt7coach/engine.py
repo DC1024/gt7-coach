@@ -515,12 +515,24 @@ class CoachEngine:
             return
         key = self.refs.key_for(sess)
         if key != self._ref_sess_key:
-            # 换场次 = 换赛道：自攒的旧参考圈必须作废，否则会拿上一条赛道的
-            # 折线去做「最近点定位」，结果是**静默**地把车定位到错误的位置。
+            # 🔴 「场次文件变了」和「同一场里最快圈刷新了」必须分开处理。
+            #    参考圈的 key 包含 best_lap_s（刷新了要重取剖面），但**只有
+            #    真的换了场次文件**才该作废自攒参考圈与帧缓冲。
+            #    曾经两者混在一起，后果是：直播场次里每跑完一圈 best_lap_s 就变，
+            #    于是每圈跑到 ~15s（下次轮询）时帧缓冲被清空 ——
+            #    分段统计永远是 0 圈、自攒参考圈永远建不起来，
+            #    而表面上一切正常（指令照回、状态照出）。
+            file_changed = (self._ref_sess_key is None
+                            or key[0] != self._ref_sess_key[0])
             self._ref_sess_key = key
-            self._self_ref = None
-            self._lap_buf = []
-        self.refs.request(sess)
+            if file_changed:
+                # 换场次 = 换赛道：自攒的旧参考圈必须作废，否则会拿上一条赛道的
+                # 折线去做「最近点定位」，结果是**静默**地把车定位到错误的位置。
+                self._self_ref = None
+                self._lap_buf = []
+                self._sector_len_m = None      # 换赛道 → 分段基准也要重来
+                self._sectors = SectorTracker(self.rules.cfg.sectors_n)
+            self.refs.request(sess)
 
     def _local_lap_stats(self, lap: int) -> None:
         """一圈跑完：本地算分段用时与油耗。
