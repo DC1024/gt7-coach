@@ -1,0 +1,50 @@
+# GT7 赛道工程师 —— Docker Compose 部署
+# ================================================================
+# 部署：docker compose up -d
+# 查看：docker compose logs -f
+# 自检：http://<本机IP>:8788/          （自带页面，点一下就能听）
+# 状态：curl http://127.0.0.1:8788/api/v1/coach/health
+#
+# ⚠️ network_mode: host 的理由
+#    要连宿主机的 127.0.0.1:8787（GT7 Dash）。bridge 模式下这个地址指向
+#    容器自己，连不上；host 模式最简单，也免得为了一个本地 HTTP 去改
+#    Dash 的监听地址。同理端口不用 ports: 映射（host 模式下直接占宿主机）。
+#
+# ⚠️ 和 GT7 Dash 是两个**独立项目**：本服务只通过 HTTP 读它的公开 v1。
+#    它挂了/没起，赛道工程师会一直退避重试，不会崩；反过来也一样。
+
+services:
+  gt7-coach:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: gt7-coach:latest
+    container_name: gt7-coach
+
+    network_mode: host
+
+    restart: unless-stopped
+
+    # 负载很低（10Hz 拉一次 live + 少量计算），限一下防止异常时吃满
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    environment:
+      TZ: Asia/Shanghai
+
+    command:
+      - serve
+      - --dash
+      - http://127.0.0.1:8787
+      - --bind
+      - 0.0.0.0
+      - --port
+      - "8788"
