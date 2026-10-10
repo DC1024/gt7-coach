@@ -534,6 +534,22 @@ DEMO_HTML = """<!DOCTYPE html>
  button{background:#1b2735;color:#cfe0f2;border:1px solid #2b3a4d;
         border-radius:8px;padding:7px 14px;cursor:pointer;font-size:13px}
  button.on{background:#14532d;border-color:#1e7a45;color:#7ff0b0}
+ select,input[type=text]{background:#0e1520;color:#dbe4ee;
+        border:1px solid #2b3a4d;border-radius:7px;padding:6px 9px;
+        font-size:13px;font-family:inherit}
+ input[type=range]{width:180px;vertical-align:middle;accent-color:#1e7a45}
+ .ctl{display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+      margin:6px 0;font-size:13px}
+ .ctl label{color:#7b8798;font-size:12px;min-width:88px}
+ .prow{display:flex;align-items:flex-start;gap:8px;padding:5px 0;
+       font-size:13px;cursor:pointer}
+ .psub{display:flex;align-items:center;gap:7px;padding:2px 0 2px 21px;
+       font-size:12px;cursor:pointer;color:#9aa7b6}
+ .psub.off label{color:#5b6675;text-decoration:line-through;opacity:.7}
+ .psub input{margin:0}
+ .warn{color:#fbbf24}
+ .okmsg{color:#5ee6a8}
+ .err{color:#f87171}
 </style></head><body>
 <h1>GT7 赛道工程师 · 自检页</h1>
 <div class="sub">直接问 /api/v1/coach/state，不经过仪表盘。</div>
@@ -549,9 +565,49 @@ DEMO_HTML = """<!DOCTYPE html>
 </div>
 <div class="card">
   <div class="sub" style="margin-bottom:10px">
-    播报开关 —— 关掉哪一类，就不再播那一类（勾选 = 播报）</div>
+    播报开关 —— 关掉哪一类，就不再播那一类（勾选 = 播报）；
+    每组下面是<strong>逐规则</strong>细分开关（关掉 = 连评估都不跑）</div>
   <div id="panel"></div>
   <div class="sub" id="panelmsg" style="margin-top:10px">加载中…</div>
+</div>
+<div class="card">
+  <div class="sub" style="margin-bottom:8px">打滑灵敏度 —— 三档预设 + 滑块微调</div>
+  <div class="ctl">
+    <label for="slipPreset">三档预设</label>
+    <select id="slipPreset">
+      <option value="strict">严格（街道）</option>
+      <option value="standard">标准（赛道日）</option>
+      <option value="lenient">宽容（漂移/拉力/泥地）</option>
+    </select>
+  </div>
+  <div class="ctl">
+    <label for="slipSlider">滑移率阈值</label>
+    <input type="range" id="slipSlider" min="0.08" max="0.30" step="0.005">
+    <b id="slipVal" style="min-width:38px">—</b>
+  </div>
+  <div class="sub" id="slipMsg">滑移率超过阈值才报「打滑」。选预设会把阈值设回该档基线，滑块可在档内微调。</div>
+</div>
+<div class="card">
+  <div class="sub" style="margin-bottom:8px">云措辞（OpenAI 兼容）—— 🔴 key 本体只放环境变量，这里填<strong>变量名</strong>，明文 key 绝不落盘</div>
+  <div class="ctl">
+    <label for="cloudPreset">服务商预设</label>
+    <select id="cloudPreset"><option value="">（不切换，仅查看）</option></select>
+    <span class="sub">选一个会把下面三框填成该家的默认值，按保存才生效</span>
+  </div>
+  <div class="ctl"><label for="cloudBaseUrl">base_url</label>
+    <input type="text" id="cloudBaseUrl" size="34"
+           placeholder="留空 = 用厂商默认端点"></div>
+  <div class="ctl"><label for="cloudKeyEnv">key 变量名</label>
+    <input type="text" id="cloudKeyEnv" size="34"
+           placeholder="如 GT7_COACH_LLM_KEY"></div>
+  <div class="ctl"><label for="cloudModel">模型名</label>
+    <input type="text" id="cloudModel" size="34"
+           placeholder="留空 = 用该家免费默认模型"></div>
+  <div class="ctl">
+    <button id="cloudSave">保存云措辞</button>
+    <button id="cloudToggle">停用</button>
+    <span class="sub" id="cloudMsg"></span>
+  </div>
 </div>
 <div class="card"><div class="sub">最近播报</div><div id="hist"></div></div>
 
@@ -658,23 +714,30 @@ function renderTts(t){
     + (t.errors ? " · 错误 " + t.errors : "");
 }
 // —— 播报开关面板：勾选=播报，取消=静音该分组 ——
+// #G：每组下面还有**逐规则细分开关**（subs），管「这条规则算不算」——
+//     与分组静音（出口拦截）是两层，走的接口也不同：分组 POST /panel，
+//     细分 POST /config 的 rules 节（布尔白名单）。
 function renderPanel(groups){
   document.getElementById("panel").innerHTML = groups.map(function(g){
     var tag = g.advice ? ' <span class="tag">'+g.advice+'</span>' : '';
-    return '<label style="display:flex;align-items:flex-start;gap:8px;'+
-      'padding:5px 0;font-size:13px;cursor:pointer">'+
+    var subs = (g.subs || []).map(function(s){
+      return '<div class="psub'+(s.on?'':' off')+'" data-sub="'+s.id+'">'+
+        '<input type="checkbox" '+(s.on?'checked':'')+' id="sub_'+s.id+'">'+
+        '<label for="sub_'+s.id+'">'+s.label+'</label></div>';
+    }).join("");
+    return '<div><label class="prow">'+
       '<input type="checkbox" data-gid="'+g.id+'" '+(g.muted?'':'checked')+
       ' style="margin-top:3px">'+
       '<span><b>'+g.label+'</b>'+tag+
-      '<br><span class="sub">'+g.desc+'</span></span></label>';
+      '<br><span class="sub">'+g.desc+'</span></span></label>'+subs+'</div>';
   }).join("");
   Array.prototype.forEach.call(
-    document.querySelectorAll("#panel input"), function(cb){
+    document.querySelectorAll("#panel input[data-gid]"), function(cb){
       cb.onchange = function(){
-        var muted = Array.prototype.filter.call(
-          document.querySelectorAll("#panel input"),
-          function(c){ return !c.checked; }
-        ).map(function(c){ return c.getAttribute("data-gid"); });
+        var muted = Array.prototype.map.call(
+          document.querySelectorAll("#panel input[data-gid]"),
+          function(c){ return c.checked ? null : c.getAttribute("data-gid"); }
+        ).filter(function(x){ return x; });
         fetch("/api/v1/coach/panel", {method:"POST",
           headers:{"Content-Type":"application/json"},
           body: JSON.stringify({muted: muted})})
@@ -695,19 +758,185 @@ function renderPanel(groups){
         });
       };
     });
+  // 细分开关：POST /config {rules:{<id>: bool}} —— 服务端布尔白名单校验
+  Array.prototype.forEach.call(
+    document.querySelectorAll("#panel .psub input"), function(cb){
+      cb.onchange = function(){
+        var id = cb.parentElement.getAttribute("data-sub"), on = cb.checked;
+        fetch("/api/v1/coach/config", {method:"POST",
+          headers:{"Content-Type":"application/json"},
+          body: JSON.stringify({rules: (function(o){o[id]=on;return o;})({})})})
+        .then(function(r){ return r.json(); })
+        .then(function(d){
+          var msg = document.getElementById("panelmsg");
+          if (d.ok){
+            document.getElementById("panelmsg").textContent =
+              "已保存：「"+id+"」" + (on ? "开" : "关");
+            msg.className = "sub okmsg";
+          } else {
+            document.getElementById("panelmsg").textContent =
+              "保存失败：" + (d.error || "未知错误");
+            msg.className = "sub err";
+            loadPanel();                       // 回读真值，别让 UI 骗人
+          }
+        })
+        .then(null, function(e){
+          document.getElementById("panelmsg").textContent = "保存失败："+e;
+        });
+      };
+    });
 }
 function loadPanel(){
   fetch("/api/v1/coach/panel").then(function(r){return r.json();})
   .then(function(d){
     if (d.groups){ renderPanel(d.groups);
-      document.getElementById("panelmsg").textContent =
+      var msg = document.getElementById("panelmsg");
+      msg.className = "sub";
+      msg.textContent =
         d.muted.length ? ("当前静音：" + d.muted.join("、")) : "全部开启"; }
   })
   .then(null, function(e){
     document.getElementById("panelmsg").textContent = "加载失败："+e;
   });
 }
+
+// —— 打滑三档（#J）：预设只是标签，真值是 slip_threshold ——
+var SLIP_LABEL = {strict:"严格（街道）", standard:"标准（赛道日）",
+                  lenient:"宽容（漂移/拉力/泥地）"};
+function renderSlip(cfg){
+  var sel = document.getElementById("slipPreset"),
+      sl = document.getElementById("slipSlider"),
+      val = document.getElementById("slipVal");
+  if (!sel || !sl || !cfg.rules) return;
+  var r = cfg.rules;
+  // 🔴 不覆盖正在操作的控件（与仪表盘同一个坑：无条件回填会冲掉正拖的滑块）
+  if (document.activeElement !== sel) sel.value = r.slip_preset || "standard";
+  var thr = (typeof r.slip_threshold === "number") ? r.slip_threshold
+                                                   : parseFloat(sl.value);
+  if (document.activeElement !== sl){
+    sl.value = thr; val.textContent = thr.toFixed(2);
+  }
+}
+function saveRules(patch, okText){
+  var msg = document.getElementById("slipMsg");
+  return fetch("/api/v1/coach/config", {method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify(patch)})
+  .then(function(r){ return r.json(); })
+  .then(function(d){
+    if (d.ok){ renderSlip(d.config);
+      msg.textContent = okText; msg.className = "sub okmsg"; }
+    else { msg.textContent = "保存失败：" + (d.error || "未知错误");
+           msg.className = "sub err"; }
+  })
+  .then(null, function(e){
+    msg.textContent = "保存失败：" + e; msg.className = "sub err";
+  });
+}
+document.getElementById("slipPreset").onchange = function(){
+  saveRules({rules:{slip_preset:this.value}},
+    "已切换为「" + (SLIP_LABEL[this.value] || this.value) +
+    "」档，阈值回到该档基线。");
+};
+document.getElementById("slipSlider").onchange = function(){
+  saveRules({rules:{slip_threshold: parseFloat(this.value)}},
+    "阈值已微调为 " + parseFloat(this.value).toFixed(2) + "。");
+};
+
+// —— 云措辞三框（#H）：base_url / key 变量名 / 模型名 ——
+var cloudPresets = {};
+function renderCloudStatus(d){
+  var msg = document.getElementById("cloudMsg"),
+      btn = document.getElementById("cloudToggle");
+  if (!d){ msg.textContent = "云措辞：未上报"; return; }
+  btn.textContent = d.enabled ? "停用" : "启用";
+  var warn = d.model_warning ? " ⚠️" + d.model_warning : "";
+  msg.textContent = (d.enabled ? "已启用" : "已停用")
+    + " · " + (d.model || "（默认模型）")
+    + (d.base_url ? " · " + d.base_url : "")
+    + (d.api_key_env ? " · key=" + d.api_key_env : "") + warn;
+  msg.className = "sub" + (d.model_warning ? " warn" : "");
+}
+function loadCloudStatus(){
+  fetch("/api/v1/coach/cloud").then(function(r){return r.json();})
+  .then(renderCloudStatus)
+  .then(null, function(){});
+}
+document.getElementById("cloudSave").onclick = function(){
+  var msg = document.getElementById("cloudMsg");
+  var body = {
+    model: document.getElementById("cloudModel").value.trim(),
+    base_url: document.getElementById("cloudBaseUrl").value.trim(),
+    api_key_env: document.getElementById("cloudKeyEnv").value.trim()
+  };
+  msg.className = "sub"; msg.textContent = "保存中…";
+  fetch("/api/v1/coach/cloud", {method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify(body)})
+  .then(function(r){ return r.json(); })
+  .then(function(d){
+    if (d.ok){ msg.className = "sub okmsg";
+      msg.textContent = "已保存（填了模型/端点会自动启用）。";
+      renderCloudStatus(d.cloud); }
+    else { msg.className = "sub err";
+      msg.textContent = "保存失败：" + (d.error || "未知错误"); }
+  })
+  .then(null, function(e){
+    msg.className = "sub err"; msg.textContent = "保存失败：" + e;
+  });
+};
+document.getElementById("cloudToggle").onclick = function(){
+  var msg = document.getElementById("cloudMsg");
+  var to = this.textContent === "停用" ? false : true;
+  msg.className = "sub"; msg.textContent = "保存中…";
+  fetch("/api/v1/coach/cloud", {method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({enabled: to})})
+  .then(function(r){ return r.json(); })
+  .then(function(d){
+    if (d.ok){ renderCloudStatus(d.cloud);
+      msg.className = "sub okmsg";
+      msg.textContent = to ? "已启用。" : "已停用（回到纯本地模板）。"; }
+    else { msg.className = "sub err";
+      msg.textContent = "保存失败：" + (d.error || "未知错误"); }
+  })
+  .then(null, function(e){
+    msg.className = "sub err"; msg.textContent = "保存失败：" + e;
+  });
+};
+document.getElementById("cloudPreset").onchange = function(){
+  var k = this.value, p = cloudPresets[k];
+  if (!p) return;                       // 「不切换」选项
+  // 只填框不保存 —— 用户看完三框再决定（与仪表盘同一交互）
+  document.getElementById("cloudBaseUrl").value = p.base_url || "";
+  document.getElementById("cloudKeyEnv").value = p.api_key_env || "";
+  document.getElementById("cloudModel").value = p.model || "";
+};
+function loadConfig(){
+  fetch("/api/v1/coach/config").then(function(r){return r.json();})
+  .then(function(cfg){
+    renderSlip(cfg);
+    // 服务商预设下拉只填一次（之后不重写，避免冲掉正展开的选项）
+    if (cfg.cloud_presets){
+      cloudPresets = cfg.cloud_presets;
+      var sel = document.getElementById("cloudPreset");
+      if (sel.options.length <= 1){
+        Object.keys(cloudPresets).forEach(function(k){
+          var o = document.createElement("option");
+          o.value = k;
+          o.textContent = cloudPresets[k].label || k;
+          sel.appendChild(o);
+        });
+      }
+    }
+  })
+  .then(null, function(){});
+}
 loadPanel();
+loadConfig();
+loadCloudStatus();
 poll(); setInterval(poll, 200);
+setInterval(loadConfig, 3000);       // 回填打滑阈值（不碰正在操作的控件）
+setInterval(loadCloudStatus, 3000);  // 云状态（调用数/费用/警告）
 </script></body></html>
 """

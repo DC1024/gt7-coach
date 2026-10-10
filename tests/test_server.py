@@ -178,6 +178,24 @@ class TestRoutes:
         # 面板内嵌在自检页里（用户自选播报内容）
         assert "/api/v1/coach/panel" in html
 
+    def test_demo_page_matches_dashboard_capabilities(self, server):
+        """自检页必须与仪表盘教练卡片同等全面（用户要求：自检页是
+        功能最全的操作面）—— 细分开关 / 打滑三档 / 云措辞三框缺一不可。"""
+        with _OPENER.open(server + "/", timeout=5) as r:
+            html = r.read().decode("utf-8")
+        # #G 细分开关：走 /config 的 rules 节（布尔白名单）
+        assert "data-sub" in html, "自检页缺逐规则细分开关"
+        assert "/api/v1/coach/config" in html
+        # #J 打滑三档：预设 + 阈值微调
+        assert "slip_preset" in html and "slip_threshold" in html
+        assert "slipPreset" in html and "slipSlider" in html
+        # #H 云措辞三框：base_url / key 变量名 / model + 服务商预设
+        assert "/api/v1/coach/cloud" in html
+        assert "cloudBaseUrl" in html and "cloudKeyEnv" in html \
+            and "cloudModel" in html
+        # 🔴 红线在 UI 也要说得明白：填的是变量名，不是 key 本体
+        assert "变量名" in html
+
 
 class TestBroadcastPanel:
     """播报开关面板：用户自选"什么内容播报、什么不播报"。"""
