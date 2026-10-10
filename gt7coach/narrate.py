@@ -442,6 +442,9 @@ class Narrator:
         return {
             "enabled": bool(cfg and cfg.enabled),
             "provider": cfg.provider if cfg else None,
+            # 🔴 #H：base_url 也透出（URL 非敏感），UI 才能把「自定义端点」
+            #    回填进三框之一。空 = 没覆盖，在用预设厂商的 base_url。
+            "base_url": cfg.base_url if cfg else "",
             "fallbacks": list(cfg.fallbacks) if cfg else [],
             "degraded": st["degraded"] or self._in_cooldown(),
             "calls": st["calls"],

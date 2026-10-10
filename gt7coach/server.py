@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 from dataclasses import asdict
@@ -48,6 +49,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from . import cloud
 from .contract import CoachState
 from .engine import CoachConfig, CoachEngine
 from .rules import SLIP_PRESETS
@@ -150,6 +152,11 @@ class CoachService:
             "gate": asdict(self.engine.gate.cfg),
             # #J：打滑三档预设的各档基线，给 UI 渲染下拉 + 滑块初始值
             "slip_presets": dict(SLIP_PRESETS),
+            # #H：云措辞服务商预设（label/base_url/model/api_key_env），
+            #     给 UI 渲染「一键填入」下拉。与打滑预设同一个套路：
+            #     真值永远在服务端，前端只是渲染器。
+            "cloud_presets": {k: dict(v)
+                              for k, v in cloud.PROVIDER_PRESETS.items()},
         }
 
     def cloud_status(self) -> dict[str, Any]:
@@ -157,15 +164,22 @@ class CoachService:
         估算费用 / 降级状态 / 违规计数。**外加当前模型名与是否在免费额度内**。"""
         return self.engine.narrator.status()
 
-    # —— 云措辞的「模型名」写入（用户自行填写模型名的入口之一）———————
+    # —— 云措辞的「OpenAI 兼容三框」写入（#H）—————————————————
+    #
+    # 🔴 红线不变：**明文 api_key 绝不进配置文件**。这里能写的只有
+    #    `api_key_env`（key 所在的**环境变量名**）——key 本体永远待在
+    #    环境变量里。所以 UI 那个"api_key 框"填的是变量名，不是 key。
+    #    base_url / provider 是普通配置值，落盘没问题。
+    CLOUD_WRITABLE = ("model", "enabled", "base_url", "api_key_env",
+                      "provider")
 
-    # 🔴 只开放这两项。**不开放 api_key / api_key_env**：明文 key 绝不进
-    #    配置文件（全仓库的一条红线），而"顺手改 key 却把环境变量名改错"
-    #    的排查成本远高于收益。
-    CLOUD_WRITABLE = ("model", "enabled")
+    # api_key_env 必须长得像环境变量名（字母/下划线开头，后接字母数字下划线）。
+    # 用户把 key 明文粘进这个框是最常见的错法 —— 拦下来并说清楚，比静默
+    # 存进文件（违反红线）或存进去后运行时查不到变量（以为设好了）都好。
+    _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
     def set_cloud(self, body: dict[str, Any]) -> dict[str, Any]:
-        """把用户填的模型名写进 cloud.json（另一个入口是直接编辑这个文件）。
+        """把用户填的云配置写进 cloud.json（另一个入口是直接编辑这个文件）。
 
         为什么写**文件**而不是只存内存：cloud.json 是唯一真值源，Narrator
         靠 mtime 热加载。只改内存的话重启就丢，用户会以为"我明明设过"。
@@ -181,12 +195,28 @@ class CoachService:
         bad = [k for k in body if k not in self.CLOUD_WRITABLE]
         if bad:
             raise ValueError(
-                f"不支持的字段 {bad}（只允许 {list(self.CLOUD_WRITABLE)}）")
-        if "model" in body and not isinstance(body["model"], str):
-            raise ValueError("model 必须是字符串")
-        model = str(body.get("model") or "").strip()
-        if len(model) > 128:
+                f"不支持的字段 {bad}（只允许 {list(self.CLOUD_WRITABLE)}；"
+                f"明文 api_key 永远不收 —— key 请放进环境变量，这里只填变量名）")
+        # —— 字符串字段校验（#H 三框）——
+        for k in ("model", "base_url", "api_key_env", "provider"):
+            if k in body and not isinstance(body[k], str):
+                raise ValueError(f"{k} 必须是字符串")
+        model = str(body.get("model") or "").strip() if "model" in body else None
+        if model is not None and len(model) > 128:
             raise ValueError("model 名过长（>128 字符）")
+        base_url = str(body.get("base_url") or "").strip()
+        if base_url and not base_url.startswith(("http://", "https://")):
+            raise ValueError("base_url 必须以 http:// 或 https:// 开头")
+        if len(base_url) > 256:
+            raise ValueError("base_url 过长（>256 字符）")
+        api_key_env = str(body.get("api_key_env") or "").strip()
+        if api_key_env and not self._ENV_NAME_RE.match(api_key_env):
+            raise ValueError(
+                "api_key_env 必须是合法的环境变量名（字母/下划线开头），"
+                "不要把 key 本体粘进来 —— 明文 key 绝不落盘")
+        provider = str(body.get("provider") or "").strip()
+        if len(provider) > 64:
+            raise ValueError("provider 名过长（>64 字符）")
 
         # 读旧文件：不存在 / 坏了都当空对象，**不因此拒绝写入**
         # （用户第一次用就是没有这个文件）。
@@ -198,12 +228,22 @@ class CoachService:
         except (OSError, json.JSONDecodeError):
             cur = {}
 
-        cur["model"] = model
+        # 🔴 只覆盖**本次请求带来的**字段：只改 api_key_env 不该顺手把
+        #    已设的 model 清掉（#H 之前 model 是无条件覆盖的，单框时代
+        #    无所谓，三框时代就是 bug）。
+        if model is not None:
+            cur["model"] = model
+        if "base_url" in body:
+            cur["base_url"] = base_url
+        if "api_key_env" in body:
+            cur["api_key_env"] = api_key_env
+        if "provider" in body:
+            cur["provider"] = provider
         if "enabled" in body:
             cur["enabled"] = bool(body["enabled"])
-        elif model:
-            # 只填了模型名 = 想用云。不顺手打开的话，用户会看到"填了却没反应"，
-            # 而真值（enabled=false）藏在文件里，界面上看不见。
+        elif model or base_url:
+            # 填了模型/端点 = 想用云。不顺手打开的话，用户会看到
+            # "填了却没反应"，而真值（enabled=false）藏在文件里，界面上看不见。
             cur["enabled"] = True
 
         # 原子写（tmp + replace）：别让热加载读到半个文件

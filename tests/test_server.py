@@ -354,183 +354,8 @@ class TestCloudModelWrite:
       ① 用户填的 model 对预设厂商**完全无效**（见 test_cloud 的回归）；
       ② 默认模型 `qwen-flash` 不在免费名单里 → 填了 key 就静默计费。
     写接口本身的设计红线：
-      · **只开放 model / enabled**，不开放 api_key —— 明文 key 绝不进配置文件；
-      · 写**文件**而不是只存内存 —— cloud.json 是唯一真值源，重启不能丢；
-      · 白名单式校验 —— 把 model 拼成 modal 却以为设上了是最坏的结果。
-    """
-
-    class _Src:
-        last_error = None
-
-        def poll(self):
-            return None
-
-    def _svc(self, path) -> CoachService:
-        return CoachService(CoachEngine(self._Src(),
-                                        CoachConfig(cloud_path=str(path))))
-
-    def test_write_model_creates_cloud_json(self, tmp_path):
-        p = tmp_path / "cloud.json"
-        svc = self._svc(p)
-        out = svc.set_cloud({"model": "qwen3.8-flash"})
-        assert out["ok"] is True
-        assert p.exists(), "必须落盘 —— 只存内存的话重启就丢"
-        d = json.loads(p.read_text(encoding="utf-8"))
-        assert d["model"] == "qwen3.8-flash"
-        # 只填模型名 = 想用云；不顺手打开的话用户会看到"填了却没反应"
-        assert d["enabled"] is True
-
-    def test_write_takes_effect_immediately(self, tmp_path):
-        """🔴 改完**立刻**生效，不用重启、也不用等下一次 render。"""
-        p = tmp_path / "cloud.json"
-        svc = self._svc(p)
-        before = svc.cloud_status()
-        assert before["model_from_user"] is False
-        svc.set_cloud({"model": "kimi-k3"})
-        st = svc.cloud_status()
-        assert st["model"] == "kimi-k3"
-        assert st["model_from_user"] is True
-        assert st["enabled"] is True
-        assert st["model_is_free"] is True
-
-    def test_write_preserves_existing_keys(self, tmp_path):
-        """用户手写的其它字段不能被写接口吃掉。"""
-        p = tmp_path / "cloud.json"
-        p.write_text(json.dumps({
-            "enabled": True, "provider": "dashscope",
-            "base_url": "https://example.invalid/v1",
-            "api_key_env": "MY_OWN_KEY", "timeout_s": 1.5,
-            "limits": {"per_lap": 1, "per_day": 50},
-        }), encoding="utf-8")
-        svc = self._svc(p)
-        svc.set_cloud({"model": "glm-5.3"})
-        d = json.loads(p.read_text(encoding="utf-8"))
-        assert d["model"] == "glm-5.3"
-        assert d["api_key_env"] == "MY_OWN_KEY"      # 没被改
-        assert d["limits"] == {"per_lap": 1, "per_day": 50}
-        assert d["timeout_s"] == 1.5
-
-    def test_corrupt_file_is_replaced_not_fatal(self, tmp_path):
-        """cloud.json 坏了不该让写接口 500 —— 用户正是来修的。"""
-        p = tmp_path / "cloud.json"
-        p.write_text("{ 这不是 JSON", encoding="utf-8")
-        svc = self._svc(p)
-        out = svc.set_cloud({"model": "kimi-k3"})
-        assert out["ok"] is True
-        assert json.loads(p.read_text(encoding="utf-8"))["model"] == "kimi-k3"
-
-    def test_unknown_field_is_rejected(self, tmp_path):
-        svc = self._svc(tmp_path / "cloud.json")
-        with pytest.raises(ValueError):
-            svc.set_cloud({"modal": "kimi-k3"})        # 手滑拼错
-
-    def test_api_key_can_not_be_written(self, tmp_path):
-        """🔴 明文 key 绝不进配置文件 —— 全仓库的一条红线。"""
-        p = tmp_path / "cloud.json"
-        svc = self._svc(p)
-        with pytest.raises(ValueError):
-            svc.set_cloud({"api_key": "sk-whatever"})
-        assert not p.exists(), "被拒绝就不该留下任何文件"
-
-    def test_non_string_model_is_rejected(self, tmp_path):
-        svc = self._svc(tmp_path / "cloud.json")
-        with pytest.raises(ValueError):
-            svc.set_cloud({"model": 123})
-
-    def test_overlong_model_is_rejected(self, tmp_path):
-        svc = self._svc(tmp_path / "cloud.json")
-        with pytest.raises(ValueError):
-            svc.set_cloud({"model": "x" * 129})
-
-    def test_missing_cloud_path_gives_an_actionable_error(self):
-        """没配 --cloud 时，报错必须告诉用户**怎么办**，不能只说"失败"。"""
-        svc = CoachService(CoachEngine(self._Src(), CoachConfig()))  # 无 cloud_path
-        with pytest.raises(ValueError) as ei:
-            svc.set_cloud({"model": "kimi-k3"})
-        assert "--cloud" in str(ei.value)
-
-    def test_clearing_the_model_keeps_enabled(self, tmp_path):
-        """清空模型名 = 回到厂商预设，**不等于**关掉云措辞。"""
-        p = tmp_path / "cloud.json"
-        svc = self._svc(p)
-        svc.set_cloud({"model": "kimi-k3"})
-        svc.set_cloud({"model": ""})
-        d = json.loads(p.read_text(encoding="utf-8"))
-        assert d["model"] == ""
-        assert d["enabled"] is True
-        assert svc.cloud_status()["model_from_user"] is False
-
-    def test_enabled_can_be_turned_off_explicitly(self, tmp_path):
-        p = tmp_path / "cloud.json"
-        svc = self._svc(p)
-        svc.set_cloud({"model": "kimi-k3"})
-        svc.set_cloud({"enabled": False})
-        assert svc.cloud_status()["enabled"] is False
-
-    def test_non_free_model_reaches_the_status_with_a_warning(self, tmp_path):
-        """只警告不拦：模型照收，但状态里必须带着警告（防静默扣费）。"""
-        svc = self._svc(tmp_path / "cloud.json")
-        out = svc.set_cloud({"model": "qwen-flash"})     # 不在免费名单
-        st = out["cloud"]
-        assert st["model"] == "qwen-flash"               # 没被拦
-        assert st["enabled"] is True
-        assert st["model_is_free"] is False
-        assert "可能按量计费" in st["model_warning"]
-
-    def test_route_over_http(self, tmp_path):
-        """路由真的通（POST 不是 404），且改完 GET /cloud 就能看到。"""
-        p = tmp_path / "cloud.json"
-        frames = synth_lap_frames(laps=1)
-        src = ReplaySource(frames, profile=synth_profile(), loop=True)
-        eng = CoachEngine(src, CoachConfig(poll_interval_s=0.05,
-                                           sess_poll_boot_s=0.0,
-                                           sess_poll_idle_s=0.0,
-                                           cloud_path=str(p)))
-        svc = CoachService(eng, interval_s=0.05)
-        srv = make_server(svc, host="127.0.0.1", port=0)
-        th = threading.Thread(target=srv.serve_forever, daemon=True)
-        th.start()
-        base = f"http://127.0.0.1:{srv.server_address[1]}"
-        try:
-            code, d = _post(base + "/api/v1/coach/cloud",
-                            {"model": "deepseek-v4.1-flash"})
-            assert code == 200 and d["ok"] is True
-            assert d["cloud"]["model"] == "deepseek-v4.1-flash"
-            # 再 GET 一次：证明是**落盘**了，不是只改了内存
-            code2, d2, _ = _get(base + "/api/v1/coach/cloud")
-            assert code2 == 200
-            assert d2["model"] == "deepseek-v4.1-flash"
-            assert d2["model_is_free"] is True
-            assert json.loads(p.read_text(encoding="utf-8"))["model"] \
-                == "deepseek-v4.1-flash"
-        finally:
-            svc.stop()
-            srv.shutdown()
-            srv.server_close()
-
-    def test_route_rejects_unknown_field_over_http(self, tmp_path):
-        p = tmp_path / "cloud.json"
-        svc = self._svc(p)
-        srv = make_server(svc, host="127.0.0.1", port=0)
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
-        base = f"http://127.0.0.1:{srv.server_address[1]}"
-        try:
-            with pytest.raises(urllib.error.HTTPError) as ei:
-                _post(base + "/api/v1/coach/cloud", {"nope": 1})
-            assert ei.value.code == 400
-        finally:
-            srv.shutdown()
-            srv.server_close()
-
-
-class TestCloudModelWrite:
-    """「让用户自己填模型名」的写入口：`POST /api/v1/coach/cloud`。
-
-    这条需求（2026-10-09）查出来两个真问题，都在这里守：
-      ① 用户填的 model 对预设厂商**完全无效**（见 test_cloud 的回归）；
-      ② 默认模型 `qwen-flash` 不在免费名单里 → 填了 key 就静默计费。
-    写接口本身的设计红线：
-      · **只开放 model / enabled**，不开放 api_key —— 明文 key 绝不进配置文件；
+      · **不开放 api_key** —— 明文 key 绝不进配置文件（#H 后开放的是
+        base_url / api_key_env / provider，其中 api_key_env 只是变量名）；
       · 写**文件**而不是只存内存 —— cloud.json 是唯一真值源，重启不能丢；
       · 白名单式校验 —— 把 model 拼成 modal 却以为设上了是最坏的结果。
     """
@@ -697,16 +522,11 @@ class TestCloudModelWrite:
             srv.server_close()
 
 
-class TestCloudModelWrite:
-    """「让用户自己填模型名」的写入口：`POST /api/v1/coach/cloud`。
+class TestCloudCompatConfig:
+    """#H：OpenAI 兼容三框（base_url / api_key_env / model）+ 服务商预设。
 
-    这条需求（2026-10-09）查出来两个真问题，都在这里守：
-      ① 用户填的 model 对预设厂商**完全无效**（见 test_cloud 的回归）；
-      ② 默认模型 `qwen-flash` 不在免费名单里 → 填了 key 就静默计费。
-    写接口本身的设计红线：
-      · **只开放 model / enabled**，不开放 api_key —— 明文 key 绝不进配置文件；
-      · 写**文件**而不是只存内存 —— cloud.json 是唯一真值源，重启不能丢；
-      · 白名单式校验 —— 把 model 拼成 modal 却以为设上了是最坏的结果。
+    红线再守一遍：**明文 key 绝不落盘** —— 三框里的"key 框"收的是
+    **环境变量名**，用户把 `sk-...` 粘进来必须被拦下并说明原因。
     """
 
     class _Src:
@@ -719,153 +539,63 @@ class TestCloudModelWrite:
         return CoachService(CoachEngine(self._Src(),
                                         CoachConfig(cloud_path=str(path))))
 
-    def test_write_model_creates_cloud_json(self, tmp_path):
+    def test_three_fields_written_to_cloud_json(self, tmp_path):
         p = tmp_path / "cloud.json"
         svc = self._svc(p)
-        out = svc.set_cloud({"model": "qwen3.8-flash"})
+        out = svc.set_cloud({"model": "gpt-4o-mini",
+                             "base_url": "https://api.openai.com/v1",
+                             "api_key_env": "OPENAI_API_KEY",
+                             "provider": "openai"})
         assert out["ok"] is True
-        assert p.exists(), "必须落盘 —— 只存内存的话重启就丢"
         d = json.loads(p.read_text(encoding="utf-8"))
-        assert d["model"] == "qwen3.8-flash"
-        # 只填模型名 = 想用云；不顺手打开的话用户会看到「填了却没反应」
-        assert d["enabled"] is True
-
-    def test_write_takes_effect_immediately(self, tmp_path):
-        """🔴 改完**立刻**生效，不用重启、也不用等下一次 render。"""
-        p = tmp_path / "cloud.json"
-        svc = self._svc(p)
-        before = svc.cloud_status()
-        assert before["model_from_user"] is False
-        svc.set_cloud({"model": "kimi-k3"})
+        assert d["model"] == "gpt-4o-mini"
+        assert d["base_url"] == "https://api.openai.com/v1"
+        assert d["api_key_env"] == "OPENAI_API_KEY"
+        assert d["provider"] == "openai"
+        assert d["enabled"] is True          # 填了端点 = 想用云
+        # GET /cloud 要能看到 base_url（UI 回填用；URL 非敏感）
         st = svc.cloud_status()
-        assert st["model"] == "kimi-k3"
-        assert st["model_from_user"] is True
-        assert st["enabled"] is True
-        assert st["model_is_free"] is True
+        assert st["base_url"] == "https://api.openai.com/v1"
 
-    def test_write_preserves_existing_keys(self, tmp_path):
-        """用户手写的其它字段不能被写接口吃掉。"""
-        p = tmp_path / "cloud.json"
-        p.write_text(json.dumps({
-            "enabled": True, "provider": "dashscope",
-            "base_url": "https://example.invalid/v1",
-            "api_key_env": "MY_OWN_KEY", "timeout_s": 1.5,
-            "limits": {"per_lap": 1, "per_day": 50},
-        }), encoding="utf-8")
-        svc = self._svc(p)
-        svc.set_cloud({"model": "glm-5.3"})
-        d = json.loads(p.read_text(encoding="utf-8"))
-        assert d["model"] == "glm-5.3"
-        assert d["api_key_env"] == "MY_OWN_KEY"      # 没被改
-        assert d["limits"] == {"per_lap": 1, "per_day": 50}
-        assert d["timeout_s"] == 1.5
-
-    def test_corrupt_file_is_replaced_not_fatal(self, tmp_path):
-        """cloud.json 坏了不该让写接口 500 —— 用户正是来修它的。"""
-        p = tmp_path / "cloud.json"
-        p.write_text("{ 这不是 JSON", encoding="utf-8")
-        svc = self._svc(p)
-        out = svc.set_cloud({"model": "kimi-k3"})
-        assert out["ok"] is True
-        assert json.loads(p.read_text(encoding="utf-8"))["model"] == "kimi-k3"
-
-    def test_unknown_field_is_rejected(self, tmp_path):
-        svc = self._svc(tmp_path / "cloud.json")
-        with pytest.raises(ValueError):
-            svc.set_cloud({"modal": "kimi-k3"})        # 手滑拼错
-
-    def test_api_key_can_not_be_written(self, tmp_path):
-        """🔴 明文 key 绝不进配置文件 —— 全仓库的一条红线。"""
-        p = tmp_path / "cloud.json"
-        svc = self._svc(p)
-        with pytest.raises(ValueError):
-            svc.set_cloud({"api_key": "sk-whatever"})
-        assert not p.exists(), "被拒绝就不该留下任何文件"
-
-    def test_non_string_model_is_rejected(self, tmp_path):
-        svc = self._svc(tmp_path / "cloud.json")
-        with pytest.raises(ValueError):
-            svc.set_cloud({"model": 123})
-
-    def test_overlong_model_is_rejected(self, tmp_path):
-        svc = self._svc(tmp_path / "cloud.json")
-        with pytest.raises(ValueError):
-            svc.set_cloud({"model": "x" * 129})
-
-    def test_missing_cloud_path_gives_an_actionable_error(self):
-        """没配 --cloud 时，报错必须告诉用户**怎么办**，不能只说「失败」。"""
-        svc = CoachService(CoachEngine(self._Src(), CoachConfig()))  # 无 cloud_path
-        with pytest.raises(ValueError) as ei:
-            svc.set_cloud({"model": "kimi-k3"})
-        assert "--cloud" in str(ei.value)
-
-    def test_clearing_the_model_keeps_enabled(self, tmp_path):
-        """清空模型名 = 回到厂商预设，**不等于**关掉云措辞。"""
+    def test_partial_update_keeps_existing_fields(self, tmp_path):
+        """只改 api_key_env 不该把已设的 model 清掉 —— 三框各自独立。"""
         p = tmp_path / "cloud.json"
         svc = self._svc(p)
         svc.set_cloud({"model": "kimi-k3"})
-        svc.set_cloud({"model": ""})
+        svc.set_cloud({"api_key_env": "MOONSHOT_API_KEY"})
         d = json.loads(p.read_text(encoding="utf-8"))
-        assert d["model"] == ""
-        assert d["enabled"] is True
-        assert svc.cloud_status()["model_from_user"] is False
+        assert d["model"] == "kimi-k3"
+        assert d["api_key_env"] == "MOONSHOT_API_KEY"
+        # 部分更新不动 enabled：它保持第一次写入时的 True（第一笔填了 model
+        # = 想用云），而不是被第二次"只改变量名"的请求顺手改掉。
+        assert d.get("enabled") is True
 
-    def test_enabled_can_be_turned_off_explicitly(self, tmp_path):
+    def test_plaintext_key_in_env_name_is_rejected(self, tmp_path):
         p = tmp_path / "cloud.json"
         svc = self._svc(p)
-        svc.set_cloud({"model": "kimi-k3"})
-        svc.set_cloud({"enabled": False})
-        assert svc.cloud_status()["enabled"] is False
+        with pytest.raises(ValueError, match="环境变量名"):
+            svc.set_cloud({"api_key_env": "sk-abc123"})
+        with pytest.raises(ValueError, match="环境变量名"):
+            svc.set_cloud({"api_key_env": "OPENAI KEY"})   # 有空格
+        assert not p.exists() or "sk-" not in p.read_text(encoding="utf-8")
 
-    def test_non_free_model_reaches_the_status_with_a_warning(self, tmp_path):
-        """只警告不拦：模型照收，但状态里必须带着警告（防静默扣费）。"""
+    def test_bad_base_url_rejected(self, tmp_path):
         svc = self._svc(tmp_path / "cloud.json")
-        out = svc.set_cloud({"model": "qwen-flash"})     # 不在免费名单
-        st = out["cloud"]
-        assert st["model"] == "qwen-flash"               # 没被拦
-        assert st["enabled"] is True
-        assert st["model_is_free"] is False
-        assert "可能按量计费" in st["model_warning"]
+        with pytest.raises(ValueError, match="http"):
+            svc.set_cloud({"base_url": "api.openai.com/v1"})   # 漏了协议
 
-    def test_route_over_http(self, tmp_path):
-        """路由真的通（POST 不是 404），且改完 GET /cloud 就能看到。"""
-        p = tmp_path / "cloud.json"
-        frames = synth_lap_frames(laps=1)
-        src = ReplaySource(frames, profile=synth_profile(), loop=True)
-        eng = CoachEngine(src, CoachConfig(poll_interval_s=0.05,
-                                           sess_poll_boot_s=0.0,
-                                           sess_poll_idle_s=0.0,
-                                           cloud_path=str(p)))
-        svc = CoachService(eng, interval_s=0.05)
-        srv = make_server(svc, host="127.0.0.1", port=0)
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
-        base = f"http://127.0.0.1:{srv.server_address[1]}"
-        try:
-            code, d = _post(base + "/api/v1/coach/cloud",
-                            {"model": "deepseek-v4.1-flash"})
-            assert code == 200 and d["ok"] is True
-            assert d["cloud"]["model"] == "deepseek-v4.1-flash"
-            # 再 GET 一次：证明是**落盘**了，不是只改了内存
-            code2, d2, _ = _get(base + "/api/v1/coach/cloud")
-            assert code2 == 200
-            assert d2["model"] == "deepseek-v4.1-flash"
-            assert d2["model_is_free"] is True
-            assert json.loads(p.read_text(encoding="utf-8"))["model"] \
-                == "deepseek-v4.1-flash"
-        finally:
-            svc.stop()
-            srv.shutdown()
-            srv.server_close()
-
-    def test_route_rejects_unknown_field_over_http(self, tmp_path):
+    def test_config_exposes_cloud_presets(self, tmp_path):
         svc = self._svc(tmp_path / "cloud.json")
-        srv = make_server(svc, host="127.0.0.1", port=0)
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
-        base = f"http://127.0.0.1:{srv.server_address[1]}"
-        try:
-            with pytest.raises(urllib.error.HTTPError) as ei:
-                _post(base + "/api/v1/coach/cloud", {"nope": 1})
-            assert ei.value.code == 400
-        finally:
-            srv.shutdown()
-            srv.server_close()
+        presets = svc.config()["cloud_presets"]
+        assert set(presets) >= {"openai", "deepseek", "dashscope", "ollama"}
+        for v in presets.values():
+            assert v["base_url"].startswith("http")
+            assert v["model"]
+            assert v["api_key_env"]
+            assert "label" in v
+
+    def test_env_name_validation_allows_normal_names(self, tmp_path):
+        """合法变量名要放行：默认 GT7_COACH_LLM_KEY、各大厂惯例名。"""
+        svc = self._svc(tmp_path / "cloud.json")
+        for name in ("GT7_COACH_LLM_KEY", "OPENAI_API_KEY", "_PRIVATE"):
+            svc.set_cloud({"api_key_env": name})   # 不抛即通过

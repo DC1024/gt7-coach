@@ -120,6 +120,47 @@ PROVIDERS: dict[str, dict[str, str]] = {
 DEFAULT_PROVIDER = "dashscope"
 
 
+# —— #H：给仪表盘 UI 用的「服务商预设」（一键填入三框）—————————————
+#
+#    与上面 PROVIDERS 的分工：PROVIDERS 是给**代码**用的端点表（resolve_provider），
+#    这一份是给**人**看的（含中文 label + 建议的 key 环境变量名），UI 拿它
+#    渲染下拉，选中后把 base_url / model / api_key_env 三个框填上。
+#
+#    🔴 api_key_env 存的是**环境变量名**，明文 key 绝不落盘 —— 全仓库红线，
+#       #H 也不例外。用户把 key 放进环境变量，配置文件里只有变量名。
+#
+#    openai / ollama 不在 PROVIDERS 端点表里没关系：预设填的是 cloud.json 的
+#    base_url / model，`narrate._polish` 里用户显式值本来就优先于厂商预设。
+#    ollama 本地不校验 key，但 narrate 侧「无 key 即回落模板」，所以 UI 提示：
+#    随便设一个非空环境变量（如 GT7_COACH_LLM_KEY=local）当占位即可。
+PROVIDER_PRESETS: dict[str, dict[str, str]] = {
+    "openai":    {"label": "OpenAI 官方",
+                  "base_url": "https://api.openai.com/v1",
+                  "model": "gpt-4o-mini",
+                  "api_key_env": "OPENAI_API_KEY"},
+    "deepseek":  {"label": "DeepSeek 深度求索",
+                  "base_url": "https://api.deepseek.com/v1",
+                  "model": "deepseek-chat",
+                  "api_key_env": "DEEPSEEK_API_KEY"},
+    "dashscope": {"label": "阿里百炼（默认）",
+                  "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                  "model": "qwen3.8-flash",
+                  "api_key_env": "DASHSCOPE_API_KEY"},
+    "zhipu":     {"label": "智谱 AI",
+                  "base_url": "https://open.bigmodel.cn/api/paas/v4",
+                  "model": "glm-4-flash",
+                  "api_key_env": "ZHIPU_API_KEY"},
+    "moonshot":  {"label": "月之暗面 Kimi",
+                  "base_url": "https://api.moonshot.cn/v1",
+                  "model": "moonshot-v1-8k",
+                  "api_key_env": "MOONSHOT_API_KEY"},
+    "ollama":    {"label": "本地 Ollama",
+                  "base_url": "http://127.0.0.1:11434/v1",
+                  "model": "qwen2.5:7b",
+                  "api_key_env": "GT7_COACH_LLM_KEY"},
+}
+
+
 # —— 百炼「免费额度」模型名单 ——————————————————————————————————
 #
 # 🔴 为什么把这份名单写进代码：
