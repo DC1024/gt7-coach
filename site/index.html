@@ -279,6 +279,8 @@ footer{padding:46px 0 56px;background:#fff;border-top:1px solid var(--line)}
     <p class="sub">
       14 条播报规则，按延迟分成三档。P0/P1 是硬实时档 —— 必须在 300 毫秒内出声，
       因为它说的是「还有 1.5 秒就要刹车了」这种来不及补的话。
+      每一条规则都可以在仪表盘「播报设置」里<strong>单独开关</strong>——不想要的提醒，
+      连评估都不跑。
     </p>
 
     <div class="tw">
@@ -287,8 +289,8 @@ footer{padding:46px 0 56px;background:#fff;border-top:1px solid var(--line)}
           <tr><th>什么时候说</th><th>档</th><th>触发条件</th></tr>
         </thead>
         <tbody>
-          <tr><td>出界了，回到赛道</td><td><span class="tag t0">P0</span></td><td>距参考线横向 &gt; 18 m 持续 0.4 s</td></tr>
-          <tr><td>前轮 / 后轮 / 四轮打滑</td><td><span class="tag t0">P0</span></td><td>滑移率 &gt; 0.15 持续 0.25 s</td></tr>
+          <tr><td>出界了，回到赛道</td><td><span class="tag t0">P0</span></td><td><strong>双重确认</strong>：横向偏离 + 轮胎打滑同时成立</td></tr>
+          <tr><td>前轮 / 后轮 / 四轮打滑</td><td><span class="tag t0">P0</span></td><td>滑移率超阈值持续 0.25 s；三档预设（严格/标准/宽容）+ 滑块微调</td></tr>
           <tr><td>刹车晚了 N 米</td><td><span class="tag t0">P0</span></td><td>过了刹车入点 &gt; 8 m 还没踩</td></tr>
           <tr><td>1.5 秒后重刹区</td><td><span class="tag t1">P1</span></td><td>距下一个刹车入点 &lt; 1.5 s</td></tr>
           <tr><td>该换挡了</td><td><span class="tag t1">P1</span></td><td>转数到换挡灯上限持续 0.5 s</td></tr>
@@ -410,9 +412,9 @@ footer{padding:46px 0 56px;background:#fff;border-top:1px solid var(--line)}
 
     <div class="stats" style="margin-top:26px">
       <div class="stat"><div class="v">10.0<small>/s</small></div><div class="l">实测 tick 速率</div></div>
-      <div class="stat"><div class="v">14</div><div class="l">条播报规则</div></div>
+      <div class="stat"><div class="v">14</div><div class="l">条播报规则 · 逐条可开关</div></div>
       <div class="stat"><div class="v">0</div><div class="l">个第三方依赖</div></div>
-      <div class="stat"><div class="v">0.07<small>s</small></div><div class="l">分段算法与参考差</div></div>
+      <div class="stat"><div class="v">742</div><div class="l">项自动化测试</div></div>
     </div>
   </div>
 </section>
@@ -501,14 +503,11 @@ footer{padding:46px 0 56px;background:#fff;border-top:1px solid var(--line)}
     <h2><span class="n">07</span>路线图</h2>
     <p class="sub">已完成的部分全部零云依赖。</p>
     <div class="road">
-      <div class="ritem done"><span class="rid">R1</span><span class="rtxt">本地闭环：参考圈索引 + 实时定位 + 十条规则 + 闸门 + HTTP 接口</span><span class="rbadge"><span class="rdone">已完成</span></span></div>
-      <div class="ritem done"><span class="rid">R1.5</span><span class="rtxt">本地极限：分段 / 理论最快圈 / 油耗续航 / 预测圈速 + 离线调参</span><span class="rbadge"><span class="rdone">已完成</span></span></div>
-      <div class="ritem done"><span class="rid">R1.6</span><span class="rtxt">每弯累积失误：跨圈累积哪个弯反复亏，第 3 圈起主动提醒</span><span class="rbadge"><span class="rdone">已完成</span></span></div>
-      <div class="ritem done"><span class="rid">R2.1</span><span class="rtxt">措辞层分离 + 数字白名单 + 长度预算 / ttl 对齐</span><span class="rbadge"><span class="rdone">已完成</span></span></div>
-      <div class="ritem done"><span class="rid">R3.1</span><span class="rtxt">名次与情绪向播报：追回 / 掉位、后半区鼓励、领跑提醒</span><span class="rbadge"><span class="rdone">已完成</span></span></div>
-      <div class="ritem"><span class="rid">R2.2</span><span class="rtxt">云润色措辞，失败自动回落本地模板</span><span class="rbadge"><span class="rnext">下一步</span></span></div>
-      <div class="ritem"><span class="rid">R2.3</span><span class="rtxt">可靠性层：幂等缓存 / 预算闸 / 熔断退避 / 降级状态位</span><span class="rbadge"><span class="rnext">计划中</span></span></div>
-      <div class="ritem"><span class="rid">R3</span><span class="rtxt">云 TTS 音色（仅 B/C 档；A 档必须保持本地）</span><span class="rbadge"><span class="rnext">计划中</span></span></div>
+      <div class="ritem done"><span class="rid">R1~R3.1</span><span class="rtxt">本地闭环 + 本地极限 + 每弯累积 + 措辞层 + 云润色/可靠性/TTS + 名次播报</span><span class="rbadge"><span class="rdone">已完成</span></span></div>
+      <div class="ritem done"><span class="rid">细分开关</span><span class="rtxt">播报设置面板：分组静音 + 每条规则独立开关</span><span class="rbadge"><span class="rdone">已完成</span></span></div>
+      <div class="ritem done"><span class="rid">云接入</span><span class="rtxt">OpenAI 兼容三框（base_url / key 变量名 / model）+ 六家服务商预设</span><span class="rbadge"><span class="rdone">已完成</span></span></div>
+      <div class="ritem done"><span class="rid">判定打磨</span><span class="rtxt">出界双重确认（横向偏离 + 打滑）；打滑三档预设 + 滑块微调</span><span class="rbadge"><span class="rdone">已完成</span></span></div>
+      <div class="ritem"><span class="rid">下一步</span><span class="rtxt">赛场验证打磨（真车反馈驱动）；Dash 侧最快圈落盘缓存（省掉重启后 ~11s 认场）</span><span class="rbadge"><span class="rnext">计划中</span></span></div>
     </div>
   </div>
 </section>
