@@ -91,6 +91,12 @@ class CoachConfig:
     # cloud.json 的挂载路径（容器内 /opt/gt7-coach/data/cloud.json）。
     # 设为 None → narrator 全程禁用态（纯本地模板，零网络），降级到 R2.1 行为。
     cloud_path: str | None = None
+    # 用户界面设置的持久化文件（打滑灵敏度、逐规则开关、静音分组…）。
+    # 🔴 这些设置原本只在内存里，教练一重启（部署 / 重启容器 / 重启机器）就
+    #    回到默认值，用户每次都得重调。设了这个路径后就落盘、启动时回灌。
+    #    设 None → 退回"不持久化"（但会尝试从 cloud_path 同目录的 ui.json 兜底，
+    #    见 server.CoachService._persist_path）。
+    state_path: str | None = None
     # —— R3 云 TTS（只给 **B 档**句子；A 档永远走浏览器 TTS）——
     # 默认**全禁**：不配就是纯浏览器 `speechSynthesis`（= R2.2 的行为）。
     # 要开启得凑齐三样：tts_enabled + tts_workspace_id + 可写的 tts_cache_dir；

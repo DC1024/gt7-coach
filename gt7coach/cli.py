@@ -130,6 +130,7 @@ def _print_tts_state(engine: CoachEngine) -> None:
 def _build(args, *, tts_auto: bool = True) -> CoachEngine:
     cfg = CoachConfig(poll_interval_s=args.interval,
                       cloud_path=getattr(args, "cloud", None),
+                      state_path=getattr(args, "ui_state", None),
                       ref_cache_dir=_resolve_ref_cache_dir(args),
                       **_resolve_tts(args, auto=tts_auto))
     if args.demo:
@@ -164,6 +165,9 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--timeout", type=float, default=3.0)
         p.add_argument("--cloud", default=None,
                        help="cloud.json 路径（R2.2 云润色；不填=纯本地模板）")
+        p.add_argument("--ui-state", default=None,
+                       help="用户设置持久化文件（打滑灵敏度 / 规则开关 / 静音分组）"
+                            "；不填则尝试从 --cloud 同目录的 ui.json 兜底")
         p.add_argument("--ref-cache-dir", default=None,
                        help="参考圈本地缓存目录（根治前几圈瞎播报的第二条杠杆）；"
                             "不填则读 GT7_COACH_REF_CACHE_DIR，都没有=禁用")

@@ -79,6 +79,9 @@ class CoachService:
         self._started = time.time()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        # 🔴 把上次存的用户设置（打滑灵敏度 / 逐规则开关 / 静音分组）灌回来。
+        #    放在最后：它要读 engine 的三份 cfg，而那三份此刻都已就绪。
+        self._load_ui_state()
 
     # —— 生命周期 ————————————————————————————————————
 
@@ -158,6 +161,125 @@ class CoachService:
             "cloud_presets": {k: dict(v)
                               for k, v in cloud.PROVIDER_PRESETS.items()},
         }
+
+    # —— 用户设置的持久化（打滑灵敏度 / 逐规则开关 / 静音分组）———————
+    #
+    # 🔴 这些设置原来只在内存里：教练一重启（部署 / 重启容器 / 重启机器）
+    #    就回默认值，用户每次都得重调。落盘到 ui.json、启动时回灌即可。
+    #    路径 = `state_path`，缺省从 `cloud_path` 同目录兜底（同一个持久化卷）。
+
+    _UI_SECTIONS = ("coach", "rules", "gate")
+
+    def _persist_path(self) -> str | None:
+        p = self.engine.cfg.state_path
+        if p:
+            return p
+        cp = self.engine.cfg.cloud_path
+        if cp:
+            return os.path.join(os.path.dirname(os.path.abspath(cp)), "ui.json")
+        return None
+
+    def _section_obj(self, name: str) -> Any:
+        return {"coach": self.engine.cfg, "rules": self.engine.rules.cfg,
+                "gate": self.engine.gate.cfg}.get(name)
+
+    def _save_ui_state(self, applied: dict[str, list[str]]) -> None:
+        """把这次真改到的字段**增量**写进 ui.json（读-合并-写，原子替换）。
+
+        只写 `applied` 里的项 —— 白名单与类型已在 `update_config` 里校验过，
+        这里不再重复判断，只挑能 JSON 化的标量。
+        """
+        path = self._persist_path()
+        if not path or not applied:
+            return
+        patch: dict[str, dict] = {}
+        for sec in self._UI_SECTIONS:
+            obj = self._section_obj(sec)
+            if obj is None:
+                continue
+            d: dict[str, Any] = {}
+            for k in applied.get(sec) or []:
+                if not hasattr(obj, k):
+                    continue
+                v = getattr(obj, k)
+                if k == "muted":                    # 元组 → 列表
+                    d[k] = list(v or ())
+                elif isinstance(v, (bool, int, float, str)) or v is None:
+                    d[k] = v
+            if d:
+                patch[sec] = d
+        if not patch:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                cur = json.load(f)
+            if not isinstance(cur, dict):
+                cur = {}
+        except (OSError, json.JSONDecodeError):
+            cur = {}
+        for sec, vals in patch.items():
+            dst = cur.get(sec)
+            if not isinstance(dst, dict):
+                dst = {}
+                cur[sec] = dst
+            dst.update(vals)
+        d = os.path.dirname(os.path.abspath(path))
+        if d:
+            os.makedirs(d, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cur, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+
+    def _load_ui_state(self) -> None:
+        """启动时回灌 ui.json。坏存档 / 类型对不上 → 跳过该项，不阻止启动。"""
+        path = self._persist_path()
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(saved, dict):
+            return
+        # 静音分组不在数值白名单里，单独走 panel 的归一化
+        gate_saved = saved.get("gate")
+        if isinstance(gate_saved, dict) and "muted" in gate_saved:
+            try:
+                from . import panel as panel_mod
+                self.engine.gate.cfg.muted = panel_mod.normalize_muted(
+                    gate_saved.get("muted"))
+            except Exception:                       # noqa: BLE001
+                pass
+        # 其余标量：先按"当前字段的类型"过滤，再用同一套白名单校验应用。
+        body: dict[str, Any] = {}
+        for sec in self._UI_SECTIONS:
+            vals = saved.get(sec)
+            obj = self._section_obj(sec)
+            if not isinstance(vals, dict) or obj is None:
+                continue
+            keep: dict[str, Any] = {}
+            for k, v in vals.items():
+                if not hasattr(obj, k):
+                    continue
+                cur = getattr(obj, k)
+                if isinstance(cur, bool):
+                    if isinstance(v, bool):
+                        keep[k] = v
+                elif isinstance(cur, (int, float)):
+                    if isinstance(v, (int, float)) and not isinstance(v, bool):
+                        keep[k] = v
+                elif isinstance(cur, str):
+                    if isinstance(v, str):
+                        keep[k] = v
+            if keep:
+                body[sec] = keep
+        if body:
+            try:
+                self.update_config(body, persist=False)
+            except ValueError:
+                pass
 
     def cloud_status(self) -> dict[str, Any]:
         """R2.2 云接入状态：enabled / provider / 今日调用 / token /
@@ -306,12 +428,16 @@ class CoachService:
         from . import panel as panel_mod
         muted = panel_mod.normalize_muted(body.get("muted"))
         self.engine.gate.cfg.muted = muted
+        self._save_ui_state({"gate": ["muted"]})     # 静音分组也持久化
         return {"ok": True, **self.panel()}
 
-    def update_config(self, body: dict[str, Any]) -> dict[str, Any]:
+    def update_config(self, body: dict[str, Any], *,
+                      persist: bool = True) -> dict[str, Any]:
         """改闸门/规则阈值。白名单式——
         只允许改**已经存在**的字段，且类型要对得上，否则整条请求拒绝。
         （防止前端一个笔误就把阈值改成字符串，之后比较运算静默全 False。）
+
+        `persist=False` 供启动回灌用：那时不能再往文件里写（会自己覆盖自己）。
         """
         applied: dict[str, list[str]] = {}
         # 🔴 #J：打滑预设 `slip_preset` 是字符串字段，不能走下面的数值白名单，
@@ -366,6 +492,10 @@ class CoachService:
         if any(k.startswith("tts_") for k in applied.get("coach", ())):
             self.engine.rebuild_tts()
             tts_rebuilt = True
+
+        # 落盘（打滑灵敏度 / 逐规则开关等）→ 教练重启后不再回默认值
+        if persist:
+            self._save_ui_state(applied)
 
         out: dict[str, Any] = {"ok": True, "applied": applied,
                                "config": self.config()}
@@ -583,10 +713,10 @@ DEMO_HTML = """<!DOCTYPE html>
   </div>
   <div class="ctl">
     <label for="slipSlider">滑移率阈值</label>
-    <input type="range" id="slipSlider" min="0.08" max="0.30" step="0.005">
+    <input type="range" id="slipSlider" min="0.05" max="0.60" step="0.01">
     <b id="slipVal" style="min-width:38px">—</b>
   </div>
-  <div class="sub" id="slipMsg">滑移率超过阈值才报「打滑」。选预设会把阈值设回该档基线，滑块可在档内微调。</div>
+  <div class="sub" id="slipMsg">滑移率超过阈值才报「打滑」。选预设会把阈值设回该档基线（严格 0.15 / 标准 0.30 / 宽容 0.45），滑块可在档内微调。设置会自动保存。</div>
 </div>
 <div class="card">
   <div class="sub" style="margin-bottom:8px">云措辞（OpenAI 兼容）—— 🔴 key 本体只放环境变量，这里填<strong>变量名</strong>，明文 key 绝不落盘</div>

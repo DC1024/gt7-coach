@@ -197,7 +197,9 @@ class TestWheelSlip:
         assert cal["n"] >= 150
         assert cal["front"] == pytest.approx(0.34, rel=0.02)
         assert cal["rear"] == pytest.approx(0.34, rel=0.02)
-        assert feed(rs, st, ticks=5, wheel_rads=(w, w, w * 1.3, w * 1.3)), \
+        # 🔴 后轮 1.5× 自由滚动 → 滑移率 ≈0.5，明显高于标准档门限 0.30。
+        #    1.3×（≈0.3）在新门限下贴着线，测不出"能检出"——换个够大的值。
+        assert feed(rs, st, ticks=5, wheel_rads=(w, w, w * 1.5, w * 1.5)), \
             "标定完之后必须还能检出滑移"
 
     def test_low_speed_ignored(self, rs, st):

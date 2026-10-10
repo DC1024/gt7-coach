@@ -111,19 +111,19 @@ class TestRoutes:
 
     def test_slip_preset_maps_to_threshold(self, server):
         """#J：选打滑预设要把 slip_threshold 设回该档基线。"""
-        # 宽容档 → 0.30（故意滑也不怎么报）
+        # 宽容档 → 0.45（故意滑也不怎么报）
         _c, d = _post(server + "/api/v1/coach/config",
                       {"rules": {"slip_preset": "lenient"}})
         assert d["config"]["rules"]["slip_preset"] == "lenient"
-        assert d["config"]["rules"]["slip_threshold"] == pytest.approx(0.30, abs=1e-6)
-        # 严格档 → 0.08（任何打滑都报）
+        assert d["config"]["rules"]["slip_threshold"] == pytest.approx(0.45, abs=1e-6)
+        # 严格档 → 0.15（任何打滑都报）
         _c, d = _post(server + "/api/v1/coach/config",
                       {"rules": {"slip_preset": "strict"}})
-        assert d["config"]["rules"]["slip_threshold"] == pytest.approx(0.08, abs=1e-6)
+        assert d["config"]["rules"]["slip_threshold"] == pytest.approx(0.15, abs=1e-6)
         # 配置里要带各档基线，供 UI 渲染下拉 + 滑块初始值
         code, full, _ = _get(server + "/api/v1/coach/config")
         assert code == 200 and full["slip_presets"] == {
-            "strict": 0.08, "standard": 0.15, "lenient": 0.30}
+            "strict": 0.15, "standard": 0.30, "lenient": 0.45}
 
     def test_slip_preset_explicit_threshold_wins(self, server):
         """同一条请求里既选预设又微调阈值 → 微调值优先（用户刚拖完滑块）。"""

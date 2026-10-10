@@ -12,7 +12,7 @@
 | key                     | 档 | 触发 |
 |-------------------------|---|------|
 | `off_track`             | P0 | 距参考线横向 > 18 m **且** 轮胎打滑（滑移率 > 0.10）同时持续 0.4 s（#I 双重确认，减少走线图误差误报）|
-| `slip_front/rear/all`   | P0 | 滑移率 > 0.15 持续 0.25 s |
+| `slip_front/rear/all`   | P0 | 滑移率 > `slip_threshold`（默认标准档 0.30；三档 0.15/0.30/0.45）持续 0.25 s |
 | `brake_late@<刹车区>`   | P0 | 已过入点 > 8 m 还没踩刹车（**只到弯心为止**） |
 | `brake_warn@<刹车区>`   | P1 | 距下一个刹车入点 < 1.5 s |
 | `shift`                 | P1 | rpm ≥ 换挡灯上限持续 0.5 s |
@@ -103,7 +103,7 @@ class RuleConfig:
     #    两者同时满足才报，显著减少走线图误差带来的误报。
     #    False 退回旧行为（只看横向距离），保留给"不要这层过滤"的用户。
     off_track_require_slip: bool = True
-    # 第二重闸门用的滑移率门限。比 slip_threshold(0.15) 低一点：这里只要
+    # 第二重闸门用的滑移率门限。比 slip 播报线（标准档 0.30）低得多：这里只要
     # "有可见打滑"就够确认出界，不必到打滑规则那条更严格的播报线。
     off_track_slip_min: float = 0.10
 
@@ -116,7 +116,7 @@ class RuleConfig:
     #      standard 赛道日：默认
     #      lenient  漂移/拉力/泥地：本来就在故意滑 → 高门限，别老报
     slip_preset: str = "standard"
-    slip_threshold: float = 0.15
+    slip_threshold: float = 0.30      # = SLIP_PRESETS["standard"]
     slip_hold_s: float = 0.25
     tyre_radius_default: float = 0.34
     free_glat_max: float = 0.15      # 自由滚动的判定窗
@@ -229,9 +229,9 @@ class RuleConfig:
 #    选预设时 server 把 `slip_threshold` 设回对应基线，之后滑块微调只动
 #    `slip_threshold` 本身。UI 用这份表渲染下拉 + 各档默认值。
 SLIP_PRESETS: dict[str, float] = {
-    "strict": 0.08,    # 街道：任何打滑都该报
-    "standard": 0.15,  # 赛道日：默认
-    "lenient": 0.30,   # 漂移/拉力/泥地：故意滑，高门限别老报
+    "strict": 0.15,    # 街道：任何打滑都该报
+    "standard": 0.30,  # 赛道日：默认
+    "lenient": 0.45,   # 漂移/拉力/泥地：故意滑，高门限别老报
 }
 
 
