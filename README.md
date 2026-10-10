@@ -262,7 +262,7 @@ evidence。合成数据下永远绿，**真车场次回放**才被白名单抓�
 | `shift` | P1 | rpm ≥ 换挡灯上限持续 0.5 s |
 | `apex_slow@<弯心>` | P2 | 弯中速度比参考低 > 5 km/h |
 | `throttle_late@<弯心>` | P2 | 过弯心 40~120 m 油门仍 < 0.3 持续 0.5 s |
-| `tyre_hot` / `tyre_cold` | P2 | 任一胎温 > 110 / < 60 °C 持续 2 s |
+| `tyre_hot` / `tyre_cold` | P2 | 任一胎温 > 110 / < 60 °C 持续 2 s。**报实际温度**（`左前胎 52 度太凉…`），太凉还给目标区间 80~100 °C（GT7 遥测不暴露天气 / 赛道温度，故用固定领域值）|
 | `delta` | P3 | 本圈 delta 首次跨过 ±0.2 s |
 | `projected_lap` | P3 | 跑过本圈 35% 后预测最终圈速（`参考圈速 + 当前 delta`）|
 | `lap_summary` | P3 | 每圈结束报上一圈成绩与参考差（R2.1：`1:32.412，慢 0.37`）|
@@ -334,7 +334,7 @@ GT7 遥测是**单车流**，有些东西就是拿不到，不许编：
 ## 开发
 
 ```bash
-python -m pytest tests/ -q      # 742 项，纯标准库 + pytest
+python -m pytest tests/ -q      # 743 项，纯标准库 + pytest
 ```
 
 测试用**合成赛道**（`gt7coach/synth.py`）而不是真数据 —— 合成圆上每个量都能
@@ -357,6 +357,15 @@ python -m pytest tests/ -q      # 742 项，纯标准库 + pytest
 - **`ttl_s` 写死下限会静默丢掉消息**：`max(1.2, t_go+0.6)` 在
   `t_go ≤1.0`（最常见的接近窗口）装不下 8 字句（1.78 s）。
   ttl 必须 `max(speech_s(text), t_go+0.6)`
+- **单点 delta / 圈差必须有硬上界**：参考圈一旦错配（不同赛道 / 半圈 / 被污染），
+  `_delta` 会蹦出"比参考圈快 40 秒"之类的离谱值，摧毁可信度。规则层与显示层
+  共用 `DELTA_MAX_S = 20 s` 这把尺；`lap_summary` 的 `vs_ref_s` 也用同一上界。
+- **比赛终局判定不能看「上一圈」**：`c.lap.lap`（刚跑完那圈）在有固定圈数的
+  比赛里最多到 `laps_in_race-1`（GT7 冲线后圈号不再自增），终局判定永远差一圈 →
+  名次播报从不触发。改用引擎自增的 `c.run_laps`。
+- **断开 / 待机后教练还在讲**：`tick` 只在 `f is None` 时早退，而游戏断开时
+  dash 仍回最后一帧（`connected=False`）被当成正常帧 → 规则继续评估、继续出声。
+  改成 `f is None or not f.connected` 时早退。
 
 ---
 

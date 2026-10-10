@@ -34,7 +34,7 @@ from .lapstats import (CornerTracker, FuelTracker, LapResult,
                        lap_result)
 from .narrate import Narrator
 from .refindex import RefLap
-from .rules import Ctx, RuleConfig, RuleSet
+from .rules import Ctx, RuleConfig, RuleSet, DELTA_MAX_S
 from .source import HttpSource, ReplaySource
 from .tts import TtsConfig, TtsEngine
 
@@ -613,7 +613,10 @@ class CoachEngine:
         f = self.src.poll()
         now = self._clock()
         self._ticks += 1
-        if f is None:
+        # 🔴 没帧 / 已断开（游戏退出或待机）→ 不再评估规则、不再产生新播报。
+        #    否则断开瞬间 dash 仍回最后一帧（connected=False）会被当成正常帧，
+        #    教练继续对着过期数据说话，用户看到的就是"游戏都断了教练还在讲"。
+        if f is None or not f.connected:
             err = getattr(self.src, "last_error", None)
             return CoachState(
                 connected=False,
@@ -817,7 +820,8 @@ class CoachEngine:
                   lateral_m=lateral_m, dt=dt, st=self._st_rules,
                   lap=self._prev_lap, theory=self._sectors.to_dict(),
                   fuel=self._fuel_snapshot(), corners=self._corner_snapshot(),
-                  warmup=warmup, ref_pace_ok=self._ref_pace_ok)
+                  warmup=warmup, run_laps=self._run_laps,
+                  ref_pace_ok=self._ref_pace_ok)
         cands = self.rules.evaluate(ctx)
         say = self.gate.filter(cands, now=now, lap=f.lap,
                                g_mag=f.g_mag, st=self._st_gate)
@@ -852,7 +856,8 @@ class CoachEngine:
                 d = f.lap_time_s - t_ref
                 # 兜底闸：定位或时间轴一旦不一致，delta 会变成"整圈"量级。
                 # 宁可不给这个数，也不能给一个离谱的数（会被当成真丢了一圈）。
-                if abs(d) <= max(30.0, live.lap_time_s * 0.5):
+                # 🔴 与规则层 `_delta` 共用 `DELTA_MAX_S` 这把尺。
+                if abs(d) <= DELTA_MAX_S:
                     delta = round(d, 3)
             ref_v = live.v_at_s(s)
             z = live.next_brake(s)

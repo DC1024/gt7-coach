@@ -1448,9 +1448,12 @@ class TestRaceFinish:
     @staticmethod
     def _ctx(st, *, position=3, num_cars=16, lap_no=5, laps_in_race=5,
              warmup=False):
+        # 🔴 run_laps = 本场已完成圈数；终局判定看它，不看 c.lap（上一圈）。
+        #    lap_no==laps_in_race 即"刚跑完最后一圈"→ run_laps==laps_in_race。
         return Ctx(f=mk(lap=lap_no, position=position, num_cars=num_cars,
                         laps_in_race=laps_in_race),
-                   st=st, warmup=warmup, lap=_lap_result(lap_no))
+                   st=st, warmup=warmup, lap=_lap_result(lap_no),
+                   run_laps=lap_no)
 
     def test_announces_at_final_lap(self, rs, st):
         u = rs._race_finish(self._ctx(st))
@@ -1494,6 +1497,76 @@ class TestRaceFinish:
     def test_key_in_mood_group(self, rs, st):
         from gt7coach import panel
         assert panel.group_of_key("race_finish") == "mood"
+
+
+class TestTyreTempReportsActualTemp:
+    """#A 复审：太凉 / 过热都要报**实际温度**（过热含「度」），
+    太凉还要给目标工作区间。不能只说"太凉"。"""
+
+    def test_cold_reports_temp_and_target(self, rs, st):
+        f = mk(lap=3, tyre_temp=(50.0, 55.0, 52.0, 54.0))
+        c = Ctx(f=f, st=st, dt=1.0)
+        u = None
+        for _ in range(30):       # 等 hold 累积超过 tyre_hold_s 才放行
+            u = rs._tyre_temp(c)
+            if u:
+                break
+        assert u is not None, "应触发胎温过凉"
+        assert u.key == "tyre_cold"
+        # 最凉的是左前（50 度）；报实际温度 + 目标区间
+        assert "50" in u.text and "80" in u.text and "100" in u.text
+        # 数字白名单：报的温度与目标区间都在 evidence 里（不能凭空编数字）
+        assert u.evidence["tyre_temp_c"] == [50.0, 55.0, 52.0, 54.0]
+        assert u.evidence["target_lo_c"] == 80.0
+        assert u.evidence["target_hi_c"] == 100.0
+
+    def test_hot_reports_temp(self, rs, st):
+        f = mk(lap=3, tyre_temp=(115.0, 100.0, 100.0, 100.0))
+        c = Ctx(f=f, st=st, dt=1.0)
+        u = None
+        for _ in range(30):
+            u = rs._tyre_temp(c)
+            if u:
+                break
+        assert u is not None and u.key == "tyre_hot"
+        assert "115" in u.text and "度" in u.text
+
+
+class TestAbsurdDeltaSuppressed:
+    """参考圈错配会蹦出几十秒离谱 delta；必须有硬上界闸拦住。"""
+
+    class _FakeRef:
+        def __init__(self, lap_time_s):
+            self.lap_time_s = lap_time_s
+        def t_at_s(self, s):
+            return 20.0   # 任意点都返回 20s → 与当前圈差巨大
+
+    def test_delta_quiet_when_ref_mismatch(self, rs, st):
+        # 当前圈在某点已用 60s，参考圈同点只要 20s → delta=+40 → 必须静默
+        f = mk(lap=3, lap_time_s=60.0)
+        c = Ctx(f=f, ref=self._FakeRef(60.0), s=100.0, st=st,
+                ref_pace_ok=True)
+        assert rs._delta(c) is None
+
+    def test_lap_summary_quiet_when_ref_mismatch(self, rs, st):
+        # 上一圈 60s，参考圈 20s → 差 40s → vs_ref_s 不能进 evidence（不报离谱差）
+        f = mk(lap=3, last_lap_ms=60000.0)
+        c = Ctx(f=f, ref=self._FakeRef(20.0), st=st, ref_pace_ok=True)
+        u = rs._lap_summary(c)
+        assert u is not None
+        assert "vs_ref_s" not in u.evidence
+
+    def test_delta_ok_when_small(self, rs, st):
+        # 正常小 delta 仍要报
+        class NearRef:
+            lap_time_s = 60.0
+            def t_at_s(self, s):
+                return 59.5
+        c = Ctx(f=mk(lap=3, lap_time_s=60.0), ref=NearRef(), s=100.0,
+                 st=st, ref_pace_ok=True)
+        u = rs._delta(c)
+        assert u is not None
+        assert abs(float(u.text)) < 1.0   # "+0.50" 之类
 
 
 class TestRuleToggles:

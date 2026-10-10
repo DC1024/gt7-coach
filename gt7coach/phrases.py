@@ -70,7 +70,7 @@ TTL_CAP_S: dict[str, float] = {
     "next_focus": 6.0,      # 习惯类，最长（"连续 N 圈"值得听完）
     "fuel_range": 6.0,      # 续航类，最长
     "projected_lap": 3.0,   # 预测圈速，下一段就刷新
-    "tyre_temp": 4.0,       # 胎温变化慢
+    "tyre_temp": 7.0,       # 胎温：凉/热都报实际温度+目标区间，句子变长（≈27 字）
     "delta": 2.0,           # 秒级刷新，过期极快
     "apex_slow": 2.0,       # 弯心后 60 m 内有效
     "throttle_late": 2.0,   # 同上

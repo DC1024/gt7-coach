@@ -71,6 +71,10 @@ from .narrate import Narrator
 from .refindex import RefLap
 
 # 🔴 措辞（怎么说）已经搬到 `phrases.py`，判断（什么时候说）留在这里。
+
+# 单点 delta / 圈差超过此值一律视为参考圈错配（不同赛道 / 半圈 / 被污染），
+# 宁可不报 —— 否则会蹦出"比参考圈快 40 秒"之类的离谱值，摧毁可信度。
+DELTA_MAX_S = 20.0
 #    `fmt_lap_time` 从 phrases 转出来只为兼容既有调用方（__init__/cli/tests）——
 #    新代码请直接用 `phrases.fmt_lap_time`。
 fmt_lap_time = phrases.fmt_lap_time
@@ -142,6 +146,11 @@ class RuleConfig:
     shift_hold_s: float = 0.50
     tyre_hot_c: float = 110.0
     tyre_cold_c: float = 60.0
+    # 理想工作温度区间（领域知识）。GT7 遥测不暴露天气 / 赛道温度，
+    # 故用固定值；不同胎种 / 天气的微调留给车手自己判断。低于下限报"太凉"、
+    # 高于上限报"过热"，区间内不报胎温。报出来的温度与目标区间都进 evidence。
+    tyre_target_lo_c: float = 80.0
+    tyre_target_hi_c: float = 100.0
     tyre_hold_s: float = 2.0
     delta_threshold_s: float = 0.20
 
@@ -266,6 +275,10 @@ class Ctx:
     #    给的"最后一次冲线"值，**重开比赛后它还停在上一轮** —— 不按住它，
     #    新的一局刚发车，教练先把上一局的圈速念一遍。
     warmup: bool = False
+    # 本场**已完成**的圈数（引擎按圈变化自增，重开清零）。终局判定用它，
+    # 不依赖 `lap`（上一圈）—— 否则固定圈数比赛里终局那一圈永远差一圈，
+    # 名次播报永不被触发。
+    run_laps: int = 0
 
 
 class RuleSet:
@@ -700,7 +713,8 @@ class RuleSet:
             if not cfg.tyre_hot_on:
                 return None
             i = tt.index(max(tt))
-            txt = f"{names[i]}胎过热 {tt[i]:.0f}"
+            # 🔴 过热也要报实际温度（含"度"），让车手知道离上限多远。
+            txt = f"{names[i]}胎 {tt[i]:.0f} 度过热"
             return Utterance(key="tyre_hot", text=txt,
                              priority=P_NORMAL,
                              ttl_s=phrases.ttl_for(txt, P_NORMAL, "tyre_temp"),
@@ -709,15 +723,20 @@ class RuleSet:
         # #G：太凉开关单独关 → 不报
         if not cfg.tyre_cold_on:
             return None
-        # 🔴 #A 复审：工程师不能只说"太凉"，要告诉车手**怎么升温** ——
-        #    GT7 里冷胎的两大解法：直线上轻拖刹车（刹车盘热量喂给胎）、
-        #    走线上多左右摆动（摩擦生热）。再精简过：用户反馈一句为宜。
-        txt = "轮胎太凉，轻拖刹车多摆走线，升温再推"
+        # 🔴 #A 复审：工程师不能只说"太凉"，要告诉车手**现在几度**、**目标几度**、
+        #    以及怎么升温。GT7 遥测不暴露天气 / 赛道温度，工作区间用固定领域值
+        #    （见 `tyre_target_lo_c` / `tyre_target_hi_c`）；不同胎种 / 天气的微调
+        #    留给车手自己判断。报出来的温度与目标区间都进 evidence，过数字白名单。
+        i = tt.index(min(tt))
+        txt = (f"{names[i]}胎 {tt[i]:.0f} 度太凉，轻拖刹车升温，"
+               f"目标 {cfg.tyre_target_lo_c:.0f} 到 {cfg.tyre_target_hi_c:.0f}")
         return Utterance(key="tyre_cold", text=txt,
                          priority=P_NORMAL,
                          ttl_s=phrases.ttl_for(txt, P_NORMAL, "tyre_temp"),
                          short="胎温",
-                         evidence={"tyre_temp_c": [round(x, 1) for x in tt]})
+                         evidence={"tyre_temp_c": [round(x, 1) for x in tt],
+                                   "target_lo_c": cfg.tyre_target_lo_c,
+                                   "target_hi_c": cfg.tyre_target_hi_c})
 
     # —— 9. delta ——————————————————————————————————————
 
@@ -735,6 +754,11 @@ class RuleSet:
             return None
         delta = c.f.lap_time_s - t_ref
         if abs(delta) < self.cfg.delta_threshold_s:
+            return None
+        # 🔴 上界闸：单点 delta 正常只有几秒（你相对参考圈在某点的快慢）。
+        #    若参考圈错配，这里会蹦出几十秒的离谱值，报出来等于凭空说你
+        #    丢了半圈。超过硬上界直接不报。
+        if abs(delta) > DELTA_MAX_S:
             return None
         sign = "+" if delta > 0 else "-"
         txt = f"{delta:+.2f}"
@@ -766,7 +790,9 @@ class RuleSet:
             # 防御：参考圈圈速若被污染/错用，差值会跳到整圈量级
             # （如参考圈 1:00、当前圈 1:41 → 41 秒），这种"快/慢 40 秒"
             # 只会摧毁可信度，宁可不报差值也不报离谱数字。
-            if abs(vs) <= max(30.0, c.ref.lap_time_s * 0.25):
+            # 🔴 用统一硬上界 `DELTA_MAX_S`（与 `_delta` 同把尺）：任何超过
+            #    它的圈差都是参考圈错配，绝不报。
+            if abs(vs) <= DELTA_MAX_S:
                 ev["vs_ref_s"] = round(vs, 3)
             ev["ref_lap_time_s"] = round(c.ref.lap_time_s, 3)
         txt = self.narrator.render("lap_summary", ev)
@@ -1142,10 +1168,11 @@ class RuleSet:
     #
     # 固定圈数比赛跑完最后一圈、冲过终点的那一刻，报最终名次。
     #
-    # 🔴 触发用「已完成的圈数 ≥ 本局总圈数」：`c.lap.lap` 是**刚跑完的那一圈**
-    #    的编号（第 5 圈完成 → c.lap.lap == 5），而 `f.lap` 在最后一圈全程
-    #    都 == laps_in_race（第五圈里它一直是 5）。若只看 `f.lap` 会从最后一圈
-    #    一开始就误报；看「完成了几圈」才精确卡在冲线那一下。
+    # 🔴 触发用引擎记的「本场已完成圈数 ≥ 本局总圈数」（`c.run_laps`），
+    #    **不**依赖 `c.lap.lap`（刚跑完那一圈）。早先只看 `c.lap.lap`，而 GT7 在
+    #    冲过终点那一圈往往**不再把圈号往上加**（终局圈号一直停在 laps_in_race），
+    #    于是 `c.lap.lap` 最多到 laps_in_race-1，终局判定永远差一圈 → 名次播报
+    #    从不被触发。用引擎自增的 `run_laps` 就卡在冲线那一下，与圈号索引无关。
     #
     # 🔴 只报一次：用 `st["finish_done_laps"]` 记这一局已报过的 laps_in_race；
     #    新一局（已完成圈数 < 总圈数）自动复位，下一局再报。
@@ -1154,11 +1181,13 @@ class RuleSet:
         f = c.f
         if c.warmup or f.laps_in_race <= 0:
             return None
-        if c.lap is None or c.lap.lap < f.laps_in_race:
+        if c.run_laps < f.laps_in_race:
             # 还没跑完最后一圈（含新一局刚开始）→ 清掉上一局标记，准备重报
             c.st.pop("finish_done_laps", None)
             return None
-        if not self._race_ok(c, cfg.position_min_cars):
+        # 终局名次：哪怕只有 2 车（头对头）也要报冲线名次；纯单人跑（num_cars==1）
+        # 不算比赛（laps_in_race<=0 已在上面拦掉），这里 num_cars>=2 即可。
+        if not self._race_ok(c, 2):
             return None
         if c.st.get("finish_done_laps") == f.laps_in_race:
             return None  # 这一局已经报过

@@ -928,7 +928,7 @@ class TestSpeechDigits:
 
     这是「语音报数字 54→五四」的端到端落点：引擎在闸门之后给每条要说的话贴
     上 `speech`（屏幕用的 `text` 仍是原样 54 / 115，便于扫读）。用不依赖参考圈的
-    胎温过热规则触发，它产出带数字的话「左前胎过热 115」。
+    胎温过热规则触发，它产出带数字的话「左前胎 115 度过热」。
     """
 
     def test_engine_attaches_digit_by_digit_speech(self):
@@ -947,13 +947,32 @@ class TestSpeechDigits:
                 got = st.say[0]
                 break
         assert got is not None, "应触发胎温过热播报"
-        assert got.text == "左前胎过热 115"
+        assert got.text == "左前胎 115 度过热"
         # 语音走逐位中文，屏幕 text 保持原样
-        assert got.speech == "左前胎过热 一一五"
+        assert got.speech == "左前胎 一一五 度过热"
         # 序列化到 /api/v1/coach/state 时也带 speech，仪表盘据此播报
-        assert got.to_dict()["speech"] == "左前胎过热 一一五"
+        assert got.to_dict()["speech"] == "左前胎 一一五 度过热"
         # 字符数等价 → ttl 预算无需因这一层重算
         assert len(got.speech) == len(got.text)
+
+
+class TestDisconnectStopsSpeech:
+    """游戏断开 / 待机：dash 仍回最后一帧但 connected=False，
+    引擎必须早退、不再产生新播报。"""
+
+    def test_no_utterance_when_disconnected(self):
+        frames = [Frame(t=i * 0.1, lap_time_s=i * 0.1, lap=1,
+                        connected=False,
+                        tyre_temp=(115.0, 100.0, 100.0, 100.0),
+                        speed_kph=30.0) for i in range(40)]
+        src = ReplaySource(frames, profile=None, session=None, loop=False)
+        eng = CoachEngine(src, CoachConfig(poll_interval_s=0.1,
+                                           sess_poll_boot_s=999,
+                                           sess_poll_idle_s=999))
+        for _ in range(20):
+            st = eng.tick()
+            assert st.connected is False
+            assert st.say == []   # 断开后不应有任何播报
 
 
 # ===========================================================================
