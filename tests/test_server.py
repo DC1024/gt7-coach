@@ -195,6 +195,10 @@ class TestRoutes:
             and "cloudModel" in html
         # 🔴 红线在 UI 也要说得明白：填的是变量名，不是 key 本体
         assert "变量名" in html
+        # 🔴 模型名不做预设（2026-10-10 用户要求）：预设只填端点与 key 变量名，
+        #    模型名必须用户自己写 —— 预设的 model 不能从 UI 流出去
+        blk = html[html.index('cloudPreset").onchange'):html.index("function loadConfig()")]
+        assert "p.model" not in blk and "cloudModel" not in blk
 
 
 class TestBroadcastPanel:

@@ -592,7 +592,7 @@ DEMO_HTML = """<!DOCTYPE html>
   <div class="ctl">
     <label for="cloudPreset">服务商预设</label>
     <select id="cloudPreset"><option value="">（不切换，仅查看）</option></select>
-    <span class="sub">选一个会把下面三框填成该家的默认值，按保存才生效</span>
+    <span class="sub">选一个会把端点与 key 变量名填成该家默认值（模型名请自行填写），按保存才生效</span>
   </div>
   <div class="ctl"><label for="cloudBaseUrl">base_url</label>
     <input type="text" id="cloudBaseUrl" size="34"
@@ -602,7 +602,7 @@ DEMO_HTML = """<!DOCTYPE html>
            placeholder="如 GT7_COACH_LLM_KEY"></div>
   <div class="ctl"><label for="cloudModel">模型名</label>
     <input type="text" id="cloudModel" size="34"
-           placeholder="留空 = 用该家免费默认模型"></div>
+           placeholder="自行填写；留空 = 该家免费默认模型"></div>
   <div class="ctl">
     <button id="cloudSave">保存云措辞</button>
     <button id="cloudToggle">停用</button>
@@ -907,10 +907,11 @@ document.getElementById("cloudToggle").onclick = function(){
 document.getElementById("cloudPreset").onchange = function(){
   var k = this.value, p = cloudPresets[k];
   if (!p) return;                       // 「不切换」选项
-  // 只填框不保存 —— 用户看完三框再决定（与仪表盘同一交互）
+  // 🔴 只填端点与 key 变量名，**模型名不预设**（2026-10-10 用户要求）：
+  //    让用户自己写 —— 预设里的 model 只作为留空时的服务端免费默认，
+  //    不从 UI 流出去变成显式覆盖。（与仪表盘同一交互。）
   document.getElementById("cloudBaseUrl").value = p.base_url || "";
   document.getElementById("cloudKeyEnv").value = p.api_key_env || "";
-  document.getElementById("cloudModel").value = p.model || "";
 };
 function loadConfig(){
   fetch("/api/v1/coach/config").then(function(r){return r.json();})
