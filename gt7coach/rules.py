@@ -134,7 +134,9 @@ class RuleConfig:
     throttle_late_from_m: float = 40.0
     throttle_late_to_m: float = 120.0
     throttle_late_hold_s: float = 0.50
-    throttle_late_on: float = 0.30
+    # 🔴 原名 throttle_late_on —— #G 引入逐规则开关后 `_on` 后缀让给了
+    #    布尔开关，阈值改名 `_min`（"油门低于这个值算没给油"），语义也更准。
+    throttle_late_min: float = 0.30
 
     # 换挡 / 胎温 / delta
     shift_hold_s: float = 0.50
@@ -179,6 +181,39 @@ class RuleConfig:
     #   事实合并成**一句** `lap_advice`（每圈一条，云润色只调用一次）。
     # False：退回旧行为 —— 四条各自单说（保留给逐条调试 / A-B 对比用）。
     lap_advice: bool = True
+
+    # —— #G 播报细分开关 ————————————————————————————————————
+    #
+    # 🔴 面板（panel.py）的分组开关是「整类静音」（说完不说的出口闸）；
+    #    这里是更细的**逐规则**开关（规则根本不评估，evidence 也不产出）。
+    #    两层各管各的：分组开关管"出口拦不拦"，这里的开关管"算不算"。
+    #    全部默认 True = 现行为不变；id 与 panel.py GROUPS[].subs 一一对应，
+    #    UI 直接拿字段名当开关 id。
+    # 安全组（brake_late 与 brake_warn 相隔 1~2 秒本就该连着说，共用一个开关）
+    off_track_on: bool = True
+    slip_on: bool = True
+    brake_on: bool = True
+    shift_on: bool = True
+    # 驾驶组
+    apex_slow_on: bool = True
+    throttle_late_on: bool = True
+    # 轮胎组（一条规则产两种播报，热/凉分开开关，见 _tyre_temp）
+    tyre_hot_on: bool = True
+    tyre_cold_on: bool = True
+    # 圈速组
+    delta_on: bool = True
+    projected_on: bool = True
+    # 圈后组（lap_advice=True 合并句模式下，子开关决定各事实**进不进合并句**；
+    #         lap_advice=False 各自单说模式下，子开关就是各自的总开关）
+    lap_summary_on: bool = True
+    sector_loss_on: bool = True
+    fuel_range_on: bool = True
+    next_focus_on: bool = True
+    # 名次 / 情绪组
+    position_on: bool = True
+    encourage_on: bool = True
+    leader_on: bool = True
+    race_finish_on: bool = True
 
 
 # 🔴 #J：打滑三档预设 → 各档基线阈值（见 RuleConfig.slip_preset 说明）。
@@ -273,23 +308,44 @@ class RuleSet:
 
     def evaluate(self, c: Ctx) -> list[Utterance]:
         out: list[Utterance] = []
-        for fn in (self._off_track, self._wheel_slip, self._brake_warn,
-                   self._brake_late, self._apex_slow, self._throttle_late,
-                   self._shift, self._tyre_temp, self._delta,
-                   self._projected_lap):
+        # 🔴 #G：逐规则开关在**调用点**过滤 —— 关掉的规则根本不评估，
+        #    evidence 也不产出（与面板的"出口静音"是两层，见 RuleConfig 注释）。
+        #    ⚠️ 关掉再打开的边角：_position_now 等的状态位只在真播出后推进
+        #       （on_spoken），关掉期间不推进，重开时第一次名次比较可能
+        #       报一个累计变化 —— 罕见操作，宁可这样也不给它偷偷记状态。
+        for fn, flag in ((self._off_track, self.cfg.off_track_on),
+                         (self._wheel_slip, self.cfg.slip_on),
+                         (self._brake_warn, self.cfg.brake_on),
+                         (self._brake_late, self.cfg.brake_on),
+                         (self._apex_slow, self.cfg.apex_slow_on),
+                         (self._throttle_late, self.cfg.throttle_late_on),
+                         (self._shift, self.cfg.shift_on),
+                         # 胎温一条规则产两种播报（过热/太凉），热/凉各自的
+                         # 开关在方法内部处理 —— 这里恒放行，保持原有顺序。
+                         (self._tyre_temp, True),
+                         (self._delta, self.cfg.delta_on),
+                         (self._projected_lap, self.cfg.projected_on)):
+            if not flag:
+                continue
             u = fn(c)
             if u is not None:
                 out.append(u)
         # —— 圈后播报（R2.4）——
         # 默认把四条事实合并成**一句** `lap_advice`（每圈一条；云润色因此
         # 每圈最多花一次）。`lap_advice=False` 时退回旧的四条各自单说。
+        # #G：四个子开关在两种模式下都生效 —— 合并句里决定事实进不进，
+        #     单说模式里就是各自的总开关。
         if self.cfg.lap_advice:
             u = self._lap_debrief(c)
             if u is not None:
                 out.append(u)
         else:
-            for fn in (self._lap_summary, self._sector_loss,
-                       self._fuel_range, self._next_focus):
+            for fn, flag in ((self._lap_summary, self.cfg.lap_summary_on),
+                             (self._sector_loss, self.cfg.sector_loss_on),
+                             (self._fuel_range, self.cfg.fuel_range_on),
+                             (self._next_focus, self.cfg.next_focus_on)):
+                if not flag:
+                    continue
                 u = fn(c)
                 if u is not None:
                     out.append(u)
@@ -297,8 +353,12 @@ class RuleSet:
         # 🔴 独立于上面的圈后合并句：情绪不该去挤成绩/习惯那些硬信息的
         #    位置（合并句有长度预算，加鼓励就会把主体挤掉），而且要能
         #    在面板上单独关掉（分组 `mood`）—— 有人就是不想被鼓励。
-        for fn in (self._position_now, self._encourage, self._leader,
-                   self._race_finish):
+        for fn, flag in ((self._position_now, self.cfg.position_on),
+                         (self._encourage, self.cfg.encourage_on),
+                         (self._leader, self.cfg.leader_on),
+                         (self._race_finish, self.cfg.race_finish_on)):
+            if not flag:
+                continue
             u = fn(c)
             if u is not None:
                 out.append(u)
@@ -599,7 +659,7 @@ class RuleSet:
             self._hold(c.st, "thrlate", False, c.dt)
             return None
         a = max(zone, key=lambda x: x["s_m"])
-        bad = c.f.throttle < cfg.throttle_late_on
+        bad = c.f.throttle < cfg.throttle_late_min
         if self._hold(c.st, "thrlate", bad, c.dt) < cfg.throttle_late_hold_s:
             return None
         return Utterance(
@@ -636,6 +696,9 @@ class RuleSet:
             return None
         names = ["左前", "右前", "左后", "右后"]
         if hot:
+            # #G：过热开关单独关 → 不报（凉的那半本来也不会同时触发）
+            if not cfg.tyre_hot_on:
+                return None
             i = tt.index(max(tt))
             txt = f"{names[i]}胎过热 {tt[i]:.0f}"
             return Utterance(key="tyre_hot", text=txt,
@@ -643,6 +706,9 @@ class RuleSet:
                              ttl_s=phrases.ttl_for(txt, P_NORMAL, "tyre_temp"),
                              short="胎温",
                              evidence={"tyre_temp_c": [round(x, 1) for x in tt]})
+        # #G：太凉开关单独关 → 不报
+        if not cfg.tyre_cold_on:
+            return None
         txt = "轮胎太凉，抓地不够，先跑两圈升温"
         return Utterance(key="tyre_cold", text=txt,
                          priority=P_NORMAL,
@@ -886,13 +952,17 @@ class RuleSet:
     def _lap_debrief(self, c: Ctx) -> Utterance | None:
         facts: dict[str, Any] = {}
 
-        ls = self._lap_summary(c)          # 成绩：lap_time_s（可能还有 vs_ref_s）
+        # 🔴 #G：四个子开关在这里生效 —— 关掉的那条事实**不进合并句**。
+        #    注意 _next_focus 带"隔几圈提醒"的状态副作用：关掉期间状态机
+        #    停走，重开后从头计圈 —— 关开关的人不在乎这个。
+        ls = self._lap_summary(c) if self.cfg.lap_summary_on else None
         if ls is not None:
             for k in ("lap_time_s", "vs_ref_s", "ref_lap_time_s"):
                 if k in ls.evidence:
                     facts[k] = ls.evidence[k]
 
-        fu = self._fuel_range(c)           # 续航：只在"警告区"（≤fuel_warn_laps）才有
+        fu = (self._fuel_range(c)             # 续航：只在"警告区"（≤fuel_warn_laps）才有
+              if self.cfg.fuel_range_on else None)
         if fu is not None:
             # 🔴 连 `laps_to_go` / `margin_laps` 一起透传：圈后综合句要能说
             #    "够不够到终点"，而余量是派生值，必须由这里带进 facts，
@@ -902,12 +972,14 @@ class RuleSet:
                 if k in fu.evidence:
                     facts[k] = fu.evidence[k]
 
-        se = self._sector_loss(c)          # 最慢段
+        se = (self._sector_loss(c)            # 最慢段
+              if self.cfg.sector_loss_on else None)
         if se is not None:
             facts["sector"] = se.evidence.get("sector")
             facts["loss_s"] = se.evidence.get("loss_s")
 
-        nf = self._next_focus(c)           # 习惯弯（含"隔几圈提醒一次"的副作用）
+        nf = (self._next_focus(c)             # 习惯弯（含"隔几圈提醒一次"的副作用）
+              if self.cfg.next_focus_on else None)
         if nf is not None:
             h = nf.evidence
             facts["focus_label"] = h.get("label")

@@ -287,12 +287,14 @@ class CoachService:
     # —— 播报面板（用户自选"什么播报、什么不播报"）———————————————
 
     def panel(self) -> dict[str, Any]:
-        """当前面板快照：每个内容分组的开关状态 + 最近播报计数。"""
+        """当前面板快照：每个内容分组的开关状态 + 最近播报计数。
+        #G：每组附带 subs（细分开关的当前值，来自 RuleConfig）。"""
         from . import panel as panel_mod
         muted = getattr(self.engine.gate.cfg, "muted", ()) or ()
         spoken = self.state().get("spoken") or []
         recent = [str(h.get("key", "")) for h in spoken]
-        return {"api_version": 1, **panel_mod.panel_state(muted, recent)}
+        return {"api_version": 1,
+                **panel_mod.panel_state(muted, recent, self.engine.rules.cfg)}
 
     def set_panel(self, body: dict[str, Any]) -> dict[str, Any]:
         """设置被关掉的分组。`body = {"muted": ["tyres", "pace"]}`。
@@ -329,9 +331,17 @@ class CoachService:
                 if not hasattr(obj, k):
                     raise ValueError(f"{section}.{k} 不是可配置项")
                 cur = getattr(obj, k)
-                if isinstance(cur, bool) or not isinstance(cur, (int, float)):
+                if isinstance(cur, bool):
+                    # #G：布尔开关（*_on / lap_advice）可改，但类型要真对 ——
+                    #    v=0/1 这类"顺手用数字"一律拒收，防止前端把开关写成
+                    #    字符串 "false"（真值判断恒 True）而看起来像关了。
+                    if not isinstance(v, bool):
+                        raise ValueError(f"{section}.{k} 需要布尔值 true/false")
+                    setattr(obj, k, v)
+                elif isinstance(cur, (int, float)):
+                    setattr(obj, k, type(cur)(v))
+                else:
                     raise ValueError(f"{section}.{k} 不是数值项，不支持修改")
-                setattr(obj, k, type(cur)(v))
                 names.append(k)
             if names:
                 applied[section] = names

@@ -1494,3 +1494,58 @@ class TestRaceFinish:
     def test_key_in_mood_group(self, rs, st):
         from gt7coach import panel
         assert panel.group_of_key("race_finish") == "mood"
+
+
+class TestRuleToggles:
+    """#G：逐规则细分开关 —— 关掉的规则**根本不评估**（evidence 也不产出），
+    与面板「整类出口静音」是两层。每组的代表性规则各验一条。"""
+
+    def test_slip_toggle_off(self, st):
+        w = 50.0 / 0.34
+        rs = RuleSet(RuleConfig(slip_on=False))
+        assert keys(feed(rs, st, ticks=5,
+                         wheel_rads=(w, w, w * 1.3, w * 1.3))) == []
+
+    def test_slip_toggle_on_by_default(self, st):
+        w = 50.0 / 0.34
+        rs = RuleSet(RuleConfig())
+        assert "slip_rear" in keys(feed(rs, st, ticks=5,
+                                        wheel_rads=(w, w, w * 1.3, w * 1.3)))
+
+    def test_shift_toggle_off(self, st):
+        rs = RuleSet(RuleConfig(shift_on=False))
+        assert keys(feed(rs, st, ticks=6, rpm=8300.0)) == []
+
+    def test_tyre_hot_and_cold_toggle_independently(self, st):
+        # 过热场景：关掉"过热"只关这一半，"太凉"开关不影响它
+        rs = RuleSet(RuleConfig(tyre_hot_on=False))
+        assert keys(feed(rs, st, ticks=25,
+                         tyre_temp=(88.0, 121.0, 86.0, 87.0))) == []
+        # 太凉场景：只关"太凉" → 过热照报
+        rs2 = RuleSet(RuleConfig(tyre_cold_on=False))
+        us = feed(rs2, st, ticks=25, tyre_temp=(88.0, 121.0, 86.0, 87.0))
+        assert "tyre_hot" in keys(us)
+
+    def test_tyre_cold_toggle_off(self, st):
+        rs = RuleSet(RuleConfig(tyre_cold_on=False))
+        assert keys(feed(rs, st, ticks=25,
+                         tyre_temp=(50.0, 55.0, 52.0, 54.0))) == []
+
+    def test_debrief_fact_filtered_by_sub_toggle(self, rs, st, ref):
+        # 默认（全开）：圈后合并句里有上一圈成绩
+        us = feed(rs, st, ref=ref, last_lap_ms=92412.0)
+        assert [u for u in us if u.key == "lap_advice"]
+        # 关掉"上一圈成绩"：这条事实不进合并句；没别的可说 → 整句静默
+        rs2 = RuleSet(RuleConfig(lap_summary_on=False))
+        us2 = feed(rs2, st, ref=ref, last_lap_ms=92412.0)
+        assert [u for u in us2 if u.key == "lap_advice"] == []
+
+    def test_legacy_mode_sub_toggles_gate_each_sentence(self, rs, st, ref):
+        # lap_advice=False 的旧四条单说模式下，子开关就是各自的总开关
+        cfg = RuleConfig(lap_advice=False, lap_summary_on=False)
+        rs2 = RuleSet(cfg)
+        us = feed(rs2, st, ref=ref, last_lap_ms=92412.0)
+        assert [u for u in us if u.key == "lap_summary"] == []
+        cfg2 = RuleConfig(lap_advice=False)
+        us2 = feed(RuleSet(cfg2), st, ref=ref, last_lap_ms=92412.0)
+        assert "lap_summary" in keys(us2)

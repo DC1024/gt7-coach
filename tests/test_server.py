@@ -599,3 +599,53 @@ class TestCloudCompatConfig:
         svc = self._svc(tmp_path / "cloud.json")
         for name in ("GT7_COACH_LLM_KEY", "OPENAI_API_KEY", "_PRIVATE"):
             svc.set_cloud({"api_key_env": name})   # 不抛即通过
+
+
+class TestRuleToggleConfig:
+    """#G：细分开关走 /config 的 rules 节（布尔白名单）+ panel 透出 subs。"""
+
+    class _Src:
+        last_error = None
+
+        def poll(self):
+            return None
+
+    def _svc(self) -> CoachService:
+        return CoachService(CoachEngine(self._Src(), CoachConfig()))
+
+    def test_update_config_accepts_bool_toggles(self):
+        svc = self._svc()
+        out = svc.update_config({"rules": {"off_track_on": False,
+                                           "lap_advice": False}})
+        assert out["ok"] is True
+        assert out["config"]["rules"]["off_track_on"] is False
+        assert out["config"]["rules"]["lap_advice"] is False
+        # 改回 True 也要行
+        svc.update_config({"rules": {"off_track_on": True}})
+        assert svc.config()["rules"]["off_track_on"] is True
+
+    def test_update_config_rejects_non_bool_for_toggle(self):
+        svc = self._svc()
+        with pytest.raises(ValueError, match="布尔"):
+            svc.update_config({"rules": {"off_track_on": 0}})
+        with pytest.raises(ValueError, match="布尔"):
+            svc.update_config({"rules": {"off_track_on": "false"}})
+        # 整条请求拒绝 → 字段保持原值
+        assert svc.config()["rules"]["off_track_on"] is True
+
+    def test_unknown_field_still_rejected(self):
+        svc = self._svc()
+        with pytest.raises(ValueError, match="不是可配置项"):
+            svc.update_config({"rules": {"nope_on": False}})
+
+    def test_panel_includes_subs_with_live_values(self):
+        svc = self._svc()
+        svc.update_config({"rules": {"encourage_on": False}})
+        d = svc.panel()
+        by_id = {g["id"]: g for g in d["groups"]}
+        subs_safety = {s["id"]: s["on"] for s in by_id["safety"]["subs"]}
+        assert subs_safety == {"off_track_on": True, "slip_on": True,
+                               "brake_on": True, "shift_on": True}
+        subs_mood = {s["id"]: s["on"] for s in by_id["mood"]["subs"]}
+        assert subs_mood["encourage_on"] is False
+        assert subs_mood["position_on"] is True
