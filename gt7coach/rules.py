@@ -711,8 +711,8 @@ class RuleSet:
             return None
         # 🔴 #A 复审：工程师不能只说"太凉"，要告诉车手**怎么升温** ——
         #    GT7 里冷胎的两大解法：直线上轻拖刹车（刹车盘热量喂给胎）、
-        #    走线上多左右摆动（摩擦生热）。一句说完，别超过无线电长度。
-        txt = "轮胎太凉，先别推极限：直线上轻拖刹车、走线多左右摆，两三圈升温再发力"
+        #    走线上多左右摆动（摩擦生热）。再精简过：用户反馈一句为宜。
+        txt = "轮胎太凉，轻拖刹车多摆走线，升温再推"
         return Utterance(key="tyre_cold", text=txt,
                          priority=P_NORMAL,
                          ttl_s=phrases.ttl_for(txt, P_NORMAL, "tyre_temp"),
