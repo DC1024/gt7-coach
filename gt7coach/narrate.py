@@ -50,7 +50,7 @@ class CloudConfig:
     enabled: bool = False
     provider: str = cloud.DEFAULT_PROVIDER
     base_url: str = ""                       # 空 → 用预设厂商的 base_url
-    model: str = ""                          # 空 → 用预设厂商的默认 model
+    model: str = ""                          # 🔴 必填：留空 = 云措辞不可用（回落模板）
     api_key_env: str = "GT7_COACH_LLM_KEY"   # 🔴 只存变量名
     timeout_s: float = 2.0
     fallbacks: list[str] = field(default_factory=list)
@@ -302,31 +302,29 @@ class Narrator:
                 self._st["no_key"] += 1
             return None
 
+        # 🔴 2026-10-10 用户要求：模型名**必须玩家自己填**，没有任何预设默认。
+        #    留空 = 云措辞不可用，直接回落本地模板（不再用厂商默认模型兜底）。
+        if not cfg.model:
+            return None
+
         messages = prompts.messages_for(key, facts)
         providers = [cfg.provider] + list(cfg.fallbacks)
         last_err_kind = "error"
         for i, prov in enumerate(providers):
             p = cloud.resolve_provider(prov)
             if i == 0:
-                # 🔴 主家：**用户在 cloud.json 里显式填的 model/base_url 优先**。
-                #    这是"让用户自己选模型"的唯一通道。原先是 `p.get("model")
-                #    or cfg.model`，后果是用户在 cloud.json 把 model 改成 kimi-k3
-                #    却**完全无效** —— 预设厂商永远用自己的 model，用户以为换了、
-                #    实际还在用默认那个（实测抓出来的）。之所以长期没暴露：
-                #    测试全用未知厂商 provider="test"，那条路本来就只能落到
-                #    cfg.model，正好绕开了这个分支。
+                # 🔴 主家：用户显式填的 base_url 优先于端点表
                 base_url = cfg.base_url or p.get("base_url")
-                model = cfg.model or p.get("model")
             else:
-                # 🔴 备用厂商：必须用**它自己**的预设，不能沿用主家的 ——
+                # 🔴 备用厂商：必须用**它自己**的端点，不能沿用主家的 ——
                 #    顺序写反会让主家熔断后备用仍打主家的 URL（实测抓出来的）。
+                #    （模型名没有"自己的预设"这一说：全部统一用 cfg.model。）
                 base_url = p.get("base_url") or cfg.base_url
-                model = p.get("model") or cfg.model
-            if not base_url or not model:
-                # 未知厂商又没在 cloud.json 显式给 base_url/model → 跳过
+            if not base_url:
+                # 未知厂商又没在 cloud.json 显式给 base_url → 跳过
                 continue
             try:
-                reply = cloud.chat(base_url, model, key_val, messages,
+                reply = cloud.chat(base_url, cfg.model, key_val, messages,
                                    timeout_s=cfg.timeout_s)
             except cloud.CloudError as e:
                 last_err_kind = e.kind
@@ -397,27 +395,19 @@ class Narrator:
     # —— 可观测 ————————————————————————————————————————
 
     def model_info(self) -> dict[str, Any]:
-        """当前**实际会发出去**的模型名 + 它是否在免费名单里。
+        """当前**实际会发出去**的模型名（= 玩家自己填的 cfg.model）。
 
-        🔴 为什么要单独抽出来：**"配置里填的"和"真发出去的"可能不是一回事** ——
-           主家用 `cfg.model`（用户填的），备用家各自用自己的预设（见 _polish）。
-           界面/状态要显示的是**真发出去的那个**，否则用户改完看不到变化，
-           会以为"改了没生效"——那正是这次修掉的那个 bug 的表现。
+        🔴 2026-10-10 起没有任何预设模型：cfg.model 空 = 云措辞不可用，
+           状态里 model 返回空串。也不再有任何「厂商预设 / 免费额度」标注
+           —— 那是会被时间打脸的承诺（今天免费明天可能收费/下架）。
         """
         cfg = self._cfg
         if cfg is None:
-            return {"model": "", "provider": None, "from_user": False,
-                    "is_free": False, "free": None, "warning": None,
+            return {"model": "", "provider": None,
                     "api_key_env": "", "has_key": False}
-        preset = cloud.resolve_provider(cfg.provider).get("model") or ""
-        model = cfg.model or preset
         return {
-            "model": model,
+            "model": cfg.model,
             "provider": cfg.provider,
-            "from_user": bool(cfg.model),       # True=用户填的，False=厂商预设
-            "is_free": cloud.is_free_model(model),
-            "free": cloud.free_info(model),
-            "warning": cloud.model_warning(model, provider=cfg.provider),
             # 🔴 只报**变量名**与"有没有设"，绝不回显 key 本身
             "api_key_env": cfg.api_key_env,
             "has_key": bool(os.environ.get(cfg.api_key_env, "")),
@@ -480,14 +470,10 @@ class Narrator:
             "last_latency_s": st["last_latency"],
             "limits": dict(cfg.limits) if cfg else {},
             "prompt_version": prompts.PROMPT_VERSION,
-            # —— 模型（"用户填了什么 / 真发出去的是哪个 / 是否在免费额度内"）——
-            #    model_warning 非空 = 这个模型不在免费名单里或快到期了。
-            #    🔴 只提示、**不拦截**（用户明确要求：非免费模型只警告不拦）。
+            # —— 模型（玩家自己填的那个，无任何预设/免费标注）——
+            #    2026-10-10 用户要求：删除 model_from_user / model_is_free /
+            #    model_free / model_warning 四个字段，不做任何免费承诺。
             "model": mi["model"],
-            "model_from_user": mi["from_user"],
-            "model_is_free": mi["is_free"],
-            "model_free": mi["free"],
-            "model_warning": mi["warning"],
             # 只报变量名与"有没有设"，绝不回显 key
             "api_key_env": mi["api_key_env"],
             "has_key": mi["has_key"],

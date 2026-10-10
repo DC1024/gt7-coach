@@ -370,11 +370,9 @@ class TestVoicePreemption:
 
 
 class TestCloudModelWrite:
-    """「让用户自己填模型名」的写入口：`POST /api/v1/coach/cloud`。
+    """「让玩家自己填模型名」的写入口：`POST /api/v1/coach/cloud`。
 
-    这条需求（2026-10-09）查出来两个真问题，都在这里守：
-      ① 用户填的 model 对预设厂商**完全无效**（见 test_cloud 的回归）；
-      ② 默认模型 `qwen-flash` 不在免费名单里 → 填了 key 就静默计费。
+    2026-10-10 更新：**没有任何预设模型**，模型名留空 = 云措辞不可用。
     写接口本身的设计红线：
       · **不开放 api_key** —— 明文 key 绝不进配置文件（#H 后开放的是
         base_url / api_key_env / provider，其中 api_key_env 只是变量名）；
@@ -408,13 +406,11 @@ class TestCloudModelWrite:
         p = tmp_path / "cloud.json"
         svc = self._svc(p)
         before = svc.cloud_status()
-        assert before["model_from_user"] is False
+        assert before["model"] == ""
         svc.set_cloud({"model": "kimi-k3"})
         st = svc.cloud_status()
         assert st["model"] == "kimi-k3"
-        assert st["model_from_user"] is True
         assert st["enabled"] is True
-        assert st["model_is_free"] is True
 
     def test_write_preserves_existing_keys(self, tmp_path):
         """用户手写的其它字段不能被写接口吃掉。"""
@@ -473,7 +469,8 @@ class TestCloudModelWrite:
         assert "--cloud" in str(ei.value)
 
     def test_clearing_the_model_keeps_enabled(self, tmp_path):
-        """清空模型名 = 回到厂商预设，**不等于**关掉云措辞。"""
+        """清空模型名 = 云措辞实际不可用（回落本地模板），
+        但**不等于**关掉云措辞开关本身。"""
         p = tmp_path / "cloud.json"
         svc = self._svc(p)
         svc.set_cloud({"model": "kimi-k3"})
@@ -481,7 +478,7 @@ class TestCloudModelWrite:
         d = json.loads(p.read_text(encoding="utf-8"))
         assert d["model"] == ""
         assert d["enabled"] is True
-        assert svc.cloud_status()["model_from_user"] is False
+        assert svc.cloud_status()["model"] == ""
 
     def test_enabled_can_be_turned_off_explicitly(self, tmp_path):
         p = tmp_path / "cloud.json"
@@ -490,15 +487,17 @@ class TestCloudModelWrite:
         svc.set_cloud({"enabled": False})
         assert svc.cloud_status()["enabled"] is False
 
-    def test_non_free_model_reaches_the_status_with_a_warning(self, tmp_path):
-        """只警告不拦：模型照收，但状态里必须带着警告（防静默扣费）。"""
+    def test_any_model_is_accepted_without_free_labels(self, tmp_path):
+        """🔴 2026-10-10：任何模型名都照收，状态里**没有**任何
+        「免费额度 / 计费警告」标注 —— 不做会被时间打脸的承诺。"""
         svc = self._svc(tmp_path / "cloud.json")
-        out = svc.set_cloud({"model": "qwen-flash"})     # 不在免费名单
+        out = svc.set_cloud({"model": "qwen-flash"})
         st = out["cloud"]
-        assert st["model"] == "qwen-flash"               # 没被拦
+        assert st["model"] == "qwen-flash"
         assert st["enabled"] is True
-        assert st["model_is_free"] is False
-        assert "可能按量计费" in st["model_warning"]
+        for gone in ("model_from_user", "model_is_free",
+                     "model_free", "model_warning"):
+            assert gone not in st, gone
 
     def test_route_over_http(self, tmp_path):
         """路由真的通（POST 不是 404），且改完 GET /cloud 就能看到。"""
@@ -522,7 +521,7 @@ class TestCloudModelWrite:
             code2, d2, _ = _get(base + "/api/v1/coach/cloud")
             assert code2 == 200
             assert d2["model"] == "deepseek-v4.1-flash"
-            assert d2["model_is_free"] is True
+            assert "model_is_free" not in d2
             assert json.loads(p.read_text(encoding="utf-8"))["model"] \
                 == "deepseek-v4.1-flash"
         finally:
@@ -612,9 +611,10 @@ class TestCloudCompatConfig:
         assert set(presets) >= {"openai", "deepseek", "dashscope", "ollama"}
         for v in presets.values():
             assert v["base_url"].startswith("http")
-            assert v["model"]
             assert v["api_key_env"]
             assert "label" in v
+            # 🔴 2026-10-10：UI 预设里**不许有**模型名 —— 玩家自己填
+            assert "model" not in v
 
     def test_env_name_validation_allows_normal_names(self, tmp_path):
         """合法变量名要放行：默认 GT7_COACH_LLM_KEY、各大厂惯例名。"""

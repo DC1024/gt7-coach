@@ -42,7 +42,6 @@ from datetime import date
 from typing import Any
 from urllib.parse import urlparse
 
-# 免费额度名单复用 cloud.py 那一份（LLM 与 TTS 同一套口径，不各写一份）。
 # cloud.py 只 import 标准库，不存在循环依赖。
 from . import cloud
 
@@ -551,13 +550,9 @@ class TtsEngine:
             "provider": self.cfg.provider,
             "model": self.cfg.resolved_model,
             "voice": self.cfg.resolved_voice,
-            # —— 免费额度提示（与 cloud.narrate 同一口径，只提示不拦截）——
-            # 当前默认 cosyvoice-v3-flash **不在**名单里（名单只有 v1），
-            # 所以这里大概率会持续给出提示：这是事实，不该藏起来。
-            "model_is_free": cloud.is_free_model(self.cfg.resolved_model),
-            "model_free": cloud.free_info(self.cfg.resolved_model),
-            "model_warning": cloud.model_warning(self.cfg.resolved_model,
-                                                 provider=self.cfg.provider),
+            # 🔴 2026-10-10 用户要求：不再有任何「免费额度」提示字段
+            #    （model_is_free / model_free / model_warning 已删除）——
+            #    免费承诺会被时间打脸，计费情况由玩家在厂商控制台自行确认。
             "format": self.cfg.audio_format,
             "sample_rate": self.cfg.sample_rate,
             # 🔴 这三个是 `POST /config` 唯一能改的 tts_* 项，必须回显 ——

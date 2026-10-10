@@ -18,7 +18,7 @@
 | GET  | `/api/v1/coach/panel`   | 播报开关面板：各内容分组的开/关状态 + 最近计数 |
 | POST | `/api/v1/coach/panel`   | 设置关掉的分组，body 形如 `{"muted": ["tyres","pace"]}` |
 | GET  | `/api/v1/coach/health`  | 存活与 tick 计数 |
-| GET  | `/api/v1/coach/cloud`   | R2.2 云接入状态：enabled/provider/**当前模型**/是否免费额度内/今日调用/token/估算费用/降级/违规计数 |
+| GET  | `/api/v1/coach/cloud`   | R2.2 云接入状态：enabled/provider/**当前模型（玩家自填）**/今日调用/token/估算费用/降级/违规计数 |
 | POST | `/api/v1/coach/cloud`   | 写云措辞的**模型名**，body 形如 `{"model": "qwen3.8-flash"}`（写进 cloud.json，立即热加载生效） |
 | GET  | `/api/v1/coach/tts`     | R3 云 TTS 状态：enabled/model/voice/缓存命中/队列深度/字符数/估算费用 |
 | GET  | `/api/v1/coach/tts/<id>`| 取某句已合成的音频字节（mp3）。`state` 里 `say[].tts_url` 就指向这里 |
@@ -161,7 +161,8 @@ class CoachService:
 
     def cloud_status(self) -> dict[str, Any]:
         """R2.2 云接入状态：enabled / provider / 今日调用 / token /
-        估算费用 / 降级状态 / 违规计数。**外加当前模型名与是否在免费额度内**。"""
+        估算费用 / 降级状态 / 违规计数。**外加玩家自己填的当前模型名**
+        （2026-10-10 起无任何预设模型与免费额度标注）。"""
         return self.engine.narrator.status()
 
     # —— 云措辞的「OpenAI 兼容三框」写入（#H）—————————————————
@@ -602,7 +603,7 @@ DEMO_HTML = """<!DOCTYPE html>
            placeholder="如 GT7_COACH_LLM_KEY"></div>
   <div class="ctl"><label for="cloudModel">模型名</label>
     <input type="text" id="cloudModel" size="34"
-           placeholder="自行填写；留空 = 该家免费默认模型"></div>
+           placeholder="必填，自行填写（无任何预设模型）"></div>
   <div class="ctl">
     <button id="cloudSave">保存云措辞</button>
     <button id="cloudToggle">停用</button>
@@ -850,12 +851,13 @@ function renderCloudStatus(d){
       btn = document.getElementById("cloudToggle");
   if (!d){ msg.textContent = "云措辞：未上报"; return; }
   btn.textContent = d.enabled ? "停用" : "启用";
-  var warn = d.model_warning ? " ⚠️" + d.model_warning : "";
+  // 🔴 2026-10-10：无任何「厂商预设 / 免费额度」标注 —— 模型名只显示
+  //    玩家自己填的那个；没填就明说云措辞不可用。
   msg.textContent = (d.enabled ? "已启用" : "已停用")
-    + " · " + (d.model || "（默认模型）")
+    + " · " + (d.model || "未填写模型名，云措辞不可用")
     + (d.base_url ? " · " + d.base_url : "")
-    + (d.api_key_env ? " · key=" + d.api_key_env : "") + warn;
-  msg.className = "sub" + (d.model_warning ? " warn" : "");
+    + (d.api_key_env ? " · key=" + d.api_key_env : "");
+  msg.className = "sub" + (d.enabled && !d.model ? " warn" : "");
 }
 function loadCloudStatus(){
   fetch("/api/v1/coach/cloud").then(function(r){return r.json();})
@@ -908,8 +910,8 @@ document.getElementById("cloudPreset").onchange = function(){
   var k = this.value, p = cloudPresets[k];
   if (!p) return;                       // 「不切换」选项
   // 🔴 只填端点与 key 变量名，**模型名不预设**（2026-10-10 用户要求）：
-  //    让用户自己写 —— 预设里的 model 只作为留空时的服务端免费默认，
-  //    不从 UI 流出去变成显式覆盖。（与仪表盘同一交互。）
+  //    模型名必须玩家自己填，服务端也没有任何默认模型可兜底。
+  //    （与仪表盘同一交互。）
   document.getElementById("cloudBaseUrl").value = p.base_url || "";
   document.getElementById("cloudKeyEnv").value = p.api_key_env || "";
 };

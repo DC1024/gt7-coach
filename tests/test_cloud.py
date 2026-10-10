@@ -434,8 +434,11 @@ def test_failover_primary_to_fallback():
         ))
         # 把 fallback 的 base_url 指到真 ok 端点：用 monkeypatch 改预设
         from gt7coach import cloud as cloud_mod
-        cloud_mod.PROVIDERS["p2"] = {"base_url": ok_url, "model": "m"}
-        out = n.render("lap_summary", FACTS)
+        cloud_mod.PROVIDERS["p2"] = {"base_url": ok_url}
+        try:
+            out = n.render("lap_summary", FACTS)
+        finally:
+            del cloud_mod.PROVIDERS["p2"]     # 不能泄漏，污染后面的测试
     assert out == OK_REPLY
     st = n.status()
     assert st["switches"] == 1
@@ -604,87 +607,38 @@ def test_cloud_config_parses_price_fields():
     assert (d.price_in_yuan_per_mtok, d.price_out_yuan_per_mtok) == (0.15, 1.5)
 
 
-# —— 免费模型名单 / 模型名可配置（2026-10-09）————————————————————
+# —— 无预设模型 / 无免费承诺（2026-10-10 用户要求）—————————————————
 #
-# 起因：用户给了百炼控制台的「免费额度」导出表，要求「不要用到付费模型
-# 避免用户被收费」，并让模型名由用户自己填。
-#
-# 查这条需求时抓出两个真问题：
-#   ① PROVIDERS["dashscope"]["model"] 硬编码成 `qwen-flash`，**不在**免费
-#      名单里 → 用户只要填了 key 就会静默按量计费；
-#   ② cloud.json 里用户填的 `model` 对**预设厂商完全无效** ——
-#      `model = p.get("model") or cfg.model` 让厂商预设永远赢，用户以为
-#      换了模型、实际还在用默认那个。所有既有测试都用未知厂商
-#      provider="test"，那条路本来就只能落到 cfg.model，正好绕开了这个分支。
+# 起因：状态里显示「qwen3.8-flash（厂商预设）· 免费额度内」，用户指出
+# **它可能今天免费，明天就收费或者被删除了** —— 项目不该向玩家做任何
+# 免费承诺。要求：
+#   ① 端点表/UI 预设里**没有任何模型名**，模型名一律玩家自己填；
+#   ② 「免费额度名单」与一切免费/计费提示**整体删除**；
+#   ③ ollama 本质是 OpenAI 兼容端点，label 直接叫「OpenAI 兼容」。
 
-class TestFreeModelRegistry:
-    """免费名单只用于**提示**，不参与拦截（用户明确要求只警告不拦）。"""
+class TestNoModelPreset:
+    """预设里不许有任何模型名 —— 改预设时这些测试会红。"""
 
-    def test_default_dashscope_model_is_free(self):
-        """🔴 防"填了 key 就静默扣费"：默认模型必须是名单里的。
+    def test_providers_have_no_model_field(self):
+        for name, p in cloud.PROVIDERS.items():
+            assert "model" not in p, f"端点表 {name} 不许再带模型预设"
 
-        这条是本次需求的核心保证 —— 改默认值时它会红。
-        """
-        m = cloud.PROVIDERS[cloud.DEFAULT_PROVIDER]["model"]
-        assert cloud.is_free_model(m), (
-            f"默认模型 {m} 不在免费名单里 —— 用户填了 key 就会按量计费")
+    def test_ui_presets_have_no_model_field(self):
+        for name, p in cloud.PROVIDER_PRESETS.items():
+            assert "model" not in p, f"UI 预设 {name} 不许再带模型预设"
 
-    def test_free_models_are_recognised(self):
-        for m in ("qwen3.8-flash", "kimi-k3", "glm-5.3", "deepseek-v4.1-flash"):
-            assert cloud.is_free_model(m), m
-            assert cloud.free_info(m)["kind"] == "大语言模型"
+    def test_ollama_is_labeled_openai_compatible(self):
+        assert cloud.PROVIDER_PRESETS["ollama"]["label"] == "OpenAI 兼容"
 
-    def test_paid_or_typo_models_are_not_free(self):
-        for m in ("qwen-flash", "gpt-4o", "", "typo-model-xyz"):
-            assert not cloud.is_free_model(m), m
-            assert cloud.free_info(m) is None
-
-    def test_warning_is_silent_for_a_free_model(self):
-        assert cloud.model_warning("kimi-k3") is None
-        assert cloud.model_warning("") is None       # 没填 = 用预设，不警告
-
-    def test_warning_for_unknown_model(self):
-        w = cloud.model_warning("typo-model-xyz")
-        assert w and "不在内置免费名单" in w and "可能按量计费" in w
-
-    def test_warning_for_an_expired_model(self):
-        """名单里但已过期 → 单独一句（别混在"不在名单里"里，那是两回事）。"""
-        info = dict(cloud.FREE_MODELS["qwen3.7-flash"])
-        info["until"] = "2000-01-01"        # 造一个必然过期的
-        cloud.FREE_MODELS["__expired_test__"] = info
-        try:
-            assert cloud.free_info("__expired_test__")["expired"] is True
-            assert not cloud.is_free_model("__expired_test__")
-            w = cloud.model_warning("__expired_test__")
-            assert w and "到期" in w
-        finally:
-            del cloud.FREE_MODELS["__expired_test__"]
-
-    def test_near_expiry_is_warned_early(self):
-        """7 天内到期要提前提醒 —— 否则用户到期当天才发现开始计费。"""
-        info = dict(cloud.FREE_MODELS["qwen3.8-flash"])
-        import datetime as _dt
-        info["until"] = (_dt.date.today() + _dt.timedelta(days=3)).isoformat()
-        cloud.FREE_MODELS["__soon_test__"] = info
-        try:
-            assert cloud.free_info("__soon_test__")["days_left"] == 3
-            assert cloud.is_free_model("__soon_test__")   # 还没到期
-            assert "还剩 3 天" in cloud.model_warning("__soon_test__")
-        finally:
-            del cloud.FREE_MODELS["__soon_test__"]
-
-    def test_far_future_expiry_is_not_warned(self):
-        w = cloud.model_warning("qwen3.8-flash")
-        assert w is None or "还剩" not in w     # >7 天就不吵
-
-    def test_days_left_none_for_monthly_reset(self):
-        """每月重置的（until=None）不给天数，也不能被判成过期。"""
-        assert cloud.free_info("cosyvoice-v1")["days_left"] is None
-        assert cloud.is_free_model("cosyvoice-v1")
+    def test_free_registry_is_gone(self):
+        """免费名单与三个免费提示函数必须整体删除，不许留半套。"""
+        for attr in ("FREE_MODELS", "free_info", "is_free_model",
+                     "model_warning"):
+            assert not hasattr(cloud, attr), attr
 
 
 class TestUserSuppliedModel:
-    """「让用户自己填模型名」—— 填了必须**真的用上**。"""
+    """模型名玩家自己填 —— 填了必须**真的用上**，留空则云措辞不可用。"""
 
     def _narrator(self, url, **kw):
         """把 dashscope 预设指到本地假端点，模拟真实的预设厂商。"""
@@ -694,79 +648,66 @@ class TestUserSuppliedModel:
             enabled=True, provider="dashscope", api_key_env="GT7_TEST_KEY",
             timeout_s=1.0, **kw))
 
-    def test_user_model_overrides_the_preset_for_the_primary(self):
-        """🔴 回归：原先 `p.get("model") or cfg.model` 让预设永远赢，
-        用户在 cloud.json 填的 model **完全无效**（实测抓出来的）。"""
+    def test_user_model_is_sent_as_is(self):
         with fake_llm("ok") as (url, srv):
             real, n = self._narrator(url, model="kimi-k3")
             try:
                 out = n.render("lap_summary", FACTS)
                 assert out == OK_REPLY
-                assert srv.seen[-1]["model"] == "kimi-k3", (
-                    "用户填的 model 没被发出去 —— 仍在用厂商预设 "
-                    f"{real['model']}")
+                assert srv.seen[-1]["model"] == "kimi-k3"
             finally:
                 cloud.PROVIDERS["dashscope"] = real
 
-    def test_empty_model_falls_back_to_the_preset(self):
+    def test_empty_model_disables_cloud_calls(self):
+        """🔴 留空 = 云措辞不可用（回落本地模板），**没有**默认模型兜底。"""
         with fake_llm("ok") as (url, srv):
             real, n = self._narrator(url, model="")
             try:
                 n.render("lap_summary", FACTS)
-                assert srv.seen[-1]["model"] == real["model"]
+                assert not srv.seen, "模型名留空竟还发了外呼"
             finally:
                 cloud.PROVIDERS["dashscope"] = real
 
-    def test_fallback_still_uses_its_own_preset_model(self):
-        """🔴 回归：备用厂商必须用**它自己**的预设，不能沿用主家的 ——
-        否则主家熔断后备用仍打主家的 model（主备切换那个 bug 的同类）。"""
+    def test_fallback_uses_the_user_model_too(self):
+        """备用厂商没有自己的模型预设 —— 主备只切换 base_url，
+        模型名统一用玩家填的那个。"""
         with fake_llm("ok") as (url, srv):
             real = dict(cloud.PROVIDERS["dashscope"])
             cloud.PROVIDERS["dashscope"] = {**real, "base_url": "http://127.0.0.1:1"}
-            cloud.PROVIDERS["__fb_test__"] = {"base_url": url, "model": "fb-model"}
+            cloud.PROVIDERS["__fb_test__"] = {"base_url": url}
             try:
                 n = Narrator(cfg=CloudConfig(
                     enabled=True, provider="dashscope", model="main-model",
                     api_key_env="GT7_TEST_KEY", timeout_s=0.4,
                     fallbacks=["__fb_test__"]))
                 n.render("lap_summary", FACTS)
-                assert srv.seen[-1]["model"] == "fb-model"
+                assert srv.seen[-1]["model"] == "main-model"
             finally:
                 cloud.PROVIDERS["dashscope"] = real
                 del cloud.PROVIDERS["__fb_test__"]
 
-    def test_status_reports_the_model_and_its_free_state(self):
+    def test_status_reports_the_user_model_only(self):
+        """状态只透出玩家填的模型名；model_from_user / model_is_free /
+        model_warning 等免费标注字段已整体删除。"""
         with fake_llm("ok") as (url, _):
             real, n = self._narrator(url, model="kimi-k3")
             try:
                 st = n.status()
                 assert st["model"] == "kimi-k3"
-                assert st["model_from_user"] is True
-                assert st["model_is_free"] is True
-                assert st["model_warning"] is None
+                for gone in ("model_from_user", "model_is_free",
+                             "model_free", "model_warning"):
+                    assert gone not in st, gone
                 # 只报变量名与"有没有设"，绝不回显 key
                 assert st["api_key_env"] == "GT7_TEST_KEY"
                 assert st["has_key"] is True
             finally:
                 cloud.PROVIDERS["dashscope"] = real
 
-    def test_status_warns_for_a_non_free_model(self):
-        with fake_llm("ok") as (url, _):
-            real, n = self._narrator(url, model="qwen2.5-max")
-            try:
-                st = n.status()
-                assert st["model_from_user"] is True
-                assert st["model_is_free"] is False
-                assert "可能按量计费" in st["model_warning"]
-            finally:
-                cloud.PROVIDERS["dashscope"] = real
-
-    def test_status_marks_preset_model_as_not_from_user(self):
+    def test_status_empty_model_reports_empty(self):
         with fake_llm("ok") as (url, _):
             real, n = self._narrator(url, model="")
             try:
                 st = n.status()
-                assert st["model_from_user"] is False
-                assert st["model"] == real["model"]
+                assert st["model"] == ""
             finally:
                 cloud.PROVIDERS["dashscope"] = real

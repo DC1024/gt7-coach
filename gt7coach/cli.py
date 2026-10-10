@@ -87,10 +87,9 @@ def _print_cloud_state(engine: CoachEngine) -> None:
     """把「云措辞」的落地状态打出来（对应 R2.2，此前**一行都不打**）。
 
     🔴 为什么必须打：`/api/v1/coach/cloud` 是给程序看的，而启动横幅是给
-       **人**看的。用户最需要一眼确认的两件事在这里：
-         ① 现在到底用哪个模型（是不是自己填的那个）；
-         ② 这个模型在不在免费额度里 —— 不在就是"可能被计费"。
-       这两件事原来都看不见，用户只能靠猜。
+       **人**看的。用户最需要一眼确认的是：现在用的模型是不是自己填的那个。
+       （2026-10-10 起没有任何预设模型/免费额度提示 —— 那是会被时间打脸
+       的承诺，模型名玩家自己填、自己负责。）
     """
     st = engine.narrator.status()
     if not st["enabled"]:
@@ -100,17 +99,15 @@ def _print_cloud_state(engine: CoachEngine) -> None:
             print(f"[gt7coach] 云措辞未启用（配置在 {engine.cfg.cloud_path}）"
                   " —— 全部走本地模板，零外呼")
         return
-    src = "用户填的" if st.get("model_from_user") else "厂商预设"
+    if not st.get("model"):
+        print("[gt7coach] 云措辞已启用，但**未填写模型名** —— 云措辞不可用，"
+              "全部走本地模板。请在 cloud.json 的 model 字段或仪表盘里自行填写")
+        return
     line = (f"[gt7coach] 云措辞已启用  {st['provider']}/{st['model']}"
-            f"（{src}）  key={'有' if st['has_key'] else '缺'}"
+            f"  key={'有' if st['has_key'] else '缺'}"
             f"  {st['price_yuan_per_mtok'].get('in', '?')}/"
             f"{st['price_yuan_per_mtok'].get('out', '?')} 元/百万 token")
     print(line)
-    if st.get("model_warning"):
-        # ⚠ 只警告不拦（按用户要求）。但必须显眼 —— 这条是防"静默扣费"的。
-        print(f"[gt7coach] ⚠ {st['model_warning']}")
-        print("[gt7coach]   想换模型：编辑 cloud.json 的 model 字段，"
-              "或在仪表盘「赛道工程师」卡片里直接填（改完立即生效，不用重启）")
 
 
 def _print_tts_state(engine: CoachEngine) -> None:

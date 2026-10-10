@@ -36,8 +36,8 @@ COACH_TOP = ["Dockerfile", "docker-compose.yml", ".dockerignore"]
 
 # 首次播种的云措辞配置。🔴 **不含 key**，只写"从哪个环境变量读 key"，所以
 # 放服务器上是安全的；key 由使用者自己在服务器上 export（本工具不代管）。
-# model 留空 = 用厂商预设，现在是免费额度内的 qwen3.8-flash —— 没 key 时
-# 也不会外呼，填了 key 就直接能用且不产生费用。
+# model 留空：2026-10-10 起没有任何预设模型 —— 云措辞要可用，
+# 由玩家在仪表盘/自检页自行填写模型名；没填就回落本地模板。
 CLOUD_SEED = {
     "enabled": True,
     "provider": "dashscope",
