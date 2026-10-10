@@ -861,6 +861,16 @@ class TestEngineWiring:
                 for _ in range(30):
                     st = eng.tick()
                     said += list(st.say)
+                # 🔴 云合成在后台线程：tick 里 request() 入队即返回 None，
+                #    URL 要等合成完成后由**后续 tick** 从缓存拿到。30 个 tick
+                #    跑得比一次本地 HTTP 往返还快是常态，必须轮询等落定，
+                #    不能指望循环本身就是等够（CI 上偶发就是这个竞态）。
+                deadline = time.monotonic() + 5.0
+                while not any(u.tts_url for u in said
+                              if u.priority >= P_NORMAL) \
+                        and time.monotonic() < deadline:
+                    st = eng.tick()
+                    said += list(st.say)
             finally:
                 eng.tts.close()
 
