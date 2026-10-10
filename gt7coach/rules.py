@@ -709,7 +709,10 @@ class RuleSet:
         # #G：太凉开关单独关 → 不报
         if not cfg.tyre_cold_on:
             return None
-        txt = "轮胎太凉，抓地不够，先跑两圈升温"
+        # 🔴 #A 复审：工程师不能只说"太凉"，要告诉车手**怎么升温** ——
+        #    GT7 里冷胎的两大解法：直线上轻拖刹车（刹车盘热量喂给胎）、
+        #    走线上多左右摆动（摩擦生热）。一句说完，别超过无线电长度。
+        txt = "轮胎太凉，先别推极限：直线上轻拖刹车、走线多左右摆，两三圈升温再发力"
         return Utterance(key="tyre_cold", text=txt,
                          priority=P_NORMAL,
                          ttl_s=phrases.ttl_for(txt, P_NORMAL, "tyre_temp"),
